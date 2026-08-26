@@ -1,17 +1,8 @@
 import json
-import secrets
 
 from vpnctl import users_store
-from vpnctl.dotenv import get_or_create, set_key
-from vpnctl.paths import (
-    CLASH_API_CONFIG,
-    ENV_FILE,
-    HYSTERIA2_CONFIG,
-    IKEV2_ENV_FILE,
-    VLESS_CONFIG,
-)
-
-CLASH_API_BIND = "127.0.0.1:9090"
+from vpnctl.dotenv import set_key
+from vpnctl.paths import HYSTERIA2_CONFIG, IKEV2_ENV_FILE, VLESS_CONFIG
 
 
 def _write_json(path, data) -> None:
@@ -38,20 +29,6 @@ def render_hysteria2(users: list[users_store.User]) -> None:
     _write_json(HYSTERIA2_CONFIG, data)
 
 
-def render_clash_api() -> str:
-    secret = get_or_create(ENV_FILE, "CLASH_API_SECRET", lambda: secrets.token_urlsafe(32))
-    data = {
-        "experimental": {
-            "clash_api": {
-                "external_controller": CLASH_API_BIND,
-                "secret": secret,
-            }
-        }
-    }
-    _write_json(CLASH_API_CONFIG, data)
-    return secret
-
-
 def render_ikev2_env(users: list[users_store.User]) -> None:
     """Regenerate VPN_ADDL_USERS/VPN_ADDL_PASSWORDS for L2TP/Cisco IPsec.
 
@@ -69,6 +46,5 @@ def render_all() -> list[users_store.User]:
     users = users_store.load()
     render_vless(users)
     render_hysteria2(users)
-    render_clash_api()
     render_ikev2_env(users)
     return users

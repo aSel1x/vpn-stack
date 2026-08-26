@@ -3,9 +3,9 @@ import sys
 
 from vpnctl import export, ikev2ctl, render, sbctl, users_store
 from vpnctl.export import ExportError
-from vpnctl.paths import CLASH_API_CONFIG, HYSTERIA2_CONFIG, USERS_JSON, VLESS_CONFIG
+from vpnctl.paths import HYSTERIA2_CONFIG, USERS_JSON, VLESS_CONFIG
 
-FRAGMENT_FILES = [VLESS_CONFIG, HYSTERIA2_CONFIG, CLASH_API_CONFIG]
+FRAGMENT_FILES = [VLESS_CONFIG, HYSTERIA2_CONFIG]
 
 
 def _snapshot() -> dict:

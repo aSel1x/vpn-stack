@@ -2,7 +2,6 @@
   "log": {
     "disabled": false,
     "level": "info",
-    "timestamp": true,
-    "output": "/var/lib/sing-box/sing-box.log"
+    "timestamp": true
   }
 }

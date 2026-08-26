@@ -3,7 +3,6 @@ users.json
 .env
 exports/
 sing-box/hysteria2/certs/
-sing-box/common/05_clash_api.json
 sing-box/vless-reality/10_vless_reality_tcp.json
 sing-box/hysteria2/20_hysteria2.json
 ikev2/.env
