@@ -1,0 +1,12 @@
+{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct-tag"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ]
+}
