@@ -26,7 +26,7 @@ uv run vpnctl user rm <name>               # hard delete — credentials gone fo
 uv run vpnctl user enable <name>           # re-enable; vless/hysteria2/l2tp creds preserved, IKEv2 cert re-issued (new one)
 uv run vpnctl user disable <name>          # temporarily remove from active config, keep record
 uv run vpnctl user list [--show-secrets]   # secrets hidden unless explicitly asked
-uv run vpnctl user export <name> [--protocol vless|hysteria2|ikev2|both] [--host H] [--qr] [--png]
+uv run vpnctl user export <name> [--protocol vless|hysteria2|ikev2|all] [--host H] [--qr] [--png]
 uv run vpnctl render [--no-restart]        # re-render config from users.json without adding/removing anyone
 uv run vpnctl migrate                      # one-time bootstrap of users.json from hand-written config; refuses to run twice
 uv run vpnctl ikev2 list-clients           # diagnostics — see ikev2/ section below

@@ -194,7 +194,7 @@ def cmd_user_export(args: argparse.Namespace) -> None:
         print(f"No such user: {args.name!r}", file=sys.stderr)
         sys.exit(1)
 
-    protocols = ["vless", "hysteria2"] if args.protocol == "both" else [args.protocol]
+    protocols = ["vless", "hysteria2", "ikev2"] if args.protocol == "all" else [args.protocol]
 
     host = None
     if any(p in ("vless", "hysteria2") for p in protocols):
@@ -278,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = user_sub.add_parser("export", help="print share link(s) and optionally render a QR code")
     p.add_argument("name")
-    p.add_argument("--protocol", choices=["vless", "hysteria2", "ikev2", "both"], default="both")
+    p.add_argument("--protocol", choices=["vless", "hysteria2", "ikev2", "all"], default="all")
     p.add_argument("--host", help="server hostname/IP (defaults to VPN_SERVER_HOST in .env)")
     p.add_argument("--qr", action="store_true", help="print an ASCII QR code to the terminal")
     p.add_argument("--png", action="store_true", help="also save a QR code PNG under exports/")
