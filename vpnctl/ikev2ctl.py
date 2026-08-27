@@ -37,7 +37,58 @@ def apply_env() -> tuple[bool, str]:
         text=True,
     )
     output = (result.stdout + result.stderr).strip()
-    return result.returncode == 0, output
+    ok = result.returncode == 0
+    if ok:
+        fw_ok, fw_output = ensure_ipv4_forwarding()
+        if not fw_ok:
+            output += f"\nwarning: could not ensure IKEv2 IPv4 forwarding rules: {fw_output}"
+    return ok, output
+
+
+# hwdsl2/ipsec-vpn-server's default IPv4 pool shared by both L2TP and IKEv2
+# clients (not overridden by anything in ikev2/.env for this deployment --
+# confirmed against the live nftables ruleset).
+_IKEV2_IPV4_NET = "192.168.42.0/24"
+
+
+def _default_iface() -> str | None:
+    result = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.split()
+    return parts[parts.index("dev") + 1] if "dev" in parts else None
+
+
+def ensure_ipv4_forwarding() -> tuple[bool, str]:
+    """Insert the FORWARD-chain accepts run.sh never adds for its own L2TP_NET pool.
+
+    Confirmed against a live instance's nftables ruleset: run.sh installs
+    net0<->net0 FORWARD accepts for XAUTH_NET (Cisco IPsec, 192.168.43.0/24)
+    and for its IPv6 pool, plus ppp+<->net0 accepts for L2TP-over-ppp -- but
+    never a net0<->net0 pair for L2TP_NET (192.168.42.0/24) itself. IKEv2
+    IPv4 clients share that pool but, unlike L2TP, have no ppp interface --
+    their decrypted traffic reappears directly on the physical interface via
+    XFRM -- so without this rule their IKE/IPsec SA establishes fine but no
+    traffic can ever forward: FORWARD's default DROP policy swallows it
+    silently, with nothing logged. Idempotent (checks before inserting);
+    safe to call anytime, including after every ikev2 container restart.
+    """
+    iface = _default_iface()
+    if not iface:
+        return False, "could not determine default network interface"
+
+    rules = [
+        ["-i", iface, "-d", _IKEV2_IPV4_NET, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ["-s", _IKEV2_IPV4_NET, "-o", iface, "-j", "ACCEPT"],
+    ]
+    for rule in rules:
+        check = subprocess.run(["iptables", "-C", "FORWARD", *rule], capture_output=True, text=True)
+        if check.returncode == 0:
+            continue
+        add = subprocess.run(["iptables", "-I", "FORWARD", "1", *rule], capture_output=True, text=True)
+        if add.returncode != 0:
+            return False, (add.stdout + add.stderr).strip()
+    return True, f"IKEv2 IPv4 FORWARD rules ensured on {iface} for {_IKEV2_IPV4_NET}"
 
 
 def add_client(name: str) -> tuple[bool, str]:

@@ -41,3 +41,22 @@ if command -v ufw >/dev/null; then
 else
   echo "ufw not found, skipping firewall setup" >&2
 fi
+
+# hwdsl2/ipsec-vpn-server's run.sh never adds a FORWARD accept for its own
+# L2TP_NET pool (192.168.42.0/24, shared with IKEv2 IPv4 clients) on the
+# physical interface -- only for XAUTH_NET and its IPv6 pool. IKEv2 IPv4
+# clients have no ppp interface (unlike L2TP), so without this their IPsec SA
+# comes up but no traffic ever forwards. Only takes effect once the ikev2
+# container has actually created its own chain/rules; harmless (and a no-op
+# check) if run before that. `uv run vpnctl render` re-applies this too, so
+# a reboot only needs one or the other, not both.
+IKEV2_IFACE=$(ip route show default | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -1)
+if [[ -n "$IKEV2_IFACE" ]] && command -v iptables >/dev/null; then
+  for rule in \
+    "-i $IKEV2_IFACE -d 192.168.42.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+    "-s 192.168.42.0/24 -o $IKEV2_IFACE -j ACCEPT"
+  do
+    # shellcheck disable=SC2086
+    iptables -C FORWARD $rule 2>/dev/null || iptables -I FORWARD 1 $rule || true
+  done
+fi
