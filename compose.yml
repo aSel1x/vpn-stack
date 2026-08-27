@@ -7,14 +7,22 @@ services:
     container_name: ipsec-vpn-server
     restart: always
     network_mode: host
-    # TEMPORARY diagnostic: switched from non-privileged (cap_add: NET_ADMIN
-    # + devices: /dev/ppp, see git history) to privileged: true to test
-    # whether capability mode is a factor in the IKEv2 connectivity
-    # investigation. host-bootstrap.sh's sysctls are still required either
-    # way -- network_mode: host blocks Compose's `sysctls:` regardless of
-    # privilege level. Revert to the non-privileged block once this is
-    # answered.
-    privileged: true
+    # Not privileged: true. network_mode: host means there's no separate
+    # container netns, so Compose can't set the sysctls this image normally
+    # wants (Docker rejects `sysctls:` under host networking) -- those are
+    # applied once on the host itself instead, see scripts/host-bootstrap.sh.
+    #
+    # Confirmed via a live diagnostic (privileged: true, then a full
+    # bare-metal hwdsl2/setup-ipsec-vpn install replacing this container
+    # entirely): capability mode and Docker-vs-bare-metal are both ruled
+    # out as factors in a client-side IKEv2 connectivity issue -- packets
+    # never arrived at this host's interface in any of the three
+    # configurations. Root cause is a network path issue upstream of this
+    # server, not this container's privilege level.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/ppp:/dev/ppp"
     env_file:
       - ./ikev2/.env
     volumes:
