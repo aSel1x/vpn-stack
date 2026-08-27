@@ -7,14 +7,14 @@ services:
     container_name: ipsec-vpn-server
     restart: always
     network_mode: host
-    # Not privileged: true. network_mode: host means there's no separate
-    # container netns, so Compose can't set the sysctls this image normally
-    # wants (Docker rejects `sysctls:` under host networking) -- those are
-    # applied once on the host itself instead, see scripts/host-bootstrap.sh.
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - "/dev/ppp:/dev/ppp"
+    # TEMPORARY diagnostic: switched from non-privileged (cap_add: NET_ADMIN
+    # + devices: /dev/ppp, see git history) to privileged: true to test
+    # whether capability mode is a factor in the IKEv2 connectivity
+    # investigation. host-bootstrap.sh's sysctls are still required either
+    # way -- network_mode: host blocks Compose's `sysctls:` regardless of
+    # privilege level. Revert to the non-privileged block once this is
+    # answered.
+    privileged: true
     env_file:
       - ./ikev2/.env
     volumes:
