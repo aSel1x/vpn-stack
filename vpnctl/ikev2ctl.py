@@ -45,15 +45,24 @@ def add_client(name: str) -> tuple[bool, str]:
 
 
 def remove_client(name: str) -> tuple[bool, str]:
-    """Revoke an IKEv2 client's certificate.
+    """Revoke, then delete, an IKEv2 client's certificate.
 
     ikev2.sh has no `--removeclient` -- confirmed against a live instance.
     There's `--deleteclient` and `--revokeclient`; deleteclient's own
     warning says deleting *does not* stop that certificate from still
-    being accepted, so revoke is the one that actually blocks access.
-    Needs `-y` or it blocks on an interactive confirmation prompt.
+    being accepted, so revoke is the step that actually blocks access.
+
+    But revoke alone isn't enough either: a revoked name stays reserved
+    in the IPsec database, so a later `--addclient` for the same name
+    (e.g. re-adding a previously removed user) fails with "already
+    exists" -- confirmed live. Deleting *after* revoking is safe (the
+    cert is already invalid by then) and frees the name for reuse.
+    Both need `-y` or they block on an interactive confirmation prompt.
     """
-    return _docker_exec("ikev2.sh", "--revokeclient", name, "-y")
+    ok, output = _docker_exec("ikev2.sh", "--revokeclient", name, "-y")
+    if not ok:
+        return False, output
+    return _docker_exec("ikev2.sh", "--deleteclient", name, "-y")
 
 
 def list_clients() -> tuple[bool, str]:
