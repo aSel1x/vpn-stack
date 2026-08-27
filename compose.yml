@@ -7,7 +7,14 @@ services:
     container_name: ipsec-vpn-server
     restart: always
     network_mode: host
-    privileged: true
+    # Not privileged: true. network_mode: host means there's no separate
+    # container netns, so Compose can't set the sysctls this image normally
+    # wants (Docker rejects `sysctls:` under host networking) -- those are
+    # applied once on the host itself instead, see scripts/host-bootstrap.sh.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/ppp:/dev/ppp"
     env_file:
       - ./ikev2/.env
     volumes:

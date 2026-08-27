@@ -1,0 +1,43 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          install -d -m 700 ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      # No --delete: users.json, .env, ikev2/.env, the rendered sing-box
+      # fragments, and hysteria2/certs/ live only on the server (gitignored,
+      # never in this checkout) and must survive every deploy.
+      - name: Sync code to server
+        run: |
+          rsync -az --exclude '.git/' --exclude '.github/' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./ "root@${{ secrets.DEPLOY_HOST }}:/root/vpn-stack/"
+
+      - name: Validate and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key "root@${{ secrets.DEPLOY_HOST }}" bash -s <<'REMOTE'
+          set -euo pipefail
+          cd /root/vpn-stack
+          uv sync --frozen
+          docker compose run --rm --no-deps sing-box check \
+            -C /etc/sing-box/common -C /etc/sing-box/vless-reality -C /etc/sing-box/hysteria2
+          docker compose up -d --force-recreate sing-box ikev2
+          REMOTE
