@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from vpnctl import export, ikev2ctl, render, sbctl, users_store
+from vpnctl import bootstrap, export, ikev2ctl, render, sbctl, users_store
 from vpnctl.export import ExportError
 from vpnctl.paths import HYSTERIA2_CONFIG, USERS_JSON, VLESS_CONFIG
 
@@ -79,6 +79,15 @@ def _sync_ikev2_client(user: users_store.User, *, provisioned: bool) -> None:
     if current is not None:
         current.ikev2_provisioned = provisioned
         users_store.save(users)
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> None:
+    ok, msg = bootstrap.bootstrap_sing_box(force=args.force)
+    print(f"[sing-box] {msg}")
+    ok2, msg2 = bootstrap.bootstrap_ikev2_env(force=args.force)
+    print(f"[ikev2] {msg2}")
+    if ok or ok2:
+        print("Run `vpnctl user add <name>` next to populate it with a real user.")
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
@@ -245,6 +254,10 @@ def cmd_ikev2_list_clients(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vpnctl", description="sing-box VPN user automator")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("bootstrap", help="generate the hand-owned base config (REALITY key, Hysteria2 cert, IKEv2 PSK) -- one-time, before the first `user add`")
+    p.add_argument("--force", action="store_true", help="regenerate even if config already exists (invalidates every already-exported client profile)")
+    p.set_defaults(func=cmd_bootstrap)
 
     p = sub.add_parser("migrate", help="bootstrap users.json from the existing hand-written config (one-time)")
     p.set_defaults(func=cmd_migrate)

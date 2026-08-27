@@ -18,9 +18,10 @@ Unlike a typical codebase, the config files here hold real credentials: a REALIT
 
 ## Users: use `vpnctl`, not hand-edited JSON
 
-`users.json` (gitignored) is the single source of truth for who has access — across *all* protocols, sing-box and IKEv2/L2TP alike. It holds, per user: `vless_uuid`, `hysteria2_password`, `l2tp_password`, `ikev2_provisioned` (bool), `enabled`, `created_at`. `sing-box/vless-reality/10_vless_reality_tcp.json` and `sing-box/hysteria2/20_hysteria2.json`'s `users` arrays, and `ikev2/.env`'s `VPN_ADDL_USERS`/`VPN_ADDL_PASSWORDS`, are all *generated* from it — any manual edit to those will be silently overwritten the next time `vpnctl` renders. Everything else in those files (ports, REALITY keys, obfs password, TLS paths, masquerade domain, `VPN_IPSEC_PSK`) is still hand-owned and passes through untouched. (Loading an older `users.json` missing the L2TP/IKEv2 fields auto-backfills them in place — no separate migration step needed.)
+`users.json` (gitignored) is the single source of truth for who has access — across *all* protocols, sing-box and IKEv2/L2TP alike. It holds, per user: `vless_uuid`, `hysteria2_password`, `l2tp_password`, `ikev2_provisioned` (bool), `enabled`, `created_at`. `sing-box/vless-reality/10_vless_reality_tcp.json` and `sing-box/hysteria2/20_hysteria2.json`'s `users` arrays, and `ikev2/.env`'s `VPN_ADDL_USERS`/`VPN_ADDL_PASSWORDS`, are all *generated* from it — any manual edit to those will be silently overwritten the next time `vpnctl` renders. Everything else in those files (ports, REALITY keys, obfs password, TLS paths, masquerade domain, `VPN_IPSEC_PSK`) is still hand-owned and passes through untouched. (Loading an older `users.json` missing the L2TP/IKEv2 fields auto-backfills them in place — no separate migration step needed. A missing `users.json` is treated as zero users, not an error — `user add` on a freshly-`bootstrap`ped server just works.)
 
 ```bash
+uv run vpnctl bootstrap [--force]          # one-time: generate REALITY keypair, Hysteria2 cert+obfs, ikev2/.env PSK (day-0 setup on a fresh checkout)
 uv run vpnctl user add <name>              # generate fresh credentials for every protocol, apply
 uv run vpnctl user rm <name>               # hard delete — credentials gone for good
 uv run vpnctl user enable <name>           # re-enable; vless/hysteria2/l2tp creds preserved, IKEv2 cert re-issued (new one)
@@ -28,9 +29,11 @@ uv run vpnctl user disable <name>          # temporarily remove from active conf
 uv run vpnctl user list [--show-secrets]   # secrets hidden unless explicitly asked
 uv run vpnctl user export <name> [--protocol vless|hysteria2|ikev2|all] [--host H] [--qr] [--png]
 uv run vpnctl render [--no-restart]        # re-render config from users.json without adding/removing anyone
-uv run vpnctl migrate                      # one-time bootstrap of users.json from hand-written config; refuses to run twice
+uv run vpnctl migrate                      # one-time bootstrap of users.json from an *existing* hand-written single-user config; refuses to run twice
 uv run vpnctl ikev2 list-clients           # diagnostics — see ikev2/ section below
 ```
+
+`bootstrap` and `migrate` solve different problems: `bootstrap` creates the hand-owned secrets from nothing (fresh server, empty `sing-box/vless-reality/` and `sing-box/hysteria2/` — these are gitignored wholesale, so a plain `git clone` never brings them along); `migrate` instead converts an *already-populated* hand-written single-user config (predates `vpnctl` entirely) into `users.json`. On a truly fresh checkout, run `bootstrap` then `user add`, not `migrate`.
 
 Every mutating subcommand follows the same pattern (`vpnctl/cli.py:validate_and_apply`): render → `docker compose run --rm --no-deps sing-box check` (all three `-C` dirs) → roll back the rendered sing-box fragment files (not `users.json`) on failure → `docker compose up -d --force-recreate --no-deps sing-box` on success, then sync the `ikev2` container **only if it's already running** (see `ikev2/` section — never implicitly started). A bad sing-box edit can't take down the running service.
 
@@ -67,14 +70,15 @@ No per-user device/connection limiting is enforced. sing-box has no native per-u
 ### `vpnctl/` (the CLI)
 
 - `paths.py` — all path constants, resolved relative to the package location (repo root).
+- `bootstrap.py` — one-time day-0 generation of the hand-owned base config: REALITY keypair (via `reality_key.generate_private_key`), self-signed Hysteria2 cert/key (`cryptography`'s `ec`/`x509`), obfs password, and `ikev2/.env`'s PSK/primary user slot. Refuses to overwrite existing files unless `force=True`.
 - `users_store.py` — `User` dataclass, `users.json` load/save, credential generation (`uuid.uuid4()`, `secrets.token_hex(16)`).
 - `render.py` — regenerates `10_/20_` config fragments and `ikev2/.env` from `users.json`.
-- `reality_key.py` — X25519 public-key derivation from the stored REALITY private key.
+- `reality_key.py` — X25519 keypair generation and public-key derivation from a stored REALITY private key.
 - `export.py` — builds `vless://` / `hysteria2://` share URIs and renders QR (terminal ASCII via `qrcode`, optional PNG under gitignored `exports/`).
 - `sbctl.py` — wraps `docker compose run .../check` and `docker compose up -d --force-recreate` for the sing-box service.
 - `ikev2ctl.py` — wraps `docker exec ipsec-vpn-server ikev2.sh` (add/remove/list/export client certs) plus `docker compose up -d --force-recreate --no-deps ikev2`; see `ikev2/` section below.
 - `dotenv.py` — minimal `.env`-file read/write helper; used by `render.py` to write `ikev2/.env`'s `VPN_ADDL_USERS`/`VPN_ADDL_PASSWORDS`, and by `export.py` to read `VPN_SERVER_HOST`.
-- `cli.py` — argparse entry point (`user add/rm/enable/disable/list/export`, `render`, `migrate`, `ikev2 list-clients`), and the validate-then-apply/rollback logic all mutating commands share.
+- `cli.py` — argparse entry point (`bootstrap`, `user add/rm/enable/disable/list/export`, `render`, `migrate`, `ikev2 list-clients`), and the validate-then-apply/rollback logic all mutating commands share.
 
 **Known trade-off:** gitignoring `10_`/`20_` wholesale (to keep secrets out of history) also puts their non-secret structural fields (ports, `server_name`, masquerade domain, bandwidth caps) outside version control, since secrets and structure currently share one file. Accepted as a reasonable simplification at solo-user scale — document structural tuning changes in commit messages/notes elsewhere rather than expecting git history to capture them.
 

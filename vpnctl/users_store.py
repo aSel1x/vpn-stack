@@ -30,10 +30,7 @@ def generate_credentials() -> tuple[str, str, str]:
 
 def load() -> list[User]:
     if not USERS_JSON.exists():
-        raise FileNotFoundError(
-            f"{USERS_JSON} not found. Run 'vpnctl migrate' first to bootstrap it "
-            "from the existing hand-written config."
-        )
+        return []
     data = json.loads(USERS_JSON.read_text())
     users = []
     schema_changed = False
