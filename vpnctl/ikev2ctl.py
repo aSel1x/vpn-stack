@@ -45,39 +45,64 @@ def add_client(name: str) -> tuple[bool, str]:
 
 
 def remove_client(name: str) -> tuple[bool, str]:
-    return _docker_exec("ikev2.sh", "--removeclient", name)
+    """Revoke an IKEv2 client's certificate.
+
+    ikev2.sh has no `--removeclient` -- confirmed against a live instance.
+    There's `--deleteclient` and `--revokeclient`; deleteclient's own
+    warning says deleting *does not* stop that certificate from still
+    being accepted, so revoke is the one that actually blocks access.
+    Needs `-y` or it blocks on an interactive confirmation prompt.
+    """
+    return _docker_exec("ikev2.sh", "--revokeclient", name, "-y")
 
 
 def list_clients() -> tuple[bool, str]:
     return _docker_exec("ikev2.sh", "--listclients")
 
 
-def export_client(name: str) -> tuple[bool, str, str | None]:
-    """Export an IKEv2 client's .p12 bundle to exports/.
+# (container filename suffix, exports/ filename suffix, human label).
+# Confirmed against a live instance: ikev2.sh --exportclient writes all
+# three for every client -- .p12 is Windows/Linux only, *not* iOS. iOS
+# and macOS need the .mobileconfig (a complete ready-to-import VPN
+# profile, not just a bare certificate).
+_CLIENT_FILES = [
+    (".p12", "-ikev2.p12", "Windows/Linux"),
+    (".sswan", "-ikev2.sswan", "Android, strongSwan app"),
+    (".mobileconfig", "-ikev2.mobileconfig", "iOS/macOS"),
+]
 
-    Returns (ok, message, path_or_none). The exact filename ikev2.sh writes
-    inside the container hasn't been confirmed against a live instance yet --
-    this tries the conventional `<name>.p12` and surfaces the raw --listclients
-    output on failure so the real name can be spotted and this fixed.
+
+def export_client(name: str) -> tuple[bool, str, list[str]]:
+    """Export an IKEv2 client's credential bundles to exports/.
+
+    Returns (ok, message, exported_paths).
     """
     ok, output = _docker_exec("ikev2.sh", "--exportclient", name)
     if not ok:
-        return False, output, None
+        return False, output, []
 
     EXPORTS_DIR.mkdir(exist_ok=True)
-    dest = EXPORTS_DIR / f"{name}-ikev2.p12"
-    cp = subprocess.run(
-        ["docker", "cp", f"{IKEV2_CONTAINER_NAME}:/etc/ipsec.d/{name}.p12", str(dest)],
-        capture_output=True,
-        text=True,
-    )
-    if cp.returncode != 0:
+    exported = []
+    lines = []
+    for src_suffix, dest_suffix, label in _CLIENT_FILES:
+        dest = EXPORTS_DIR / f"{name}{dest_suffix}"
+        cp = subprocess.run(
+            ["docker", "cp", f"{IKEV2_CONTAINER_NAME}:/etc/ipsec.d/{name}{src_suffix}", str(dest)],
+            capture_output=True,
+            text=True,
+        )
+        if cp.returncode != 0:
+            lines.append(f"  FAILED {name}{src_suffix} ({label}): {cp.stderr.strip()}")
+            continue
+        exported.append(str(dest))
+        lines.append(f"  {dest}  ({label})")
+
+    if not exported:
         _, listing = list_clients()
         return (
             False,
-            f"--exportclient succeeded but couldn't docker cp the .p12 out "
-            f"(tried /etc/ipsec.d/{name}.p12): {cp.stderr.strip()}\n"
-            f"--listclients output for reference:\n{listing}",
-            None,
+            "None of the client files could be copied out:\n" + "\n".join(lines)
+            + f"\n--listclients output for reference:\n{listing}",
+            [],
         )
-    return True, f"Exported to {dest}", str(dest)
+    return True, "Exported:\n" + "\n".join(lines), exported
