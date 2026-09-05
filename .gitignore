@@ -6,6 +6,7 @@ sing-box/hysteria2/certs/
 sing-box/vless-reality/10_vless_reality_tcp.json
 sing-box/hysteria2/20_hysteria2.json
 ikev2/.env
+dnstt/keys/server.key
 scripts/.deploy_key
 scripts/.deploy_key.pub
 

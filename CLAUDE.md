@@ -10,7 +10,7 @@ The repo root is `/home/asel1x/Code/vpn-stack/` (`compose.yml` lives directly he
 
 ## ⚠️ This directory contains live secrets
 
-Unlike a typical codebase, the config files here hold real credentials: a REALITY `private_key`, per-user VLESS UUIDs, a Hysteria2 obfuscation password and per-user passwords, a TLS `private.key`, and an IPsec PSK/user/password in `ikev2/.env`. Treat every value in `sing-box/vless-reality/`, `sing-box/hysteria2/`, `users.json`, `.env`, `exports/`, and `ikev2/.env` as a live secret:
+Unlike a typical codebase, the config files here hold real credentials: a REALITY `private_key`, per-user VLESS UUIDs, a Hysteria2 obfuscation password and per-user passwords, a TLS `private.key`, and an IPsec PSK/user/password in `ikev2/.env`. Treat every value in `sing-box/vless-reality/`, `sing-box/hysteria2/`, `users.json`, `.env`, `exports/`, `ikev2/.env`, and `dnstt/keys/server.key` as a live secret:
 
 - Never echo, log, paste, or transmit these values (including to external tools, issues, or commit messages).
 - `.gitignore` excludes every one of those paths — but double-check `git status` before ever staging files here, since a mistake would put live credentials in history.
@@ -98,3 +98,16 @@ No device/connection limiting is enforced for this protocol group either — con
 ```bash
 uv run vpnctl ikev2 list-clients   # raw `ikev2.sh --listclients` output, for diagnostics
 ```
+
+### `dnstt/` + `dnstt-socks/` — DNS-tunnel bypass (last resort)
+
+Two extra `compose.yml` services, both `network_mode: host`, deliberately **outside `vpnctl`** — this is a single fixed tunnel, not a per-user protocol, so there's nothing to render and no `users.json` involvement.
+
+- `dnstt` — David Fifield's `dnstt-server`, built from source in `dnstt/Dockerfile`. For networks that block everything except DNS: the client encodes a stream into DNS queries under the delegated zone `tun.example.net` (`ns-tun.example.net A -> this host`, `tun.example.net NS ns-tun.example.net`), which this host answers authoritatively on `udp/53`. Bound to `${VPN_SERVER_HOST}` explicitly, **not** wildcard `:53` — a wildcard collides with the host's `systemd-resolved` stub listener. The decoded stream is forwarded to the host's own sshd (`127.0.0.1:22`); there is no bespoke proxy protocol — a client runs SSH *over* the tunnel and rides its forwarding. `dnstt/keys/server.key` is the long-term private key (gitignored, server-only); `dnstt/keys/server.pub` (`7ccc…566`) is the public key every client pins.
+- `dnstt-socks` — a loopback-only `microsocks` (SOCKS5) on `127.0.0.1:7300`, built from source (`dnstt-socks/Dockerfile`; not packaged in Alpine). It's the internet exit for SSH-over-dnstt mobile clients (HTTP Injector / AnyBridge), which forward their traffic to it across the SSH channel. Never exposed — reachable only through an authenticated SSH session, so it needs no auth of its own.
+
+Access is a dedicated non-root host user `pentest-dnstt` (not in this repo; its password lives only on the server), scoped by the sshd drop-in `/etc/ssh/sshd_config.d/60-pentest-dnstt.conf` to `AllowTcpForwarding yes` + `PermitOpen 127.0.0.1:7300 1.1.1.1:853` — the SOCKS exit plus the client's DoT resolver, nothing else, so the account can't be turned into an open proxy. Loosen `PermitOpen` only if a client needs a different forward target.
+
+**Why it fails on the phone itself vs. a tethered laptop:** a tethered client resolves through the iPhone's Personal-Hotspot DNS relay at `172.20.10.1`, which forwards to the carrier's real recursor; the phone's *own* stack has no such address, so a phone-side client must point its dnstt resolver at the carrier's actual cellular resolver IP (e.g. `10.219.250.1`), never `172.20.10.1`.
+
+**Not CI-managed:** `deploy.yml` recreates only `sing-box` and `ikev2`, so after changing dnstt build/config run `docker compose up -d --build dnstt dnstt-socks` on the server by hand. Laptop test client: `dnstt-client -udp <resolver>:53 -pubkey 7ccc…566 tun.example.net 127.0.0.1:<port>`, then SSH through `127.0.0.1:<port>`.

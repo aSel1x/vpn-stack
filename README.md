@@ -1,6 +1,6 @@
 # vpn-stack
 
-Personal VPN server: `sing-box` (VLESS+REALITY, Hysteria2) + IKEv2/L2TP/Cisco IPsec (`hwdsl2/ipsec-vpn-server`), managed by `vpnctl`.
+Personal VPN server: `sing-box` (VLESS+REALITY, Hysteria2) + IKEv2/L2TP/Cisco IPsec (`hwdsl2/ipsec-vpn-server`), managed by `vpnctl`; plus `dnstt` (DNS-tunnel last-resort bypass, see `CLAUDE.md`).
 
 Deployed on `vpn-stack` (`ssh vpn-stack`, alias for `203.0.113.10`), repo lives there at `/root/vpn-stack`. Push to `main` deploys via GitHub Actions.
 
@@ -40,6 +40,12 @@ git add -A && git commit -m "..." && git push
 ```
 
 CI syncs the repo to the server, runs `sing-box check`, and restarts containers. It never touches `users.json` or any gitignored secret — those exist only on the server.
+
+CI recreates only `sing-box` and `ikev2`. The `dnstt`/`dnstt-socks` services are outside that list — after changing their build/config, bring them up by hand:
+
+```bash
+ssh vpn-stack "cd /root/vpn-stack && docker compose up -d --build dnstt dnstt-socks"
+```
 
 Manual deploy, bypassing CI:
 

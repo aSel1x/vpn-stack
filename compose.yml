@@ -43,3 +43,31 @@ services:
       -C /etc/sing-box/vless-reality
       -C /etc/sing-box/hysteria2
       run
+
+  # DNS tunnel (dnstt): last-resort bypass for networks that allow only DNS
+  # egress. Delegated zone tun.example.net (NS ns-tun.example.net -> this host)
+  # answers on udp/53; the tunneled stream is handed to the host sshd, and
+  # clients ride SSH on top, exiting via dnstt-socks. keys/server.key is
+  # gitignored and lives only on the server.
+  dnstt:
+    build: ./dnstt
+    image: dnstt-server:latest
+    container_name: dnstt-server
+    restart: always
+    network_mode: host
+    volumes:
+      - ./dnstt/keys:/keys:ro
+    command: >-
+      -udp ${VPN_SERVER_HOST}:53
+      -privkey-file /keys/server.key
+      tun.example.net 127.0.0.1:22
+
+  # SOCKS5 exit for the dnstt SSH clients. Loopback-only: reachable solely
+  # through an authenticated pentest-dnstt SSH forward, never from outside.
+  dnstt-socks:
+    build: ./dnstt-socks
+    image: dnstt-socks:latest
+    container_name: dnstt-socks
+    restart: always
+    network_mode: host
+    command: -i 127.0.0.1 -p 7300
