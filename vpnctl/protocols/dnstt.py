@@ -1,8 +1,10 @@
 """DNS tunnel (dnstt) -- last resort for networks that allow only DNS.
 
-Not per-user: a single fixed tunnel whose exit is the host's own sshd, with a
-loopback-only SOCKS5 (dnstt-socks) as the internet exit. Access control is a
-dedicated non-root host account, not anything vpnctl renders.
+One shared tunnel, but a login per person. The Noise key belongs to the
+server and encrypts the transport before anyone authenticates, so it cannot be
+personal; the sshd behind it can, and is. That is what makes `user rm` and
+`user disable` actually cut dnstt access -- with one shared account, removing
+somebody left their tunnel working and nothing to revoke.
 
 Ships disabled: it needs a delegated DNS zone, which a fresh server does not
 have, and binding udp/53 on a box that hasn't got one is pure attack surface.
@@ -45,20 +47,29 @@ PERMIT_OPEN = ("any",)
 # out of the host means no real account, no edit to the host's sshd_config, and
 # nothing to recreate by hand after a rebuild.
 EXIT = "127.0.0.1:2222"
-SSH_USER = "dnstt"
 
 
 def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
-    password = secrets.text("dnstt.ssh_password")
+    # One login per enabled user, so `user rm` and `user disable` actually cut
+    # dnstt access. They did not before: everyone shared one account, so
+    # removing somebody left their tunnel working with nothing to revoke.
+    #
+    # A user with no dnstt_password predates the field and gets no login until
+    # `vpnctl bootstrap` issues one -- silently inventing one here would mean
+    # `apply` handing out a credential nobody has been told.
+    logins = "".join(
+        f"{u.name}:{u.dnstt_password}\n"
+        for u in users
+        if u.enabled and u.dnstt_password
+    )
     env = (
-        f"SSH_USER={SSH_USER}\n"
-        f"SSH_PASSWORD={password}\n"
         f"SSH_PORT={EXIT.rsplit(':', 1)[1]}\n"
         f"SOCKS_EXIT={SOCKS_ADDR}\n"
         f"PERMIT_OPEN={' '.join(PERMIT_OPEN)}\n"
     )
     return {
         "dnstt/server.key": secrets.raw("dnstt.server.key"),
+        "dnstt-sshd/logins": logins.encode(),
         "dnstt.env": env.encode(),
     }
 
@@ -68,14 +79,16 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
     # can discover that: it is the blocked network's own DNS server, which on
     # a phone means reading it with a network-info app. See dnstt/SETUP.md.
     pub = secrets.text("dnstt.server.pub") if secrets.has("dnstt.server.pub") else "<not generated>"
-    password = secrets.text("dnstt.ssh_password") if secrets.has("dnstt.ssh_password") else "<not generated>"
+    # Zone and pubkey are the transport and identical for everyone. The login
+    # is this person's own, which is what makes revoking one of them possible.
+    password = user.dnstt_password or "<none issued -- run `vpnctl bootstrap`>"
     return [
         ShareItem(
             label="dnstt — mobile app (DNSTT → SSH)",
             filename=None,
             uri=(
                 f"zone={ZONE} pubkey={pub} "
-                f"ssh-user={SSH_USER} ssh-password={password} "
+                f"ssh-user={user.name} ssh-password={password} "
                 "resolver=<the blocked network's own DNS, plain UDP :53>"
             ),
         ),
@@ -84,20 +97,17 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
             filename=None,
             uri=(
                 f"dnstt-client -udp <resolver>:53 -pubkey {pub} {ZONE} 127.0.0.1:7000 "
-                f"&& ssh -N -D 1080 -p 7000 {SSH_USER}@127.0.0.1"
+                f"&& ssh -N -D 1080 -p 7000 {user.name}@127.0.0.1"
             ),
         ),
     ]
 
 
 def bootstrap() -> dict[str, bytes]:
-    # The SSH front's password is ordinary randomness, so it is made here.
-    # The Noise keypair is the dnstt-server binary's own format and needs the
-    # image built, which is too much to spend on a protocol that ships off --
-    # that one lives in prepare().
-    import secrets as _secrets
-
-    return {"dnstt.ssh_password": (_secrets.token_urlsafe(18) + "\n").encode()}
+    # Nothing server-wide to make. The SSH logins are per person and live in
+    # users.json; the Noise keypair is the dnstt-server binary's own format
+    # and needs the image built, so that is prepare()'s job.
+    return {}
 
 
 def prepare() -> dict[str, bytes]:
@@ -154,7 +164,7 @@ PROTOCOL = Protocol(
     order=40,
     ports=(Port(53, "udp"),),
     summary="DNS tunnel (dnstt -> containerised sshd -> SOCKS5)",
-    secret_names=("dnstt.server.key", "dnstt.ssh_password"),
+    secret_names=("dnstt.server.key",),
     default_enabled=False,
     render=render,
     share=share,
@@ -162,7 +172,7 @@ PROTOCOL = Protocol(
     prepare=prepare,
     compose_profile="dnstt",
     compose_services=("dnstt", "dnstt-sshd", "dnstt-socks"),
-    per_user=False,
+    per_user=True,
     notes=(
         f"Needs a delegated zone ({ZONE}) pointing NS at this host, and "
         "ufw allow 53/udp. See dnstt/SETUP.md."

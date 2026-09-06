@@ -101,6 +101,10 @@ services:
         required: false
     volumes:
       - dnstt-sshd-keys:/host-keys
+      # The rendered `name:password` list. A directory, not a single file:
+      # docker silently creates a *directory* in place of a missing bind-mount
+      # source, which would fail far from the cause.
+      - ${VPN_STATE:-/etc/vpn-stack}/rendered/dnstt-sshd:/conf:ro
 
   # SOCKS5 exit for SSH-over-dnstt clients. Loopback only: reachable solely
   # through an authenticated SSH forward, never from outside.

@@ -20,6 +20,12 @@ class User:
     ikev2_provisioned: bool
     enabled: bool
     created_at: str
+    # The dnstt tunnel itself has no notion of a user -- its Noise key belongs
+    # to the server and encrypts the transport before anyone authenticates.
+    # What can be personal is the SSH login behind it, and that is this.
+    # Empty means "predates this field": dnstt simply issues them no login
+    # until `vpnctl bootstrap` fills it in. Never invented on read.
+    dnstt_password: str = ""
 
 
 # render_ikev2_env joins names into a single space-separated VPN_ADDL_USERS and
@@ -69,6 +75,9 @@ def load() -> list[User]:
     for u in data["users"]:
         u.setdefault("ikev2_provisioned", False)
         u.setdefault("enabled", True)
+        # Not a rotation risk: absent means never issued, so a default of
+        # "none yet" is the truth. Filled in by `bootstrap`, never here.
+        u.setdefault("dnstt_password", "")
         if "l2tp_password" not in u:
             raise UsersError(
                 f"{USERS_JSON}: user {u.get('name')!r} has no l2tp_password. "
@@ -111,6 +120,13 @@ def find(users: list[User], name: str) -> User | None:
     return None
 
 
+def new_dnstt_password() -> str:
+    # Goes into a container's chpasswd and into a share card people retype on
+    # a phone, so: no shell metacharacters, no colon (the chpasswd separator),
+    # no ambiguity between similar glyphs.
+    return secrets.token_urlsafe(16).replace("-", "x").replace("_", "y")
+
+
 def new_user(name: str) -> User:
     vless_uuid, hy2_password, l2tp_password = generate_credentials()
     return User(
@@ -121,4 +137,20 @@ def new_user(name: str) -> User:
         ikev2_provisioned=False,
         enabled=True,
         created_at=_now(),
+        dnstt_password=new_dnstt_password(),
     )
+
+
+def backfill(users: list[User]) -> list[str]:
+    """Give pre-existing users the fields added since they were created.
+
+    Only ever *adds* a credential that was never issued; it does not rotate
+    one that exists, which is why `load()` may not do this and an operator
+    command must.
+    """
+    filled = []
+    for u in users:
+        if not u.dnstt_password:
+            u.dnstt_password = new_dnstt_password()
+            filled.append(u.name)
+    return filled
