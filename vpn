@@ -1,0 +1,178 @@
+#!/bin/bash
+# ./vpn -- the operator's entry point. Runs on YOUR machine.
+#
+# Deliberately dumb: it holds no state, no config file, no cached user list and
+# no secrets. Anything it does not recognise is forwarded verbatim to vpnctl on
+# the server, so the CLI surface is defined in exactly one place.
+#
+# This file is a placeholder for a future app's SSH transport, which is why its
+# remote surface is kept to three operations: run a command, push a tar, pull a
+# file. A second implementation (libssh2/russh/paramiko, for Windows and mobile
+# where OpenSSH is not on PATH) then costs a day, not a rewrite.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOST="${VPN_HOST:-}"
+SSH_KEY="${VPN_SSH_KEY:-}"
+REMOTE_PATH="${VPN_REMOTE_PATH:-/opt/vpn-stack}"
+
+if [[ -z "$HOST" && -f "$REPO/.vpn-host" ]]; then
+  HOST="$(<"$REPO/.vpn-host")"
+fi
+
+ssh_opts=(-o StrictHostKeyChecking=accept-new)
+[[ -n "$SSH_KEY" ]] && ssh_opts+=(-i "$SSH_KEY")
+
+need_host() {
+  if [[ -z "$HOST" ]]; then
+    cat >&2 <<MSG
+No server configured. Either:
+  ./vpn init <user@host>          set one up (writes .vpn-host, gitignored)
+  VPN_HOST=<user@host> ./vpn ...  for a one-off
+MSG
+    exit 2
+  fi
+}
+
+# One SSH call, one lock. That is the whole multi-operator story: two people
+# running ./vpn at once serialise instead of interleaving writes to users.json.
+remote() {
+  need_host
+  # -t only when we actually have a terminal, or ssh warns on every scripted call
+  local tty=()
+  [[ -t 0 && -t 1 ]] && tty=(-t)
+  [[ " $* " == *" --json "* ]] && tty=()
+  # Quote every argument for the remote shell. `$*` unquoted is re-split there,
+  # so anything with a space or a glob character silently becomes several
+  # arguments -- or, with the wrong input, something else entirely.
+  local cmd
+  cmd="$(printf '%q ' "$@")"
+  # shellcheck disable=SC2029
+  ssh "${ssh_opts[@]}" "${tty[@]}" "$HOST" \
+    "cd $REMOTE_PATH && flock /run/vpn-stack.lock /usr/local/bin/vpnctl $cmd"
+}
+
+case "${1:-}" in
+  init)
+    target="${2:?usage: ./vpn init <user@host>}"
+    shift 2
+    bash "$REPO/scripts/install.sh" "$target" "$@"
+    # The whole target, user included. Stripping it left every later ./vpn call
+    # connecting as the local user instead of root, which fails with a
+    # permission error that says nothing about where it came from.
+    echo "$target" > "$REPO/.vpn-host"
+    ;;
+
+  deploy)
+    need_host
+    SSH_OPTS="${ssh_opts[*]}" REPO_PATH="$REMOTE_PATH" bash "$REPO/scripts/deploy.sh" "$HOST"
+    ;;
+
+  share)
+    need_host
+    name="${2:?usage: ./vpn share <user> [--bind <addr>] [--port N]}"
+    shift 2
+    # The credential is fetched to THIS machine and served from here. The VPN
+    # server never gains a listener and never learns who you handed it to.
+    remote user export "$name" --json --protocol all \
+      | python3 "$REPO/scripts/share.py" "$@"
+    ;;
+
+  smoke)
+    need_host
+    ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
+    ;;
+
+  backup)
+    need_host
+    # Streams through the SSH pipe into age on THIS machine: the passphrase
+    # never reaches the server and the plaintext never lands on either disk.
+    command -v age >/dev/null || { echo "install age(1) first" >&2; exit 1; }
+    # Both halves, and the second is the one people forget: the ikev2 volume
+    # holds cert9.db/key4.db, the NSS database with the IKEv2 CA private key.
+    # Without it every certificate this server ever issued is unrecoverable.
+    # rendered-* is excluded on purpose -- it is derived, `vpnctl apply`
+    # rebuilds it, and a backup should contain only what cannot be remade.
+    ssh "${ssh_opts[@]}" "$HOST" '
+      set -e
+      tar cz -C /etc/vpn-stack --exclude="./rendered*" . 2>/dev/null > /tmp/.vpn-state.tgz
+      docker run --rm -v vpn-stack_ikev2-vpn-data:/v alpine tar cz -C /v . > /tmp/.vpn-ikev2.tgz
+      tar c -C /tmp .vpn-state.tgz .vpn-ikev2.tgz
+      rm -f /tmp/.vpn-state.tgz /tmp/.vpn-ikev2.tgz' | age -p
+    ;;
+
+  restore)
+    need_host
+    # The other half of backup. A backup that has never been restored is a
+    # hope, not a backup -- and the failure mode it guards against (a rebuilt
+    # box) is exactly when you find out.
+    command -v age >/dev/null || { echo "install age(1) first" >&2; exit 1; }
+    file="${2:?usage: ./vpn restore <file.age> [--force]}"
+    [[ -f "$file" ]] || { echo "no such file: $file" >&2; exit 1; }
+    force="${3:-}"
+
+    # Restoring over a server that already has users overwrites live
+    # credentials with older ones, and every profile issued since diverges.
+    if [[ "$force" != "--force" ]]; then
+      if ssh "${ssh_opts[@]}" "$HOST" 'test -s /etc/vpn-stack/users.json' 2>/dev/null; then
+        echo "$HOST already has a user database." >&2
+        echo "Restoring would replace it, and every profile issued since this" >&2
+        echo "backup was taken would stop working. Re-run with --force if that" >&2
+        echo "is what you mean." >&2
+        exit 1
+      fi
+    fi
+
+    echo "Decrypting locally and streaming to $HOST..." >&2
+    age -d "$file" | ssh "${ssh_opts[@]}" "$HOST" '
+      set -e
+      umask 077
+      tmp=$(mktemp -d)
+      trap "rm -rf \"$tmp\"" EXIT
+      tar x -C "$tmp"
+      # pluto keeps the NSS database open; writing under it corrupts the very
+      # thing being restored.
+      docker stop ipsec-vpn-server >/dev/null 2>&1 || true
+      install -d -m 700 /etc/vpn-stack
+      tar xz -C /etc/vpn-stack -f "$tmp/.vpn-state.tgz"
+      docker volume create vpn-stack_ikev2-vpn-data >/dev/null
+      docker run --rm -i -v vpn-stack_ikev2-vpn-data:/v alpine \
+        tar xz -C /v < "$tmp/.vpn-ikev2.tgz"
+      echo "restored $(ls /etc/vpn-stack/secrets | wc -l) secrets"'
+
+    echo "Converging..." >&2
+    remote apply
+    ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
+    ;;
+
+  logs)
+    need_host
+    shift
+    ssh "${ssh_opts[@]}" -t "$HOST" "cd $REMOTE_PATH && docker compose logs -f ${*:-sing-box}"
+    ;;
+
+  ""|-h|--help|help)
+    cat <<MSG
+./vpn -- personal VPN operator CLI
+
+  ./vpn init <user@host>      set up a bare Ubuntu server from scratch
+  ./vpn deploy                sync code, validate, converge
+  ./vpn share <user>          one-shot LAN page: tap-to-import on a phone
+  ./vpn smoke                 assert the server is actually serving
+  ./vpn backup > f.age        encrypted backup, decrypted only on this machine
+  ./vpn restore f.age         put one back on a rebuilt server
+  ./vpn logs [service]        tail logs
+
+Everything else is forwarded to vpnctl on the server:
+
+  ./vpn status
+  ./vpn user add <name>
+  ./vpn user export <name> --qr
+  ./vpn protocol list | on <name> | off <name>
+MSG
+    ;;
+
+  *)
+    remote "$@"
+    ;;
+esac

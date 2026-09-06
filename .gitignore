@@ -2,19 +2,28 @@
 users.json
 .env
 exports/
-sing-box/hysteria2/certs/
-sing-box/vless-reality/10_vless_reality_tcp.json
-sing-box/hysteria2/20_hysteria2.json
 ikev2/.env
-dnstt/keys/server.key
-scripts/.deploy_key
-scripts/.deploy_key.pub
+# Directory-wide, not filename-exact. Anything dropped into these two dirs is
+# credential-bearing by default (a second inbound fragment, a .bak, a new cert),
+# and an exact-path rule silently fails to cover it. Only sing-box/common/ is
+# tracked. Same for keys/ and the deploy key: ignore the directory, allowlist
+# the one public file.
+sing-box/vless-reality/
+sing-box/hysteria2/
+dnstt/keys/*
+!dnstt/keys/server.pub
+scripts/.deploy_key*
 
 # --- runtime state ---
 data/
+state.json
+rendered
+rendered-*/
 
 # --- python tooling ---
 .venv/
 __pycache__/
 *.pyc
 *.egg-info/
+
+.vpn-host

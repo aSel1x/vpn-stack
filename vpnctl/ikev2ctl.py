@@ -1,13 +1,17 @@
+import os
 import subprocess
 
-from vpnctl.paths import EXPORTS_DIR, IKEV2_CONTAINER_NAME, ROOT
+from vpnctl.paths import IKEV2_CONTAINER_NAME, ROOT, STATE_DIR
 
 
 def _docker_exec(*args: str) -> tuple[bool, str]:
+    # ikev2.sh prompts on some paths; every caller passes -y, but a timeout
+    # means a missed one blocks `vpn user add` forever instead of failing.
     result = subprocess.run(
         ["docker", "exec", IKEV2_CONTAINER_NAME, *args],
         capture_output=True,
         text=True,
+        timeout=120,
     )
     output = (result.stdout + result.stderr).strip()
     return result.returncode == 0, output
@@ -26,23 +30,36 @@ def apply_env() -> tuple[bool, str]:
     """Recreate the ikev2 container so it picks up new .env values.
 
     The hwdsl2 image only reads VPN_ADDL_USERS/VPN_ADDL_PASSWORDS at startup,
-    so unlike sing-box this briefly drops every active L2TP/Cisco IPsec
-    session, not just the one being added/removed -- IKEv2 clients (managed
-    separately via ikev2.sh) are unaffected.
+    so unlike sing-box this briefly drops *every* active session this container
+    serves -- L2TP, Cisco IPsec and IKEv2 alike, not just the user being added
+    or removed. IKEv2 *certificates* survive (they live in the ikev2-vpn-data
+    volume, not in the container); live IKEv2 *tunnels* do not.
+
+    A failure to (re)install the FORWARD rules fails this call rather than
+    being appended to a string the caller discards on success: without those
+    rules IKEv2 IPv4 clients still connect but carry no traffic, which is
+    silent and expensive to diagnose.
     """
     result = subprocess.run(
         ["docker", "compose", "up", "-d", "--force-recreate", "--no-deps", "ikev2"],
         cwd=ROOT,
+        env={**os.environ, "VPN_STATE": str(STATE_DIR)},
         capture_output=True,
         text=True,
+        timeout=300,
     )
     output = (result.stdout + result.stderr).strip()
-    ok = result.returncode == 0
-    if ok:
-        fw_ok, fw_output = ensure_ipv4_forwarding()
-        if not fw_ok:
-            output += f"\nwarning: could not ensure IKEv2 IPv4 forwarding rules: {fw_output}"
-    return ok, output
+    if result.returncode != 0:
+        return False, output
+
+    fw_ok, fw_output = ensure_ipv4_forwarding()
+    if not fw_ok:
+        return False, (
+            f"{output}\nthe ikev2 container restarted, but the IKEv2 IPv4 FORWARD "
+            f"rules could NOT be applied: {fw_output}\nIKEv2 clients will connect "
+            "and carry no traffic until this is fixed (needs root)."
+        )
+    return True, output
 
 
 # hwdsl2/ipsec-vpn-server's default IPv4 pool shared by both L2TP and IKEv2
@@ -132,37 +149,65 @@ _CLIENT_FILES = [
 ]
 
 
-def export_client(name: str) -> tuple[bool, str, list[str]]:
-    """Export an IKEv2 client's credential bundles to exports/.
+def bundle_label(filename: str) -> str:
+    """Which platform a bundle is for, from its name.
 
-    Returns (ok, message, exported_paths).
+    The share page labelled all three "client profile", which is exactly the
+    question the recipient is trying to answer when they look at it.
+    """
+    for _, dest_suffix, label in _CLIENT_FILES:
+        if filename.endswith(dest_suffix):
+            return label
+    return "client profile"
+
+
+def export_client(name: str) -> tuple[bool, str, dict[str, bytes]]:
+    """Produce an IKEv2 client's bundles as bytes.
+
+    Deliberately returns contents rather than writing them: client bundles are
+    live credentials, and the old behaviour left a growing directory of them on
+    the server forever. The caller streams them to whoever asked.
+
+    ikev2.sh writes them into /etc/ipsec.d, which is the persistent volume --
+    so they survive restarts, and they ride along in every backup. They are
+    deleted here once read. Verified: the .p12 has an EMPTY password, so each
+    leftover file is an unprotected private key granting VPN access.
+
+    Returns (ok, message, {filename: contents}).
     """
     ok, output = _docker_exec("ikev2.sh", "--exportclient", name)
     if not ok:
-        return False, output, []
+        return False, output, {}
 
-    EXPORTS_DIR.mkdir(exist_ok=True)
-    exported = []
-    lines = []
-    for src_suffix, dest_suffix, label in _CLIENT_FILES:
-        dest = EXPORTS_DIR / f"{name}{dest_suffix}"
-        cp = subprocess.run(
-            ["docker", "cp", f"{IKEV2_CONTAINER_NAME}:/etc/ipsec.d/{name}{src_suffix}", str(dest)],
+    bundles: dict[str, bytes] = {}
+    problems: list[str] = []
+    for suffix, dest_suffix, label in _CLIENT_FILES:
+        result = subprocess.run(
+            ["docker", "exec", IKEV2_CONTAINER_NAME,
+             "cat", f"/etc/ipsec.d/{name}{suffix}"],
             capture_output=True,
-            text=True,
+            timeout=60,
         )
-        if cp.returncode != 0:
-            lines.append(f"  FAILED {name}{src_suffix} ({label}): {cp.stderr.strip()}")
+        if result.returncode != 0 or not result.stdout:
+            problems.append(f"  FAILED {name}{suffix} ({label}): {result.stderr.decode().strip()}")
             continue
-        exported.append(str(dest))
-        lines.append(f"  {dest}  ({label})")
+        bundles[f"{name}{dest_suffix}"] = result.stdout
 
-    if not exported:
+    # Read, then remove. Regenerating them is one --exportclient away; leaving
+    # them is a credential sitting on disk for as long as the volume lives.
+    _docker_exec(
+        "sh", "-c",
+        "rm -f " + " ".join(f"/etc/ipsec.d/{name}{sfx}" for sfx, _, _ in _CLIENT_FILES),
+    )
+
+    if not bundles:
         _, listing = list_clients()
-        return (
-            False,
-            "None of the client files could be copied out:\n" + "\n".join(lines)
-            + f"\n--listclients output for reference:\n{listing}",
-            [],
-        )
-    return True, "Exported:\n" + "\n".join(lines), exported
+        return False, (
+            "None of the client files could be read:\n" + "\n".join(problems)
+            + f"\n--listclients output for reference:\n{listing}"
+        ), {}
+
+    lines = [f"  {fn}  ({len(b)} bytes)" for fn, b in bundles.items()]
+    if problems:
+        lines += problems
+    return True, "Exported:\n" + "\n".join(lines), bundles

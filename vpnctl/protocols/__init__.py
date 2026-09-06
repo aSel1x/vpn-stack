@@ -1,0 +1,129 @@
+"""The protocol registry.
+
+One module per protocol, each exporting a single `Protocol`. Everything the
+rest of the system needs to know about a protocol -- which ports it claims,
+which secrets it needs, how to render its config, how to build a client's
+share link, whether it is a sing-box inbound or its own container -- lives
+there and nowhere else.
+
+Adding a protocol is a new module plus one line in PROTOCOLS. It changes no
+command line: the `-C` directory list that used to be hardcoded in compose.yml,
+sbctl.py and deploy.yml is gone, replaced by a single rendered directory.
+
+`render` and `share` are pure: no open(), no subprocess, no globals. That is
+deliberate and load-bearing -- it is the seam a future GUI app renders share
+links through without a server round-trip.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable
+
+from vpnctl.secrets_store import Secrets
+from vpnctl.users_store import User
+
+
+class Kind(Enum):
+    SINGBOX = "singbox"   # an inbound merged into the sing-box config tree
+    COMPOSE = "compose"   # its own container, toggled by compose profile
+
+
+@dataclass(frozen=True)
+class Port:
+    number: int
+    proto: str  # "tcp" | "udp"
+
+    def __str__(self) -> str:
+        return f"{self.number}/{self.proto}"
+
+
+@dataclass(frozen=True)
+class ShareItem:
+    """One deliverable for one user: a URI to scan, or a file to install."""
+
+    label: str            # human name, e.g. "iOS/macOS"
+    filename: str | None  # set for files, None for URIs
+    uri: str | None       # set for URIs, None for files
+    content: bytes | None = None
+
+
+@dataclass(frozen=True)
+class Protocol:
+    name: str
+    kind: Kind
+    order: int
+    ports: tuple[Port, ...]
+    summary: str
+    secret_names: tuple[str, ...]
+    default_enabled: bool
+    render: Callable[[Secrets, list[User]], dict[str, bytes]]
+    share: Callable[[Secrets, User, str], list[ShareItem]]
+    bootstrap: Callable[[], dict[str, bytes]]
+    compose_profile: str | None = None
+    compose_services: tuple[str, ...] = ()
+    notes: str = ""
+    # IKEv2 client bundles are produced by ikev2.sh inside the container, so
+    # unlike every other protocol its share() cannot be a pure function of the
+    # keyring. Flagged here rather than special-cased by name in the CLI.
+    share_via_container: bool = False
+    per_user: bool = True
+    # Secrets that pure Python cannot produce. dnstt's Noise keypair is emitted
+    # by the dnstt-server binary itself, which means building a Go image -- too
+    # expensive to do in `bootstrap` for a protocol that ships disabled. Run
+    # once, at `protocol on`, which is the moment you agreed to pay for it.
+    prepare: Callable[[], dict[str, bytes]] | None = None
+
+
+class RenderError(RuntimeError):
+    pass
+
+
+def _load_registry() -> dict[str, Protocol]:
+    from vpnctl.protocols import dnstt, hysteria2, ikev2, vless_reality
+
+    return {
+        p.name: p
+        for p in (
+            vless_reality.PROTOCOL,
+            hysteria2.PROTOCOL,
+            ikev2.PROTOCOL,
+            dnstt.PROTOCOL,
+        )
+    }
+
+
+PROTOCOLS: dict[str, Protocol] = _load_registry()
+
+
+def get(name: str) -> Protocol:
+    try:
+        return PROTOCOLS[name]
+    except KeyError:
+        known = ", ".join(sorted(PROTOCOLS))
+        raise RenderError(f"unknown protocol {name!r}; known: {known}") from None
+
+
+def ordered(names: list[str] | None = None) -> list[Protocol]:
+    chosen = PROTOCOLS.values() if names is None else [get(n) for n in names]
+    return sorted(chosen, key=lambda p: p.order)
+
+
+def assert_ports_disjoint(enabled: list[Protocol]) -> None:
+    """Two inbounds on one port is not an error sing-box will catch.
+
+    Verified against the real binary: `sing-box check` exits 0 with two
+    inbounds bound to the same listen_port. It does catch a duplicate tag.
+    So the registry has to own this check itself, or `protocol on` can produce
+    a config that validates and then half-works at runtime.
+    """
+    seen: dict[str, str] = {}
+    for proto in enabled:
+        for port in proto.ports:
+            key = str(port)
+            if key in seen:
+                raise RenderError(
+                    f"port conflict: {proto.name} and {seen[key]} both claim {key}"
+                )
+            seen[key] = proto.name

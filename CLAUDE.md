@@ -4,110 +4,158 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A personal VPN server deployment plus a small automation CLI around it. Core proxy layer is `sing-box` (https://sing-box.sagernet.org), deployed via Docker Compose, providing VLESS+REALITY and Hysteria2 inbound proxies. `vpnctl` (Python, in `vpnctl/`) manages users on top of that: it's the only supported way to add/remove/export users — the generated inbound config fragments should not be hand-edited directly (see "Users" below).
+A personal VPN server plus the CLI that operates it. Four protocols, one user database, one command surface:
 
-The repo root is `/home/asel1x/Code/vpn-stack/` (`compose.yml` lives directly here — no nested subdirectory).
+- **`sing-box`** — VLESS+REALITY (`10443/tcp`) and Hysteria2 (`20443/udp`), the everyday path.
+- **`hwdsl2/ipsec-vpn-server`** — IKEv2 / L2TP/IPsec / Cisco IPsec (`500`, `4500`, `1701` udp).
+- **`dnstt` + `dnstt-socks`** — DNS-tunnel last resort (`53/udp`), for networks that allow nothing else.
 
-## ⚠️ This directory contains live secrets
+Live deployment: `root@203.0.113.10`, checkout at `/opt/vpn-stack`, state at `/etc/vpn-stack`.
 
-Unlike a typical codebase, the config files here hold real credentials: a REALITY `private_key`, per-user VLESS UUIDs, a Hysteria2 obfuscation password and per-user passwords, a TLS `private.key`, and an IPsec PSK/user/password in `ikev2/.env`. Treat every value in `sing-box/vless-reality/`, `sing-box/hysteria2/`, `users.json`, `.env`, `exports/`, `ikev2/.env`, and `dnstt/keys/server.key` as a live secret:
+## Where things run
 
-- Never echo, log, paste, or transmit these values (including to external tools, issues, or commit messages).
-- `.gitignore` excludes every one of those paths — but double-check `git status` before ever staging files here, since a mistake would put live credentials in history.
-- When editing configs, change only what's needed and avoid printing full file contents that include secrets back to the user unless they specifically ask for that value.
+**`./vpn` on your machine. `vpnctl` on the server. Never the reverse.**
 
-## Users: use `vpnctl`, not hand-edited JSON
-
-`users.json` (gitignored) is the single source of truth for who has access — across *all* protocols, sing-box and IKEv2/L2TP alike. It holds, per user: `vless_uuid`, `hysteria2_password`, `l2tp_password`, `ikev2_provisioned` (bool), `enabled`, `created_at`. `sing-box/vless-reality/10_vless_reality_tcp.json` and `sing-box/hysteria2/20_hysteria2.json`'s `users` arrays, and `ikev2/.env`'s `VPN_ADDL_USERS`/`VPN_ADDL_PASSWORDS`, are all *generated* from it — any manual edit to those will be silently overwritten the next time `vpnctl` renders. Everything else in those files (ports, REALITY keys, obfs password, TLS paths, masquerade domain, `VPN_IPSEC_PSK`) is still hand-owned and passes through untouched. (Loading an older `users.json` missing the L2TP/IKEv2 fields auto-backfills them in place — no separate migration step needed. A missing `users.json` is treated as zero users, not an error — `user add` on a freshly-`bootstrap`ped server just works.)
+`./vpn` is a stateless bash wrapper at the repo root. It holds no config, no cache, no secrets: anything it doesn't recognise is forwarded verbatim over SSH to `vpnctl` on the server, under `flock /run/vpn-stack.lock` (which is the entire multi-operator story). The server is the only place that touches Docker, iptables, ufw and the user database.
 
 ```bash
-uv run vpnctl bootstrap [--force]          # one-time: generate REALITY keypair, Hysteria2 cert+obfs, ikev2/.env PSK (day-0 setup on a fresh checkout)
-uv run vpnctl user add <name>              # generate fresh credentials for every protocol, apply
-uv run vpnctl user rm <name>               # hard delete — credentials gone for good
-uv run vpnctl user enable <name>           # re-enable; vless/hysteria2/l2tp creds preserved, IKEv2 cert re-issued (new one)
-uv run vpnctl user disable <name>          # temporarily remove from active config, keep record
-uv run vpnctl user list [--show-secrets]   # secrets hidden unless explicitly asked
-uv run vpnctl user export <name> [--protocol vless|hysteria2|ikev2|all] [--host H] [--qr] [--png]
-uv run vpnctl render [--no-restart]        # re-render config from users.json without adding/removing anyone
-uv run vpnctl migrate                      # one-time bootstrap of users.json from an *existing* hand-written single-user config; refuses to run twice
-uv run vpnctl ikev2 list-clients           # diagnostics — see ikev2/ section below
+./vpn status                       # what the server is running
+./vpn user add <name>
+./vpn user export <name> --qr      # ASCII QR in YOUR terminal
+./vpn protocol list | on <x> | off <x>
+./vpn deploy                       # same script CI runs
+./vpn smoke                        # assert it is actually serving
+./vpn backup > f.age               # encrypted here, never on the server
+./vpn restore f.age                # onto a rebuilt box
+./vpn init root@<ip>               # bare Ubuntu -> serving VPN, one command
 ```
 
-`bootstrap` and `migrate` solve different problems: `bootstrap` creates the hand-owned secrets from nothing (fresh server, empty `sing-box/vless-reality/` and `sing-box/hysteria2/` — these are gitignored wholesale, so a plain `git clone` never brings them along); `migrate` instead converts an *already-populated* hand-written single-user config (predates `vpnctl` entirely) into `users.json`. On a truly fresh checkout, run `bootstrap` then `user add`, not `migrate`.
+Set the target once with `.vpn-host` (gitignored) or `VPN_HOST=`; the key with `VPN_SSH_KEY=` (it lives in `~/.ssh/`, never in this tree).
 
-Every mutating subcommand follows the same pattern (`vpnctl/cli.py:validate_and_apply`): render → `docker compose run --rm --no-deps sing-box check` (all three `-C` dirs) → roll back the rendered sing-box fragment files (not `users.json`) on failure → `docker compose up -d --force-recreate --no-deps sing-box` on success, then sync the `ikev2` container **only if it's already running** (see `ikev2/` section — never implicitly started). A bad sing-box edit can't take down the running service.
+**`vpnctl` refuses to mutate anything off-server** (`vpnctl/guard.py`). Before that guard existed, `vpnctl user add` on a laptop did not fail — it *succeeded*, rewriting a local copy of live credentials and starting a real sing-box bound to the laptop's ports.
 
-`user export` needs to know the server's public host — pass `--host`, or set `VPN_SERVER_HOST=...` in `.env` once the server is actually deployed somewhere (nothing bakes in a default). The REALITY public key in the `vless://` link is derived on the fly from the stored `private_key` via X25519 (`vpnctl/reality_key.py`) — it is never stored separately, so the private key stays the single source of truth and never needs rotating for this to work.
+`VPN_STATE_DIR=<dir>` is the test escape hatch, and it moves the whole blast radius, not just the Python: `apply` renders and validates but **does not converge** under a pointed state directory, because Docker, ufw and the host's ports are not relocated by an env var. Otherwise the escape hatch reproduced the exact bug the guard exists to stop, one level down. `VPN_ALLOW_CONVERGE=1` overrides.
 
-## Commands
+There is no fallback to the repo directory any more. If `/etc/vpn-stack` is not there, this is not the server and `vpnctl` says so, instead of quietly writing live credentials into a checkout.
+
+## Secrets live outside the repo
+
+`/etc/vpn-stack`, mode 0700, root-owned:
+
+```
+/etc/vpn-stack/
+├── secrets/        0600 each: reality.key, reality.short_id, hysteria2.{crt,key,obfs},
+│                   ipsec.{psk,primary_user,primary_password}, dnstt.server.{key,pub}
+├── users.json      who has access, across every protocol
+├── state.json      which protocols are on; revoke_pending; last_applied
+├── .env            VPN_SERVER_HOST (the repo's ./.env is a symlink to this,
+│                   because docker compose reads .env from the project directory)
+├── data/           sing-box runtime state
+└── rendered -> rendered-<ts>/    generated config, atomic symlink
+```
+
+A `git clone` therefore *cannot* contain a credential, and `rsync` cannot clobber a live key. `users.json` is written through a temp file created at 0600 and `os.replace`d, so an interrupted write cannot leave an empty user database or a world-readable one; the keyring is written the same way, and a zero-length file is not counted as a secret (otherwise `bootstrap` would skip regenerating it). `.gitignore` is now belt-and-braces rather than load-bearing — and it is directory-wide (`sing-box/vless-reality/`, `sing-box/hysteria2/`, `dnstt/keys/*` with `!server.pub`), so a new credential-bearing sibling is covered by default.
+
+Backups: `./vpn backup` tars `/etc/vpn-stack` **and** the `vpn-stack_ikev2-vpn-data` volume — the latter holds `cert9.db`/`key4.db`, the NSS database with the IKEv2 CA private key. Omit it and every certificate is unrecoverable. The stream is encrypted by `age -p` on your machine; the passphrase never reaches the server and the plaintext never lands on either disk. `rendered-*` is excluded — it is derived, and `apply` rebuilds it.
+
+`./vpn restore` is the other half, and it has been exercised: restoring the stream into a clean directory reproduced all 8 secrets bit-identically, brought `cert9.db`/`key4.db` back into the volume, and regenerated a client's VLESS URI **byte-identical** to the one issued before. It refuses to run against a server that already has users unless you pass `--force`, and stops `ipsec-vpn-server` first, because `pluto` holds the NSS database open.
+
+## The protocol registry
+
+`vpnctl/protocols/` — one module per protocol, each exporting a single `Protocol`. It owns everything protocol-specific: ports, required secrets, how to render config, how to build a share link, whether it is a sing-box inbound or its own container.
+
+```python
+render(secrets, users) -> {relative path: bytes}      # pure
+share(secrets, user, host) -> [ShareItem]             # pure
+bootstrap() -> {secret name: bytes}                   # cheap, at install time
+prepare()   -> {secret name: bytes}                   # optional, expensive
+```
+
+`prepare` exists for one reason: dnstt's Noise keypair is the `dnstt-server` binary's own format, so producing it means building a Go image. Doing that in `bootstrap` would make every fresh server pay ~800 MB for a protocol that ships disabled. It runs at `protocol on` instead, and a failure rolls the toggle back — leaving it enabled with no key would make every later `apply`, including the one systemd runs at boot, die on a missing secret with no clue how it got there.
+
+`render` and `share` are pure — no `open()`, no `subprocess`, no globals. That is deliberate and load-bearing: it is the seam a future GUI app renders share links through with no server round-trip. Keep it that way.
+
+**Adding a protocol is a new module plus one line in `PROTOCOLS`. It changes no command line.** The `-C` directory list that used to be hardcoded in three places is gone: everything renders into one directory.
+
+Three things verified against the real binaries, which the design depends on:
+
+- **Two files in one `-C` directory concatenate their `inbounds`.** So the old three-sibling layout bought exactly one thing (drop a protocol by dropping a flag) and cost a triply-duplicated list. Now: `-C /etc/sing-box`, permanently. `certs/` sits inside that directory because `-C` merges `*.json` and does **not** recurse.
+- **`sing-box check` exits 0 on two inbounds sharing a `listen_port`.** It catches a duplicate *tag*, not a duplicate port. `protocols.assert_ports_disjoint` exists because of this and is not decorative.
+- **`docker compose up -d --remove-orphans` does not stop a service whose profile was deactivated** (Compose v5.3.1, still true on v5.5.1). Explicit `docker compose rm -sf <service>` does. `composectl.down_disabled` diffs and removes explicitly — relying on `--remove-orphans` would mean "protocol off" leaves the protocol serving traffic.
+- **Compose resolves `env_file` when it loads the project, not when it starts the service.** `ikev2.env` only exists while ikev2 is on, so a plain path there made *every* compose command fail the moment you turned the protocol off — including the ones that bring sing-box up, and including the `rm -sf` meant to stop ikev2 itself. It uses the `required: false` long form. Verified by turning the protocol off and back on.
+
+Both images are pinned, sing-box by tag and `hwdsl2/ipsec-vpn-server` by digest. `latest` means the next `apply` on any box can pull a release that dropped a config key or renamed a flag, and the failure lands on a live server — the exact class of accident the candidate-tree design exists to prevent. `ikev2ctl` hard-codes that image's CLI contract, so it gets a digest. `scripts/check.sh` reads the sing-box tag **out of compose.yml** rather than restating it: two literals drift, and the drift is invisible — the config validates against one binary and is then served by another.
+
+## The apply pipeline
+
+`vpnctl apply` is the only thing that changes the server:
+
+1. Render the whole config into `rendered-<ts>/` **beside** the live tree.
+2. `scripts/check.sh` validates that candidate in a throwaway container.
+3. On failure: delete the candidate, exit 1. **The live tree was never touched, so there is nothing to roll back.**
+4. On success: `os.replace` the `rendered` symlink — atomic, so a reader sees the old tree or the new one, never a mixture.
+5. Converge: bring up the enabled set, explicitly remove the disabled set, **wait for every expected port to bind**, reconcile ufw, reconcile IKEv2 certificates.
+
+The readiness wait matters: `docker compose up` returns immediately but `hwdsl2/ipsec-vpn-server` needs ~30s to bind, and much longer on its *first* run, when it also builds the NSS database and issues the CA. Without the wait, the smoke test that runs next fails on a server that is merely still starting — a false alarm that teaches people to ignore smoke tests.
+
+"Bound" means bound on a non-loopback address, in both `composectl` and `scripts/smoke.sh`. Substring-matching the port number reports dnstt's `53/udp` as served on any stock Ubuntu, because `systemd-resolved` holds `127.0.0.53:53`.
+
+`scripts/check.sh` is the single definition of validity. `scripts/push.sh` is the single definition of *what gets sent* — the one dangerous rsync flag combination in this repo exists in one place, and both `install.sh` and `deploy.sh` call it. `scripts/deploy.sh` is the single deploy path; CI and `./vpn deploy` both call it, so the manual route cannot drift from the automated one. `deploy.sh` deliberately does **not** bootstrap: on a server whose state directory has been damaged, generating fresh secrets would silently invalidate every profile already handed out, so `apply` fails loudly instead and points at `bootstrap` or a backup.
+
+## Users
+
+`users.json` is the source of truth across all protocols. `user add` validates the name (`[A-Za-z0-9._-]`, 1–32 chars): `render_ikev2_env` joins names and passwords into two **space-separated** env vars, so a name with a space would misalign the lists and hand one user another's password.
 
 ```bash
-uv sync                       # install vpnctl + deps (cryptography, qrcode, pillow) into .venv/
-docker compose up -d sing-box # start sing-box
-docker compose down           # stop it
-docker compose logs -f sing-box  # tail logs
+./vpn user add <name>        # fresh credentials for every protocol
+./vpn user rm <name>         # permanent
+./vpn user enable|disable <name>
+./vpn user list [--show-secrets]
+./vpn user export <name> [--protocol <p>] [--qr]
 ```
 
-Config is validated automatically by every `vpnctl` mutating command; to check manually:
+**IKEv2 is reconciled, not remembered.** `vpnctl ikev2 reconcile` diffs `ikev2.sh --listclients` against the enabled users on every apply and repairs both directions, writing `ikev2_provisioned` from observed truth. If `--listclients` *fails*, reconcile aborts rather than reading the empty result as "nobody has a certificate" — that reading would try to re-issue every user, fail on "already exists", and then record that nobody is provisioned while the certificates kept working. When a revocation can't run because the container is down, the name goes into `state.json`'s `revoke_pending` — the intent outlives the deleted user record, so a `user rm` with ikev2 stopped can't leave a working certificate behind with nothing to retry it.
 
-```bash
-docker compose run --rm --no-deps sing-box check \
-  -C /etc/sing-box/common -C /etc/sing-box/vless-reality -C /etc/sing-box/hysteria2
-```
+Hard-won IKEv2 facts: there is no `--removeclient`. `--deleteclient` alone does not stop a certificate working (the image says so itself); `--revokeclient` does, but leaves the name reserved so a later `--addclient` fails with "already exists". `remove_client` does both, in that order, each with `-y` or they block on a prompt. Re-enabling a user issues a **brand-new certificate** — the old profile stops working and needs re-exporting.
 
-## Architecture
+`--exportclient` writes three bundles: `.p12` (Windows/Linux), `.sswan` (Android/strongSwan), `.mobileconfig` (iOS/macOS, a complete ready-to-import profile). It writes them into `/etc/ipsec.d`, which is the persistent volume — so they survive restarts *and ride along in every backup*. `export_client` reads them out as bytes and then deletes them, which is what makes the old `exports/` problem actually go away rather than move. **Verified: the `.p12` has an empty password** — it is an unprotected private key, so whoever holds the file has VPN access. That is why `vpn share` is single-use, LAN-only and short-lived.
 
-`compose.yml`'s `sing-box` service runs `network_mode: host` (required so the proxy inbounds bind directly to the host's ports/interfaces), mounting `./sing-box:/etc/sing-box:ro` and `./data:/var/lib/sing-box`. Config is split into one directory per protocol, passed to sing-box as three separate `-C` flags (confirmed against the real binary: `-C` is a repeatable flag that merges each directory's `*.json` files together, but does **not** recurse into subdirectories — that's why this is three sibling directories, not one directory with subfolders):
+Recreating the ikev2 container drops **every** session it serves — L2TP, Cisco IPsec and IKEv2 alike. Certificates survive (they're in the volume); tunnels don't.
 
-- `sing-box/common/00_base.json` — global `log` settings (console output, `info` level). Tracked in git.
-- `sing-box/common/90_outbounds.json` — `direct` + `block` outbounds. Tracked in git.
-- `sing-box/vless-reality/10_vless_reality_tcp.json` — VLESS inbound, port `10443`, XTLS-Vision flow, REALITY masquerading as `www.apple.com`. `users` array generated; everything else hand-owned. Gitignored (whole file — see trade-off note below).
-- `sing-box/hysteria2/20_hysteria2.json` — Hysteria2 inbound, port `20443`, Salamander obfuscation, TLS via `certs/` in the same directory (self-signed, `CN=bing.com`), masquerading as `bing.com`. `users` array generated. Gitignored.
-- `sing-box/hysteria2/certs/` — `certificate.pem` + `private.key`, self-signed EC cert. Gitignored. Deliberately colocated with `hysteria2/` rather than shared at a higher level — REALITY (VLESS) does its own key exchange and never touches these files, so they're not actually cross-protocol.
+## IKEv2 client connectivity: settled, do not re-open
 
-No per-user device/connection limiting is enforced. sing-box has no native per-user device cap (upstream issue `SagerNet/sing-box#2579`, closed "not planned"), and there's no plan to bolt one on — evaluated and deliberately skipped as not worth the complexity/trust trade-off at solo-user scale.
+Clients cannot connect, and **it is not the server**. Privileged mode was tried and reverted (`c04b19c`/`6e7f66e`); a full bare-metal `hwdsl2/setup-ipsec-vpn` install was also tried. Settled 2026-09-05 with `scripts/diagnose-ikev2.sh`:
 
-### `vpnctl/` (the CLI)
+- A marked UDP datagram from an unrelated network **arrived** at `net0` on both 500 and 4500. The hosting provider does not block inbound IKE.
+- The box is green end to end: `pluto` bound on the public IP, `-A INPUT -p udp -m multiport --dports 500,4500 -j ACCEPT` present, ufw allowing all three ports, both `192.168.42.0/24` FORWARD accepts in place, `ip_forward=1`, `rp_filter=0`.
+- `docker logs ipsec-vpn-server` contains **zero** IKE negotiation attempts, ever. `ipsec trafficstatus` is empty.
 
-- `paths.py` — all path constants, resolved relative to the package location (repo root).
-- `bootstrap.py` — one-time day-0 generation of the hand-owned base config: REALITY keypair (via `reality_key.generate_private_key`), self-signed Hysteria2 cert/key (`cryptography`'s `ec`/`x509`), obfs password, and `ikev2/.env`'s PSK/primary user slot. Refuses to overwrite existing files unless `force=True`.
-- `users_store.py` — `User` dataclass, `users.json` load/save, credential generation (`uuid.uuid4()`, `secrets.token_hex(16)`).
-- `render.py` — regenerates `10_/20_` config fragments and `ikev2/.env` from `users.json`.
-- `reality_key.py` — X25519 keypair generation and public-key derivation from a stored REALITY private key.
-- `export.py` — builds `vless://` / `hysteria2://` share URIs and renders QR (terminal ASCII via `qrcode`, optional PNG under gitignored `exports/`).
-- `sbctl.py` — wraps `docker compose run .../check` and `docker compose up -d --force-recreate` for the sing-box service.
-- `ikev2ctl.py` — wraps `docker exec ipsec-vpn-server ikev2.sh` (add/remove/list/export client certs) plus `docker compose up -d --force-recreate --no-deps ikev2`; see `ikev2/` section below.
-- `dotenv.py` — minimal `.env`-file read/write helper; used by `render.py` to write `ikev2/.env`'s `VPN_ADDL_USERS`/`VPN_ADDL_PASSWORDS`, and by `export.py` to read `VPN_SERVER_HOST`.
-- `cli.py` — argparse entry point (`bootstrap`, `user add/rm/enable/disable/list/export`, `render`, `migrate`, `ikev2 list-clients`), and the validate-then-apply/rollback logic all mutating commands share.
+Arbitrary UDP reaches the server while no client's IKE ever has: the drop is on the **client's** network. Have the client try a different network before spending any time here. Re-run with `sudo bash scripts/diagnose-ikev2.sh listen` plus `probe <ip>` from elsewhere.
 
-**Known trade-off:** gitignoring `10_`/`20_` wholesale (to keep secrets out of history) also puts their non-secret structural fields (ports, `server_name`, masquerade domain, bandwidth caps) outside version control, since secrets and structure currently share one file. Accepted as a reasonable simplification at solo-user scale — document structural tuning changes in commit messages/notes elsewhere rather than expecting git history to capture them.
+**The missing FORWARD rule** (`ikev2ctl.ensure_ipv4_forwarding`) is a separate, real failure: the image's `run.sh` never adds a `net0`↔`net0` accept for its own `L2TP_NET` pool, and IKEv2 IPv4 clients have no ppp interface, so without it the SA establishes and no traffic forwards, silently. This is why `vpnctl` needs root. `vpn-stack.service` (oneshot, `After=docker.service`) re-applies it at boot — these are raw `iptables -I` inserts with no persistence of their own.
 
-### `ikev2/` — L2TP/IPsec, Cisco IPsec, IKEv2 (`hwdsl2/ipsec-vpn-server`)
+## Deployment
 
-`compose.yml`'s `ikev2` service runs `hwdsl2/ipsec-vpn-server`, `network_mode: host`, **not** `privileged: true` — `cap_add: [NET_ADMIN]` + `devices: ["/dev/ppp:/dev/ppp"]` instead (image's own documented non-privileged mode; confirmed working against a live instance). The image also wants a handful of sysctls that Docker refuses to set via Compose under `network_mode: host` (no separate container netns to set them in) — those are applied once on the host itself by `scripts/host-bootstrap.sh`, not through compose. Named volume `ikev2-vpn-data:/etc/ipsec.d` persists IKEv2 client certs across container recreation; `/lib/modules:/lib/modules:ro` is required by the image.
+Push to `main` → `.github/workflows/deploy.yml` → `scripts/deploy.sh root@$DEPLOY_HOST`. The rsync (in `scripts/push.sh`) uses `--filter=':- .gitignore'` and **not** `--delete-excluded` (which would delete the very files the filter protects, from the server). Then `uv sync --frozen`, `vpnctl apply`, `scripts/smoke.sh`.
 
-This image bundles two genuinely different auth mechanisms, and `vpnctl` drives both from the same `users.json`:
+`scripts/install.sh` takes a bare Ubuntu 22.04/24.04 box to a serving VPN in one command, in five separate SSH sessions rather than one long heredoc — the firewall step has to prove a *fresh* connection still works before disarming its own safety net, and it cannot do that from inside the connection it might be about to sever.
 
-- **L2TP/IPsec + Cisco IPsec** (PSK + username/password) — declarative, like sing-box: `vpnctl` renders `VPN_ADDL_USERS`/`VPN_ADDL_PASSWORDS` in `ikev2/.env` from every *enabled* user's `l2tp_password` field (`render.py:render_ikev2_env`). `VPN_IPSEC_PSK` and the primary `VPN_USER`/`VPN_PASSWORD` slot (required by the image, unused by any real person) are left untouched by rendering — every real user goes through the additional-users lists uniformly. **Applying a change recreates the whole container**, which briefly drops *every* active L2TP/Cisco session, not just the one being added/removed — this is a real limitation of the image (no live env reload), not something `vpnctl` can avoid.
-- **IKEv2** (per-client certificates) — imperative, unlike everything else in this repo: `vpnctl/ikev2ctl.py` shells out to `docker exec ipsec-vpn-server ikev2.sh --addclient/--revokeclient/--deleteclient/--listclients/--exportclient`. This is live (no container recreation) and tracked via `users.json`'s `ikev2_provisioned` bool. Confirmed against a live instance: there is no `--removeclient` (an earlier version of this code assumed one; it failed loudly on stderr but non-fatally on every disable/remove, so `ikev2_provisioned` never got cleared and the cert was never actually revoked — fixed). Removing a client is actually two steps, both needing `-y` or they block on a confirmation prompt: `--deleteclient` alone isn't enough — the image's own warning says a deleted cert *can still be used to connect*; `--revokeclient` is what actually cuts off access, but leaves the name reserved in the IPsec database, so a later `--addclient` for that same name fails with "already exists" (hit this for real re-adding `asel1x`). `ikev2ctl.remove_client` does both in order: revoke (cuts access immediately) then delete (safe now that it's already revoked; frees the name for reuse). **Re-enabling a disabled user issues a brand-new certificate** — unlike VLESS/Hysteria2/L2TP, the old IKEv2 profile a client imported stops working and needs re-exporting; there's no "same credentials" story for cert-based auth. `--exportclient <name>` writes three files under `/etc/ipsec.d/`: `<name>.p12` (Windows/Linux only), `<name>.sswan` (Android/strongSwan), `<name>.mobileconfig` (iOS/macOS — a complete ready-to-import VPN profile, not just a bare cert). `vpnctl` copies out all three into `exports/`.
+**It pushes this checkout; it does not clone.** The repo is private and a bare box holds no credential for it, so a clone would need a deploy token just to install — and the future app ships its own copy of the tree anyway. One transfer mechanism (`push.sh`), used by install and deploy alike.
 
-Every `vpnctl` mutating command (`user add/rm/enable/disable`, `render`) touches all of this automatically, but **only acts on the `ikev2` container if it's already running** (`ikev2ctl.is_running()`) — a `user add` before anyone has started `ikev2` just updates `ikev2/.env` and prints a note, it never implicitly launches the container as a side effect.
+The ufw **deadman** is real, not decorative: a detached `setsid` timer that disables ufw unconditionally after 180s, armed before the first `ufw enable`, disarmed only after a brand-new SSH connection — one that had to pass through the new rules — succeeds. It records its own pid rather than trusting `$!` (setsid forks when the caller is already a process-group leader) and is killed by process group, so the `sleep` goes with it.
 
-No device/connection limiting is enforced for this protocol group either — consistent with sing-box (see Architecture above).
+Two things a fresh box needs that an established one hides: `uv` installs to `/root/.local/bin`, which is **not** on the PATH of a non-interactive SSH session or a systemd unit, so it is symlinked into `/usr/local/bin` and the `vpnctl` shim sets its own PATH; and `/dev/ppp` must exist at container-create time.
 
-```bash
-uv run vpnctl ikev2 list-clients   # raw `ikev2.sh --listclients` output, for diagnostics
-```
+### Verified end to end on a bare box
 
-### `dnstt/` + `dnstt-socks/` — DNS-tunnel bypass (last resort)
+Ubuntu 24.04.1, 2026-09-06, from `docker`-only to serving: install, `user add` (IKEv2 certificate issued by reconcile), export of all three bundles, `protocol off ikev2` → `on` (certificate survived the volume), `deploy`, **reboot** (boot unit re-applied the FORWARD rules, both containers returned, ufw persisted), and a backup/restore round trip. From outside, `10443/tcp` presents a genuine `www.apple.com` EV certificate and a port ufw does not allow is filtered.
 
-Two extra `compose.yml` services, both `network_mode: host`, deliberately **outside `vpnctl`** — this is a single fixed tunnel, not a per-user protocol, so there's nothing to render and no `users.json` involvement.
+## Conventions
 
-- `dnstt` — David Fifield's `dnstt-server`, built from source in `dnstt/Dockerfile`. For networks that block everything except DNS: the client encodes a stream into DNS queries under the delegated zone `tun.example.net` (`ns-tun.example.net A -> this host`, `tun.example.net NS ns-tun.example.net`), which this host answers authoritatively on `udp/53`. Bound to `${VPN_SERVER_HOST}` explicitly, **not** wildcard `:53` — a wildcard collides with the host's `systemd-resolved` stub listener. The decoded stream is forwarded to the host's own sshd (`127.0.0.1:22`); there is no bespoke proxy protocol — a client runs SSH *over* the tunnel and rides its forwarding. `dnstt/keys/server.key` is the long-term private key (gitignored, server-only); `dnstt/keys/server.pub` (`7ccc…566`) is the public key every client pins.
-- `dnstt-socks` — a loopback-only `microsocks` (SOCKS5) on `127.0.0.1:7300`, built from source (`dnstt-socks/Dockerfile`; not packaged in Alpine). It's the internet exit for SSH-over-dnstt mobile clients (HTTP Injector / AnyBridge), which forward their traffic to it across the SSH channel. Never exposed — reachable only through an authenticated SSH session, so it needs no auth of its own.
-
-Access is a dedicated non-root host user `pentest-dnstt` (not in this repo; its password lives only on the server), scoped by the sshd drop-in `/etc/ssh/sshd_config.d/60-pentest-dnstt.conf` to `AllowTcpForwarding yes` + `PermitOpen 127.0.0.1:7300 1.1.1.1:853` — the SOCKS exit plus the client's DoT resolver, nothing else, so the account can't be turned into an open proxy. Loosen `PermitOpen` only if a client needs a different forward target.
-
-**Why it fails on the phone itself vs. a tethered laptop:** a tethered client resolves through the iPhone's Personal-Hotspot DNS relay at `172.20.10.1`, which forwards to the carrier's real recursor; the phone's *own* stack has no such address, so a phone-side client must point its dnstt resolver at the carrier's actual cellular resolver IP (e.g. `10.219.250.1`), never `172.20.10.1`.
-
-**Not CI-managed:** `deploy.yml` recreates only `sing-box` and `ikev2`, so after changing dnstt build/config run `docker compose up -d --build dnstt dnstt-socks` on the server by hand. Laptop test client: `dnstt-client -udp <resolver>:53 -pubkey 7ccc…566 tun.example.net 127.0.0.1:<port>`, then SSH through `127.0.0.1:<port>`.
+- `paths.py` owns every path. Don't build one inline.
+- Structural constants (ports, SNI, masquerade domains, bandwidth caps) live in the protocol modules, in git. They are no longer trapped in a gitignored file.
+- No device/connection limiting anywhere. sing-box has no native per-user cap (`SagerNet/sing-box#2579`, closed "not planned"); deliberately skipped at solo-user scale.
+- `docker compose down -v` destroys `ikev2-vpn-data` — every IKEv2 certificate, unrecoverable. Prefer `stop`/`restart`.
+- `--json` is a public API and must stay parseable: it goes to stdout, everything else to stderr, and it is accepted in **any** position (`user export x --json` as well as `--json user export x`). `--qr` is suppressed under `--json` for the same reason — ASCII art in the middle of the payload broke `./vpn share`.
+- `apply` returns `enabled_protocols`, not `enabled`. The two collided in `emit(**result)` and made `user enable`/`user disable` raise `TypeError` on every single invocation.
+- `users_store.load()` never writes. It used to mint a fresh `l2tp_password` for any record missing one and save it, so a plain `user list` could silently rotate a live credential. Booleans get defaults because those are derivable; a missing *secret* is a damaged database and says so.

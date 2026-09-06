@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import secrets
 import uuid
 from dataclasses import asdict, dataclass
@@ -20,6 +22,26 @@ class User:
     created_at: str
 
 
+# render_ikev2_env joins names into a single space-separated VPN_ADDL_USERS and
+# passwords into VPN_ADDL_PASSWORDS. A name containing whitespace silently
+# misaligns the two lists, handing one user another's password; other shell
+# metacharacters end up in a .env file the hwdsl2 image sources. Keep names to
+# one plain word.
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+
+
+def validate_name(name: str) -> str | None:
+    """Return an error message if `name` is unsafe to render, else None."""
+    if not _NAME_RE.match(name):
+        return (
+            f"Invalid user name {name!r}. Use 1-32 characters: letters, digits, "
+            "'.', '_' or '-', starting with a letter or digit. No spaces -- the "
+            "L2TP/Cisco user list is space-separated and a space would misalign "
+            "every user's password."
+        )
+    return None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -28,31 +50,58 @@ def generate_credentials() -> tuple[str, str, str]:
     return str(uuid.uuid4()), secrets.token_hex(16), secrets.token_hex(16)
 
 
+class UsersError(RuntimeError):
+    pass
+
+
 def load() -> list[User]:
+    """Read the database. Never writes -- not even to backfill.
+
+    It used to mint a fresh l2tp_password for any record missing one and save
+    it, which meant a plain `user list` could silently rotate a live
+    credential. Absent booleans get a default because that is derivable;
+    an absent *secret* is a damaged database and says so.
+    """
     if not USERS_JSON.exists():
         return []
     data = json.loads(USERS_JSON.read_text())
     users = []
-    schema_changed = False
     for u in data["users"]:
+        u.setdefault("ikev2_provisioned", False)
+        u.setdefault("enabled", True)
         if "l2tp_password" not in u:
-            u["l2tp_password"] = secrets.token_hex(16)
-            schema_changed = True
-        if "ikev2_provisioned" not in u:
-            u["ikev2_provisioned"] = False
-            schema_changed = True
+            raise UsersError(
+                f"{USERS_JSON}: user {u.get('name')!r} has no l2tp_password. "
+                "Inventing one would hand out a credential nobody holds; "
+                "restore from a backup instead."
+            )
         users.append(User(**u))
-    if schema_changed:
-        save(users)
     return users
 
 
 def save(users: list[User]) -> None:
+    """Write atomically, at 0600, with the mode set before any content exists.
+
+    The state directory is 0700, so this is defence in depth -- but a backup
+    unpacked somewhere else keeps these bits, and the file is every user's
+    password for every protocol. write_text() truncates in place, so an
+    interrupted save used to be able to leave an empty user database.
+    """
     data = {
         "schema_version": SCHEMA_VERSION,
         "users": [asdict(u) for u in users],
     }
-    USERS_JSON.write_text(json.dumps(data, indent=2) + "\n")
+    USERS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USERS_JSON.with_name(USERS_JSON.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(data, indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, USERS_JSON)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def find(users: list[User], name: str) -> User | None:

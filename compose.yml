@@ -1,73 +1,92 @@
+# Pinned so the project name -- and therefore volume names and orphan scope --
+# never depends on what the checkout directory happens to be called.
+name: vpn-stack
+
 volumes:
   ikev2-vpn-data:
 
 services:
-  ikev2:
-    image: hwdsl2/ipsec-vpn-server
-    container_name: ipsec-vpn-server
-    restart: always
-    network_mode: host
-    # Not privileged: true. network_mode: host means there's no separate
-    # container netns, so Compose can't set the sysctls this image normally
-    # wants (Docker rejects `sysctls:` under host networking) -- those are
-    # applied once on the host itself instead, see scripts/host-bootstrap.sh.
-    #
-    # Confirmed via a live diagnostic (privileged: true, then a full
-    # bare-metal hwdsl2/setup-ipsec-vpn install replacing this container
-    # entirely): capability mode and Docker-vs-bare-metal are both ruled
-    # out as factors in a client-side IKEv2 connectivity issue -- packets
-    # never arrived at this host's interface in any of the three
-    # configurations. Root cause is a network path issue upstream of this
-    # server, not this container's privilege level.
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - "/dev/ppp:/dev/ppp"
-    env_file:
-      - ./ikev2/.env
-    volumes:
-      - ikev2-vpn-data:/etc/ipsec.d
-      - /lib/modules:/lib/modules:ro
-
+  # ---------------------------------------------------------------- sing-box
+  # One -C directory, always. The config tree is rendered by `vpnctl apply`
+  # into ${VPN_STATE:-/etc/vpn-stack}/rendered/sing-box and promoted by an
+  # atomic symlink swap, so this mount is never half-written. certs/ rides
+  # inside it: -C merges *.json and does not recurse, so a subdirectory is
+  # invisible to the config loader.
   sing-box:
-    image: ghcr.io/sagernet/sing-box:latest
+    # Pinned. `latest` means the next `apply` can pull a release that dropped
+    # a config key this repo still uses, and the failure lands on a live server
+    # with no way back -- exactly what the candidate-tree design exists to
+    # prevent. Bump deliberately, with scripts/check.sh to prove it first.
+    image: ghcr.io/sagernet/sing-box:v1.14.0
     container_name: sing-box
     restart: always
     network_mode: host
     volumes:
-      - ./sing-box:/etc/sing-box:ro
-      - ./data:/var/lib/sing-box
-    command: >-
-      -D /var/lib/sing-box
-      -C /etc/sing-box/common
-      -C /etc/sing-box/vless-reality
-      -C /etc/sing-box/hysteria2
-      run
+      - ${VPN_STATE:-/etc/vpn-stack}/rendered/sing-box:/etc/sing-box:ro
+      - ${VPN_STATE:-/etc/vpn-stack}/data:/var/lib/sing-box
+    command: -D /var/lib/sing-box -C /etc/sing-box run
 
-  # DNS tunnel (dnstt): last-resort bypass for networks that allow only DNS
-  # egress. Delegated zone tun.example.net (NS ns-tun.example.net -> this host)
-  # answers on udp/53; the tunneled stream is handed to the host sshd, and
-  # clients ride SSH on top, exiting via dnstt-socks. keys/server.key is
-  # gitignored and lives only on the server.
+  # ------------------------------------------------------------------- ikev2
+  # Not privileged: cap_add + /dev/ppp is the image's own documented
+  # non-privileged mode. The sysctls it also wants cannot be set through
+  # compose under network_mode: host (no separate netns), so they live on the
+  # host -- see scripts/install.sh.
+  #
+  # Diagnosed 2026-09-05: the server side of IKEv2 is correct end to end and
+  # no client IKE has ever reached it; the drop is on the client's network.
+  # See scripts/diagnose-ikev2.sh before spending time here.
+  ikev2:
+    # Pinned by digest. ikev2ctl.py hard-codes this image's CLI contract --
+    # --addclient / --deleteclient / --revokeclient / --exportclient, and the
+    # absence of --removeclient. An unpinned tag means an upstream change to
+    # any of those silently breaks user management on the next pull.
+    image: hwdsl2/ipsec-vpn-server@sha256:2e939ffe5913c9a34a3f5b72d75a97e9a2f16824d223bf042b88a567ffeabe9b
+    container_name: ipsec-vpn-server
+    restart: always
+    network_mode: host
+    profiles: ["ikev2"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/ppp:/dev/ppp"
+    # required: false because the file only exists while the protocol is on.
+    # Compose validates env_file when it loads the project, not when it starts
+    # the service, so a plain path here makes every `docker compose` command
+    # fail once `vpn protocol off ikev2` stops rendering it -- including the
+    # ones that bring sing-box up.
+    env_file:
+      - path: ${VPN_STATE:-/etc/vpn-stack}/rendered/ikev2.env
+        required: false
+    volumes:
+      - ikev2-vpn-data:/etc/ipsec.d
+      - /lib/modules:/lib/modules:ro
+
+  # ------------------------------------------------------------------- dnstt
+  # Off by default: needs a delegated DNS zone, which a fresh server has not
+  # got, and udp/53 on a box without one is pure attack surface.
+  # Bound to an explicit address, never wildcard :53 -- a wildcard collides
+  # with the host's systemd-resolved stub listener.
   dnstt:
     build: ./dnstt
     image: dnstt-server:latest
     container_name: dnstt-server
     restart: always
     network_mode: host
+    profiles: ["dnstt"]
     volumes:
-      - ./dnstt/keys:/keys:ro
+      - ${VPN_STATE:-/etc/vpn-stack}/rendered/dnstt:/keys:ro
     command: >-
       -udp ${VPN_SERVER_HOST}:53
       -privkey-file /keys/server.key
       tun.example.net 127.0.0.1:22
 
-  # SOCKS5 exit for the dnstt SSH clients. Loopback-only: reachable solely
-  # through an authenticated pentest-dnstt SSH forward, never from outside.
+  # SOCKS5 exit for SSH-over-dnstt clients. Loopback only: reachable solely
+  # through an authenticated SSH forward, never from outside.
   dnstt-socks:
     build: ./dnstt-socks
     image: dnstt-socks:latest
     container_name: dnstt-socks
     restart: always
     network_mode: host
+    profiles: ["dnstt"]
     command: -i 127.0.0.1 -p 7300

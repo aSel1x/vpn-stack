@@ -1,23 +1,19 @@
+"""Thin wrappers around docker for the sing-box service."""
+
 import subprocess
 
-from vpnctl.paths import ROOT
+from vpnctl.paths import ROOT, SCRIPTS_DIR
 
 
-def check_config() -> tuple[bool, str]:
+def check_config(config_dir) -> tuple[bool, str]:
+    """Validate a sing-box config directory via the one shared definition."""
     result = subprocess.run(
-        [
-            "docker", "compose", "run", "--rm", "--no-deps",
-            "sing-box", "check",
-            "-C", "/etc/sing-box/common",
-            "-C", "/etc/sing-box/vless-reality",
-            "-C", "/etc/sing-box/hysteria2",
-        ],
+        ["bash", str(SCRIPTS_DIR / "check.sh"), str(config_dir)],
         cwd=ROOT,
         capture_output=True,
         text=True,
     )
-    output = (result.stdout + result.stderr).strip()
-    return result.returncode == 0, output
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
 
 
 def apply() -> tuple[bool, str]:
@@ -27,5 +23,4 @@ def apply() -> tuple[bool, str]:
         capture_output=True,
         text=True,
     )
-    output = (result.stdout + result.stderr).strip()
-    return result.returncode == 0, output
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
