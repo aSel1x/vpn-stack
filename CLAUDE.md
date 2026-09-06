@@ -70,6 +70,8 @@ Backups: `./vpn backup` tars `/etc/vpn-stack` **and** the `vpn-stack_ikev2-vpn-d
 
 `vpnctl/protocols/` — one module per protocol, each exporting a single `Protocol`. It owns everything protocol-specific: ports, required secrets, how to render config, how to build a share link, whether it is a sing-box inbound or its own container.
 
+A `ShareItem` is one of three shapes, and picking the wrong one is not cosmetic: a `uri` gets a QR code and a tappable link, a `filename` gets a download, and `fields` get a form to copy by hand. DNSTT-over-SSH has no import format at all — no URI scheme, nothing to scan — so its settings were crammed into a `uri` and every layer duly treated them as one, producing a QR nothing could read and a link that imported nothing. Hence `fields`.
+
 ```python
 render(secrets, users) -> {relative path: bytes}      # pure
 share(secrets, user, host) -> [ShareItem]             # pure

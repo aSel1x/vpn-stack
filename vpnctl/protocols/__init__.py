@@ -41,12 +41,23 @@ class Port:
 
 @dataclass(frozen=True)
 class ShareItem:
-    """One deliverable for one user: a URI to scan, or a file to install."""
+    """One deliverable for one user. Exactly one of three shapes:
+
+      uri      something a client imports or a QR code carries
+      filename a file to install, with `content`
+      fields   settings typed into a form by hand
+
+    The third exists because DNSTT-over-SSH has no import format at all: the
+    apps have a form, and that is the whole interface. Dressing those settings
+    up as a `uri` made every layer treat them as one -- a QR code nothing can
+    scan, a tappable link that imports nothing.
+    """
 
     label: str            # human name, e.g. "iOS/macOS"
-    filename: str | None  # set for files, None for URIs
-    uri: str | None       # set for URIs, None for files
+    filename: str | None  # set for files, None otherwise
+    uri: str | None       # set for URIs, None otherwise
     content: bytes | None = None
+    fields: tuple[tuple[str, str], ...] = ()  # (setting, value), in order
 
 
 @dataclass(frozen=True)

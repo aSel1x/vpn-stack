@@ -497,6 +497,16 @@ def cmd_user_export(args) -> None:
                 payload[name].append(
                     {"label": item.label, "uri": item.uri, "png_b64": _b64(export.png_bytes(item.uri))}
                 )
+            elif item.fields:
+                # Settings for a form. No QR: there is nothing to scan them
+                # with, and a QR of a settings blob is a QR that fails
+                # silently in somebody's hands.
+                width = max(len(k) for k, _ in item.fields)
+                for key, value in item.fields:
+                    say(f"  {key:<{width}}  {value}")
+                payload[name].append(
+                    {"label": item.label, "fields": [list(f) for f in item.fields]}
+                )
     emit(ok=not failures, user=user.name, host=host,
          protocols=payload, failed=failures)
 

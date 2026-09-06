@@ -87,29 +87,41 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
 
 
 def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
-    # Identical for everyone. What varies is the resolver, and only the client
-    # can discover that: it is the blocked network's own DNS server, which on
-    # a phone means reading it with a network-info app. See dnstt/SETUP.md.
+    """Settings for a form, not a link.
+
+    DNSTT-over-SSH has no import format -- no URI scheme, nothing to scan.
+    The apps have a form and that is the entire interface, so these are
+    emitted as fields. They used to be crammed into a `uri`, which made every
+    layer treat them as one: a QR code nothing can read, a tappable link on
+    the share page that imports nothing.
+    """
     pub = secrets.text("dnstt.server.pub") if secrets.has("dnstt.server.pub") else "<not generated>"
     # Zone and pubkey are the transport and identical for everyone. The login
     # is this person's own, which is what makes revoking one of them possible.
-    password = user.dnstt_password or "<none issued -- run `vpnctl bootstrap`>"
+    password = user.dnstt_password or "<none issued -- see dnstt/SETUP.md>"
     return [
         ShareItem(
-            label="dnstt — mobile app (DNSTT → SSH)",
+            label="dnstt — phone (HTTP Injector / AnyBridge, mode DNSTT → SSH)",
             filename=None,
-            uri=(
-                f"zone={ZONE} pubkey={pub} "
-                f"ssh-user={user.name} ssh-password={password} "
-                "resolver=<the blocked network's own DNS, plain UDP :53>"
+            uri=None,
+            fields=(
+                ("Nameserver / domain", ZONE),
+                ("Public key", pub),
+                ("DNS resolver", "the blocked network's OWN resolver, :53, plain UDP"),
+                ("SSH username", user.name),
+                ("SSH password", password),
             ),
         ),
         ShareItem(
-            label="dnstt — laptop (dnstt-client, then SSH through it)",
+            label="dnstt — laptop (two commands)",
             filename=None,
-            uri=(
-                f"dnstt-client -udp <resolver>:53 -pubkey {pub} {ZONE} 127.0.0.1:7000 "
-                f"&& ssh -N -D 1080 -p 7000 {user.name}@127.0.0.1"
+            uri=None,
+            fields=(
+                ("1. open the tunnel",
+                 f"dnstt-client -udp <resolver>:53 -pubkey {pub} {ZONE} 127.0.0.1:7000"),
+                ("2. SOCKS through it",
+                 f"ssh -N -D 1080 -p 7000 {user.name}@127.0.0.1"),
+                ("then", "point the browser at socks5://127.0.0.1:1080"),
             ),
         ),
     ]

@@ -97,6 +97,9 @@ class Bundle:
         self.uris: list[tuple[str, str]] = []      # (label, uri)
         self.files: dict[str, tuple[str, bytes]] = {}  # filename -> (label, bytes)
         self.qr: dict[str, bytes] = {}             # label -> png
+        # Settings typed into a form by hand. DNSTT-over-SSH has no import
+        # format, so this is the only shape that is honest about it.
+        self.forms: list[tuple[str, list[tuple[str, str]]]] = []
 
         for proto, items in (payload.get("protocols") or {}).items():
             for item in items:
@@ -105,11 +108,15 @@ class Bundle:
                     self.uris.append((f"{proto} — {label}", item["uri"]))
                     if item.get("png_b64"):
                         self.qr[f"{proto} — {label}"] = base64.b64decode(item["png_b64"])
+                elif item.get("fields"):
+                    self.forms.append(
+                        (f"{proto} — {label}", [(k, v) for k, v in item["fields"]])
+                    )
                 elif item.get("filename") and item.get("b64"):
                     self.files[item["filename"]] = (label, base64.b64decode(item["b64"]))
 
     def empty(self) -> bool:
-        return not self.uris and not self.files
+        return not self.uris and not self.files and not self.forms
 
 
 PAGE = """<!doctype html>
@@ -130,6 +137,15 @@ PAGE = """<!doctype html>
   a.item b {{ display: block; font-size: .95rem; }}
   a.item span {{ display: block; font-size: .78rem; opacity: .6; margin-top: .15rem;
                 word-break: break-all; }}
+  table.form {{ width: 100%; border-collapse: collapse; margin-bottom: 1.25rem;
+               font-size: .85rem; }}
+  table.form th {{ text-align: left; font-weight: 500; opacity: .6;
+                  padding: .45rem .6rem .45rem 0; vertical-align: top;
+                  white-space: nowrap; }}
+  table.form td {{ padding: .45rem 0; word-break: break-all;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  table.form tr + tr {{ border-top: 1px solid rgba(128,128,128,.2); }}
+  h3.form {{ font-size: .9rem; margin: 1.5rem 0 .4rem; }}
   .warn {{ font-size: .8rem; opacity: .6; margin-top: 2.5rem;
           border-top: 1px solid rgba(128,128,128,.3); padding-top: 1rem; }}
 </style>
@@ -151,6 +167,16 @@ def render_page(bundle: Bundle, token: str) -> bytes:
                 f"<b>{html.escape(label)}</b>"
                 f"<span>{html.escape(uri[:80])}…</span></a>"
             )
+    if bundle.forms:
+        parts.append("<h2>Type these in by hand</h2>")
+        for title, rows in bundle.forms:
+            parts.append(f"<h3 class=\"form\">{html.escape(title)}</h3><table class=\"form\">")
+            for key, value in rows:
+                parts.append(
+                    f"<tr><th>{html.escape(key)}</th>"
+                    f"<td>{html.escape(value)}</td></tr>"
+                )
+            parts.append("</table>")
     if bundle.files:
         parts.append("<h2>Install profiles</h2>")
         for filename, (label, blob) in bundle.files.items():

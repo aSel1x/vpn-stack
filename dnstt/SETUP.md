@@ -117,7 +117,7 @@ So dnstt's last argument is `127.0.0.1:2222`, and the container:
 
 **Each person gets their own login.** The username is their vpn user name and the password is generated when they are added (users predating that get no login, and `apply` warns), so `user disable` and `user rm` actually revoke dnstt access — the container rebuilds `/etc/passwd` from the rendered list on every start, and a name that is no longer in it cannot log in. Verified: after a `disable`, that person's own password is refused while everyone else's still works. The trade is that changing the user list recreates the container and drops live sessions, as it already does for IKEv2.
 
-Get the login, with the zone and pubkey, from:
+There is no link to import — DNSTT-over-SSH has no URI scheme and nothing to scan, the app's form is the whole interface. `user export` prints the settings as a table for exactly that reason, and `vpn share` puts the same table on the one-shot page. Get them with:
 
 ```bash
 ./vpn user export <name> --protocol dnstt
