@@ -25,6 +25,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # NOT --delete-excluded: that would delete the very files the filter protects
 # (users.json, .env, secrets) from the SERVER. Excluding means "do not send",
 # never "remove there".
+RSYNC=(rsync -az
+  --filter=':- .gitignore'
+  --exclude '.git/' --exclude '.github/' --exclude '.venv/')
+
+if [[ "${VPN_DRY_RUN:-0}" == 1 ]]; then
+  printf '\033[2m    ssh %s "mkdir -p %s"\033[0m\n' "$TARGET" "$REPO_PATH"
+  printf '\033[2m    %s -e "ssh ..." %s/ %s:%s/\033[0m\n' "${RSYNC[*]}" "$HERE" "$TARGET" "$REPO_PATH"
+  echo "    files that would be sent:"
+  # rsync's own dry run, against a local path that does not exist: the real
+  # file list rather than a guess, and no network. A --dry-run that cannot run
+  # without reaching the server is not much of a dry run.
+  "${RSYNC[@]}" -n --out-format='      %n' "$HERE/" "/nonexistent-dry-run-target/" 2>/dev/null || true
+  exit 0
+fi
+
 # mkdir over ssh rather than rsync --mkpath: --mkpath needs rsync >= 3.2.3 and
 # this has to work from whatever the operator's laptop happens to ship.
 # shellcheck disable=SC2086

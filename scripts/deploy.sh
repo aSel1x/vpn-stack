@@ -15,10 +15,17 @@ SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new}"
 REPO_PATH="${REPO_PATH:-/opt/vpn-stack}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+DRY="${VPN_DRY_RUN:-0}"
+
 echo "==> syncing code to $TARGET:$REPO_PATH"
-SSH_OPTS="$SSH_OPTS" bash "$HERE/push.sh" "$TARGET" "$REPO_PATH"
+VPN_DRY_RUN="$DRY" SSH_OPTS="$SSH_OPTS" bash "$HERE/push.sh" "$TARGET" "$REPO_PATH"
 
 echo "==> validating and converging"
+if [[ "$DRY" == 1 ]]; then
+  printf '\033[2m    ssh %s "cd %s && uv sync --frozen && vpnctl apply"\033[0m\n' "$TARGET" "$REPO_PATH"
+  printf '\033[2m    ssh %s "cd %s && bash scripts/smoke.sh"\033[0m\n' "$TARGET" "$REPO_PATH"
+  exit 0
+fi
 # `uv` lives in /root/.local/bin, which a non-interactive SSH session does not
 # have on its PATH. install.sh symlinks it into /usr/local/bin; this is the
 # belt to that braces, so a server provisioned some other way still deploys.

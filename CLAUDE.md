@@ -144,7 +144,15 @@ Push to `main` → `.github/workflows/deploy.yml` → `scripts/deploy.sh root@$D
 
 The ufw **deadman** is real, not decorative: a detached `setsid` timer that disables ufw unconditionally after 180s, armed before the first `ufw enable`, disarmed only after a brand-new SSH connection — one that had to pass through the new rules — succeeds. It records its own pid rather than trusting `$!` (setsid forks when the caller is already a process-group leader) and is killed by process group, so the `sleep` goes with it.
 
-Two things a fresh box needs that an established one hides: `uv` installs to `/root/.local/bin`, which is **not** on the PATH of a non-interactive SSH session or a systemd unit, so it is symlinked into `/usr/local/bin` and the `vpnctl` shim sets its own PATH; and `/dev/ppp` must exist at container-create time.
+Two things a fresh box needs that an established one hides: `uv` installs to `/root/.local/bin`, which is **not** on the PATH of a non-interactive SSH session or a systemd unit, so it is symlinked into `/usr/local/bin` (only when nothing is already there) and the `vpnctl` shim sets its own PATH; and `/dev/ppp` must exist at container-create time.
+
+Docker is installed from **Docker's own apt repository**, not `curl https://get.docker.com | sh`: same packages, but signed, upgradable with the rest of the system, and readable before it runs. That repository is behind CloudFront, which returns **403 over IPv4** to some ranges while serving the same bytes over IPv6 — observed on this host. `install_docker` probes both families, uses whichever answers, and when it has to use IPv6 it persists `Acquire::ForceIPv6` in `/etc/apt/apt.conf.d/99-vpn-stack-ipv6`, because otherwise the operator's own next `apt update` fails on that repository. If the system mirror turns out to have no IPv6, it reverts both files rather than leaving apt broken. (Note the asymmetry: `ghcr.io`, where sing-box comes from, answers over IPv4 and *not* IPv6. Both families are load-bearing.)
+
+**Everything already installed is left alone.** docker, git, rsync, ufw, iptables and uv are each guarded by `command -v`, and the script says so rather than staying silent. If you install docker yourself it touches neither the daemon, `/etc/docker/daemon.json`, nor apt. ufw is only `enable`d when it was inactive, and `firewall.reconcile` only ever reads and writes rules carrying a `vpn-stack:` comment.
+
+### Nothing is meant to be taken on trust
+
+`./vpn explain` prints every subcommand mapped to the literal command it runs, plus the full inventory of what an install leaves on the server and why. `./vpn --dry-run <anything>` prints those commands and executes nothing — including the whole of `init`, where each of the five phases prints the exact script it would pipe over SSH. The dry run needs no network: the rsync file list is computed locally, because a dry run that cannot run without reaching the server is not much of a dry run. `./vpn -v` runs for real, echoing each command first.
 
 ### Verified end to end on a bare box
 

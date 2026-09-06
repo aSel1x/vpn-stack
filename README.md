@@ -19,6 +19,16 @@ rather than fixing the server by hand. The one step that can lock you out, enabl
 firewall, runs behind a timer that switches ufw back off unless a **fresh** SSH connection
 succeeds first.
 
+Docker comes from Docker's own apt repository, and anything already installed is left
+alone. Before running any of it:
+
+```bash
+./vpn explain                 # every command mapped to what it actually runs,
+                              # and everything an install leaves on the server
+./vpn --dry-run init root@<ip>   # print all of it, execute nothing (no network needed)
+./vpn -v <command>            # run for real, echoing each command first
+```
+
 ## Day to day
 
 Everything runs from your machine; `./vpn` forwards to the server over SSH.
