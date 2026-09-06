@@ -56,11 +56,16 @@ case "${1:-}" in
   init)
     target="${2:?usage: ./vpn init <user@host>}"
     shift 2
-    bash "$REPO/scripts/install.sh" "$target" "$@"
+    # Recorded before the install, not after. It is only a pointer to what you
+    # typed, and writing it afterwards meant a failed install left ./vpn with
+    # no host at all -- so the obvious next command answered "No server
+    # configured" instead of saying anything about the real failure.
+    #
     # The whole target, user included. Stripping it left every later ./vpn call
     # connecting as the local user instead of root, which fails with a
     # permission error that says nothing about where it came from.
     echo "$target" > "$REPO/.vpn-host"
+    bash "$REPO/scripts/install.sh" "$target" "$@"
     ;;
 
   deploy)

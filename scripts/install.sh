@@ -53,6 +53,10 @@ on bash -s -- "$HOST" <<'REMOTE'
 set -euo pipefail
 HOST="$1"
 export DEBIAN_FRONTEND=noninteractive
+# uv installs itself here, and a non-interactive SSH session does not have it
+# on PATH. Set it before anything looks for uv, so both a fresh install and a
+# uv left over from an earlier run are found.
+export PATH="/root/.local/bin:$PATH"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -111,7 +115,11 @@ for pkg in git rsync ufw iptables; do
 done
 
 if have uv; then echo "   uv: $(command -v uv) -- left alone"
-else echo "-- installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh; fi
+else
+  echo "-- installing uv"
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  have uv || { echo "uv installed but not where expected" >&2; exit 1; }
+fi
 
 # systemd units and non-interactive SSH get a PATH without /root/.local/bin,
 # where uv installs itself. Link it where they look -- but never over a file
