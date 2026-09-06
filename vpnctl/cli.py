@@ -255,15 +255,6 @@ def cmd_bootstrap(args) -> None:
     guard.require_server("bootstrap")
     ok, message = bootstrap.bootstrap_keyring(force=args.force)
     say(message)
-
-    # Per-person credentials added after some users already existed. Only ever
-    # *issues* one that was never issued -- never rotates a live one, which is
-    # why users_store.load() must not do it and this command must.
-    users = users_store.load()
-    filled = users_store.backfill(users)
-    if filled:
-        users_store.save(users)
-        say(f"issued a dnstt login for {len(filled)} existing user(s): {', '.join(filled)}")
     if ok and users_store.load():
         say("existing users found -- re-rendering them into the new keyring")
         apply(restart=False, quiet=True)

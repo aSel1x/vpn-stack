@@ -23,8 +23,8 @@ class User:
     # The dnstt tunnel itself has no notion of a user -- its Noise key belongs
     # to the server and encrypts the transport before anyone authenticates.
     # What can be personal is the SSH login behind it, and that is this.
-    # Empty means "predates this field": dnstt simply issues them no login
-    # until `vpnctl bootstrap` fills it in. Never invented on read.
+    # Empty means "predates this field": dnstt issues them no login and says
+    # so. Never invented on read -- that would rotate a live credential.
     dnstt_password: str = ""
 
 
@@ -140,17 +140,3 @@ def new_user(name: str) -> User:
         dnstt_password=new_dnstt_password(),
     )
 
-
-def backfill(users: list[User]) -> list[str]:
-    """Give pre-existing users the fields added since they were created.
-
-    Only ever *adds* a credential that was never issued; it does not rotate
-    one that exists, which is why `load()` may not do this and an operator
-    command must.
-    """
-    filled = []
-    for u in users:
-        if not u.dnstt_password:
-            u.dnstt_password = new_dnstt_password()
-            filled.append(u.name)
-    return filled

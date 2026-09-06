@@ -12,6 +12,8 @@ have, and binding udp/53 on a box that hasn't got one is pure attack surface.
 
 from __future__ import annotations
 
+import sys
+
 from vpnctl.protocols import Kind, Port, Protocol, RenderError, ShareItem
 from vpnctl.secrets_store import Secrets
 from vpnctl.users_store import User
@@ -54,9 +56,19 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
     # dnstt access. They did not before: everyone shared one account, so
     # removing somebody left their tunnel working with nothing to revoke.
     #
-    # A user with no dnstt_password predates the field and gets no login until
-    # `vpnctl bootstrap` issues one -- silently inventing one here would mean
-    # `apply` handing out a credential nobody has been told.
+    # A user predating the field has no password and gets no login. Not
+    # invented here: `render` is pure and must not mint a credential, and
+    # `apply` handing out a password nobody has been told is worse than a gap.
+    # Said out loud rather than skipped quietly -- there is no migration
+    # command, so this warning is the whole story.
+    missing = [u.name for u in users if u.enabled and not u.dnstt_password]
+    if missing:
+        print(
+            f"warning: no dnstt login for {', '.join(missing)} "
+            "(created before dnstt became per-user); set dnstt_password in "
+            "users.json, or re-add the user",
+            file=sys.stderr,
+        )
     logins = "".join(
         f"{u.name}:{u.dnstt_password}\n"
         for u in users
