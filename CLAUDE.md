@@ -8,7 +8,11 @@ A personal VPN server plus the CLI that operates it. Four protocols, one user da
 
 - **`sing-box`** — VLESS+REALITY (`10443/tcp`) and Hysteria2 (`20443/udp`), the everyday path.
 - **`hwdsl2/ipsec-vpn-server`** — IKEv2 / L2TP/IPsec / Cisco IPsec (`500`, `4500`, `1701` udp).
-- **`dnstt` + `dnstt-socks`** — DNS-tunnel last resort (`53/udp`), for networks that allow nothing else.
+- **`dnstt` + `dnstt-sshd` + `dnstt-socks`** — DNS-tunnel last resort (`53/udp`), for networks that allow nothing else. Off by default; `protocol on dnstt` builds the image and has `dnstt-server -gen-key` mint the Noise keypair, because that format is the binary's own. The zone `tun.example.net` is already delegated (`NS ns-tun.example.net`, `A` this server).
+
+  The decoded stream exits into an sshd **in a container**, not the host's. iOS clients speak DNSTT→SSH and need a login; on the host that would be a real account plus an `/etc/ssh/sshd_config` edit, neither captured by `vpn backup` and both to be redone after every rebuild. The container listens on loopback only, allows one user, and `PermitOpen 127.0.0.1:7300` — verified: that forward carries traffic, any other is refused *administratively prohibited*. Its host key lives in a volume so it does not change under clients on restart.
+
+  `-gen-key` prints both halves as hex on stdout, and that is what `prepare()` parses. Writing them with `-privkey-file` into a bind mount produces root-owned files that nothing but root can read back, and a temp directory that then fails to clean up.
 
 Live deployment: `root@203.0.113.10`, checkout at `/opt/vpn-stack`, state at `/etc/vpn-stack`.
 
@@ -160,6 +164,7 @@ Ubuntu 24.04.1, 2026-09-06, from `docker`-only to serving: install, `user add` (
 
 - `paths.py` owns every path. Don't build one inline.
 - Structural constants (ports, SNI, masquerade domains, bandwidth caps) live in the protocol modules, in git. They are no longer trapped in a gitignored file.
+- `per_user=False` on a protocol means it issues no distinct credential per person. It does **not** mean "do not share it": dnstt has one login for everyone and they still need it. Filtering `user export` on that flag made the command silently return nothing for dnstt.
 - No device/connection limiting anywhere. sing-box has no native per-user cap (`SagerNet/sing-box#2579`, closed "not planned"); deliberately skipped at solo-user scale.
 - `docker compose down -v` destroys `ikev2-vpn-data` — every IKEv2 certificate, unrecoverable. Prefer `stop`/`restart`.
 - `--json` is a public API and must stay parseable: it goes to stdout, everything else to stderr, and it is accepted in **any** position (`user export x --json` as well as `--json user export x`). `--qr` is suppressed under `--json` for the same reason — ASCII art in the middle of the payload broke `./vpn share`.

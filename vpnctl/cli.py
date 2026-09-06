@@ -468,8 +468,6 @@ def cmd_user_export(args) -> None:
     failures: list[str] = []
     for name in names:
         proto = protocols.get(name)
-        if not proto.per_user:
-            continue
         if proto.share_via_container:
             if not user.ikev2_provisioned:
                 warn(f"[{name}] no certificate provisioned for {user.name!r}; skipping.")

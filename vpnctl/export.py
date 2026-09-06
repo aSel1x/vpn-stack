@@ -38,8 +38,10 @@ def items_for(user: User, host: str, names: list[str]) -> dict[str, list[ShareIt
     secrets = secrets_store.load()
     out: dict[str, list[ShareItem]] = {}
     for proto in protocols.ordered(names):
-        if not proto.per_user:
-            continue
+        # Note there is no per_user filter here. A protocol with no per-user
+        # credentials -- dnstt -- still has connection parameters the person
+        # needs, and skipping it meant `user export` returned nothing for it
+        # at all. Its share() simply ignores the user it is handed.
         out[proto.name] = proto.share(secrets, user, host)
     return out
 

@@ -11,7 +11,6 @@ ikev2/.env
 sing-box/vless-reality/
 sing-box/hysteria2/
 dnstt/keys/*
-!dnstt/keys/server.pub
 scripts/.deploy_key*
 
 # --- runtime state ---

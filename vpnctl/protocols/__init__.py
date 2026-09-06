@@ -68,6 +68,10 @@ class Protocol:
     # unlike every other protocol its share() cannot be a pure function of the
     # keyring. Flagged here rather than special-cased by name in the CLI.
     share_via_container: bool = False
+    # Does this protocol issue a distinct credential per user? dnstt does not:
+    # it is one tunnel with one login. This governs provisioning, NOT sharing
+    # -- everyone still needs the connection parameters, and filtering export
+    # on it meant `user export` silently returned nothing for dnstt.
     per_user: bool = True
     # Secrets that pure Python cannot produce. dnstt's Noise keypair is emitted
     # by the dnstt-server binary itself, which means building a Go image -- too

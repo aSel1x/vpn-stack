@@ -15,83 +15,118 @@ from vpnctl.secrets_store import Secrets
 from vpnctl.users_store import User
 
 NAME = "dnstt"
+# Delegated at the registrar: tun.example.net NS ns-tun.example.net, and
+# ns-tun.example.net A <this server>. compose.yml repeats these two literals
+# because a compose `command:` cannot read them from anywhere; this module is
+# the canonical copy.
 ZONE = "tun.example.net"
 IMAGE = "dnstt-server:latest"
 SOCKS_ADDR = "127.0.0.1:7300"
-# The decoded stream is handed to the host's sshd; clients run SSH over the
-# tunnel and ride its forwarding. There is no bespoke proxy protocol.
-EXIT = "127.0.0.1:22"
+# The decoded stream goes to an sshd running in its own container, not to the
+# host's. iOS clients speak DNSTT -> SSH and need a login; keeping that login
+# out of the host means no real account, no edit to the host's sshd_config, and
+# nothing to recreate by hand after a rebuild.
+EXIT = "127.0.0.1:2222"
+SSH_USER = "dnstt"
 
 
 def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
-    return {"dnstt/server.key": secrets.raw("dnstt.server.key")}
+    password = secrets.text("dnstt.ssh_password")
+    env = (
+        f"SSH_USER={SSH_USER}\n"
+        f"SSH_PASSWORD={password}\n"
+        f"SSH_PORT={EXIT.rsplit(':', 1)[1]}\n"
+        f"SOCKS_EXIT={SOCKS_ADDR}\n"
+    )
+    return {
+        "dnstt/server.key": secrets.raw("dnstt.server.key"),
+        "dnstt.env": env.encode(),
+    }
 
 
 def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
-    # Same parameters for everyone -- what varies is the client's resolver,
-    # which only the client can discover.
-    pub = secrets.text("dnstt.server.pub").strip() if secrets.has("dnstt.server.pub") else "<not generated yet>"
+    # Identical for everyone. What varies is the resolver, and only the client
+    # can discover that: it is the blocked network's own DNS server, which on
+    # a phone means reading it with a network-info app. See dnstt/SETUP.md.
+    pub = secrets.text("dnstt.server.pub") if secrets.has("dnstt.server.pub") else "<not generated>"
+    password = secrets.text("dnstt.ssh_password") if secrets.has("dnstt.ssh_password") else "<not generated>"
     return [
         ShareItem(
-            label="dnstt (DNS tunnel)",
+            label="dnstt — mobile app (DNSTT → SSH)",
             filename=None,
             uri=(
-                f"dnstt-client -udp <your-resolver>:53 -pubkey {pub} "
-                f"{ZONE} 127.0.0.1:<local-port>"
+                f"zone={ZONE} pubkey={pub} "
+                f"ssh-user={SSH_USER} ssh-password={password} "
+                "resolver=<the blocked network's own DNS, plain UDP :53>"
             ),
-        )
+        ),
+        ShareItem(
+            label="dnstt — laptop (dnstt-client, then SSH through it)",
+            filename=None,
+            uri=(
+                f"dnstt-client -udp <resolver>:53 -pubkey {pub} {ZONE} 127.0.0.1:7000 "
+                f"&& ssh -N -D 1080 -p 7000 {SSH_USER}@127.0.0.1"
+            ),
+        ),
     ]
 
 
 def bootstrap() -> dict[str, bytes]:
-    # Nothing here on purpose. The Noise keypair is the dnstt-server binary's
-    # own format, so producing it means building the image -- see prepare().
-    return {}
+    # The SSH front's password is ordinary randomness, so it is made here.
+    # The Noise keypair is the dnstt-server binary's own format and needs the
+    # image built, which is too much to spend on a protocol that ships off --
+    # that one lives in prepare().
+    import secrets as _secrets
+
+    return {"dnstt.ssh_password": (_secrets.token_urlsafe(18) + "\n").encode()}
 
 
 def prepare() -> dict[str, bytes]:
-    """Build the image and have dnstt-server emit its own keypair.
+    """Build the image and have dnstt-server emit its own Noise keypair.
 
     Deliberately not part of `bootstrap`: a fresh server would spend a Go
     toolchain build and ~800 MB of disk on a protocol that ships disabled and
     additionally needs a delegated DNS zone before it can serve anything.
+
+    `-gen-key` prints both halves as hex on stdout, which is what is parsed
+    here. The alternative -- `-privkey-file` into a bind-mounted directory --
+    writes them as root, so nothing but root can read them back, and the
+    temporary directory then fails to clean up. Found by doing it that way.
     """
+    import re
     import subprocess
-    import tempfile
-    from pathlib import Path
 
     from vpnctl.paths import ROOT
 
     build = subprocess.run(
         ["docker", "build", "-t", IMAGE, str(ROOT / "dnstt")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=900,
     )
     if build.returncode != 0:
         raise RenderError(
             "could not build the dnstt image:\n" + (build.stdout + build.stderr).strip()[-2000:]
         )
 
-    with tempfile.TemporaryDirectory() as tmp:
-        gen = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{tmp}:/out", IMAGE,
-             "-gen-key", "-privkey-file", "/out/server.key",
-             "-pubkey-file", "/out/server.pub"],
-            capture_output=True, text=True,
+    gen = subprocess.run(
+        ["docker", "run", "--rm", IMAGE, "-gen-key"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if gen.returncode != 0:
+        raise RenderError(
+            "dnstt-server -gen-key failed:\n" + (gen.stdout + gen.stderr).strip()[-2000:]
         )
-        if gen.returncode != 0:
-            raise RenderError(
-                "dnstt-server -gen-key failed:\n" + (gen.stdout + gen.stderr).strip()[-2000:]
-            )
-        key = Path(tmp, "server.key")
-        pub = Path(tmp, "server.pub")
-        if not key.is_file() or not pub.is_file():
-            raise RenderError("dnstt-server -gen-key wrote no key files")
-        return {
-            "dnstt.server.key": key.read_bytes(),
-            # The public key is not a secret -- it goes to every client -- but
-            # it lives with its private half so the two cannot drift apart.
-            "dnstt.server.pub": pub.read_bytes(),
-        }
+
+    found = dict(re.findall(r"^(privkey|pubkey)\s+([0-9a-f]{64})$", gen.stdout, re.M))
+    if {"privkey", "pubkey"} - found.keys():
+        raise RenderError(f"could not parse -gen-key output:\n{gen.stdout.strip()[:500]}")
+
+    return {
+        # dnstt reads -privkey-file as hex text, which is what it printed.
+        "dnstt.server.key": (found["privkey"] + "\n").encode(),
+        # Not a secret -- every client pins it -- but it lives beside its
+        # private half so the two cannot drift apart.
+        "dnstt.server.pub": (found["pubkey"] + "\n").encode(),
+    }
 
 
 PROTOCOL = Protocol(
@@ -99,15 +134,15 @@ PROTOCOL = Protocol(
     kind=Kind.COMPOSE,
     order=40,
     ports=(Port(53, "udp"),),
-    summary="DNS tunnel (dnstt -> sshd -> SOCKS5)",
-    secret_names=("dnstt.server.key",),
+    summary="DNS tunnel (dnstt -> containerised sshd -> SOCKS5)",
+    secret_names=("dnstt.server.key", "dnstt.ssh_password"),
     default_enabled=False,
     render=render,
     share=share,
     bootstrap=bootstrap,
     prepare=prepare,
     compose_profile="dnstt",
-    compose_services=("dnstt", "dnstt-socks"),
+    compose_services=("dnstt", "dnstt-sshd", "dnstt-socks"),
     per_user=False,
     notes=(
         f"Needs a delegated zone ({ZONE}) pointing NS at this host, and "

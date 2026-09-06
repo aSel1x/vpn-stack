@@ -4,6 +4,10 @@ name: vpn-stack
 
 volumes:
   ikev2-vpn-data:
+  # The dnstt SSH front's host key. Regenerating it on every restart would make
+  # every client warn about a changed server; baking it into the image would
+  # give every deployment the same one.
+  dnstt-sshd-keys:
 
 services:
   # ---------------------------------------------------------------- sing-box
@@ -78,7 +82,25 @@ services:
     command: >-
       -udp ${VPN_SERVER_HOST}:53
       -privkey-file /keys/server.key
-      tun.example.net 127.0.0.1:22
+      tun.example.net 127.0.0.1:2222
+
+  # The SSH front the mobile clients log into. In a container, not on the host:
+  # iOS apps speak DNSTT -> SSH and need a login, and putting that login on the
+  # host would mean a real account plus an edit to the host's sshd_config, both
+  # outside anything `vpn backup` captures. Here it is a disposable Alpine with
+  # nothing mounted, and the credentials are rendered from the keyring.
+  dnstt-sshd:
+    build: ./dnstt-sshd
+    image: dnstt-sshd:latest
+    container_name: dnstt-sshd
+    restart: always
+    network_mode: host
+    profiles: ["dnstt"]
+    env_file:
+      - path: ${VPN_STATE:-/etc/vpn-stack}/rendered/dnstt.env
+        required: false
+    volumes:
+      - dnstt-sshd-keys:/host-keys
 
   # SOCKS5 exit for SSH-over-dnstt clients. Loopback only: reachable solely
   # through an authenticated SSH forward, never from outside.
