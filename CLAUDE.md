@@ -150,10 +150,6 @@ Docker is installed from **Docker's own apt repository**, not `curl https://get.
 
 **Everything already installed is left alone.** docker, git, rsync, ufw, iptables and uv are each guarded by `command -v`, and the script says so rather than staying silent. If you install docker yourself it touches neither the daemon, `/etc/docker/daemon.json`, nor apt. ufw is only `enable`d when it was inactive, and `firewall.reconcile` only ever reads and writes rules carrying a `vpn-stack:` comment.
 
-### Nothing is meant to be taken on trust
-
-`./vpn explain` prints every subcommand mapped to the literal command it runs, plus the full inventory of what an install leaves on the server and why. `./vpn --dry-run <anything>` prints those commands and executes nothing — including the whole of `init`, where each of the five phases prints the exact script it would pipe over SSH. The dry run needs no network: the rsync file list is computed locally, because a dry run that cannot run without reaching the server is not much of a dry run. `./vpn -v` runs for real, echoing each command first.
-
 ### Verified end to end on a bare box
 
 Ubuntu 24.04.1, 2026-09-06, from `docker`-only to serving: install, `user add` (IKEv2 certificate issued by reconcile), export of all three bundles, `protocol off ikev2` → `on` (certificate survived the volume), `deploy`, **reboot** (boot unit re-applied the FORWARD rules, both containers returned, ufw persisted), and a backup/restore round trip. From outside, `10443/tcp` presents a genuine `www.apple.com` EV certificate and a port ufw does not allow is filtered.

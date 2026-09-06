@@ -5,13 +5,6 @@
 # no secrets. Anything it does not recognise is forwarded verbatim to vpnctl on
 # the server, so the CLI surface is defined in exactly one place.
 #
-# Nothing here is meant to be taken on trust. Every command it runs can be
-# printed instead of executed:
-#
-#   ./vpn explain              what each subcommand actually runs, as one table
-#   ./vpn --dry-run <cmd>      print the exact commands for <cmd>, run nothing
-#   ./vpn -v <cmd>             run it, echoing each command first
-#
 # This file is a placeholder for a future app's SSH transport, which is why its
 # remote surface is kept to three operations: run a command, push a tar, pull a
 # file. A second implementation (libssh2/russh/paramiko, for Windows and mobile
@@ -22,21 +15,6 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST="${VPN_HOST:-}"
 SSH_KEY="${VPN_SSH_KEY:-}"
 REMOTE_PATH="${VPN_REMOTE_PATH:-/opt/vpn-stack}"
-DRY="${VPN_DRY_RUN:-0}"
-VERBOSE="${VPN_VERBOSE:-0}"
-
-# -n/--dry-run and -v/--verbose are accepted anywhere, so `./vpn user add bob -n`
-# works as well as `./vpn -n user add bob`. They are stripped before anything is
-# forwarded to the server.
-args=()
-for a in "$@"; do
-  case "$a" in
-    -n|--dry-run) DRY=1 ;;
-    -v|--verbose) VERBOSE=1 ;;
-    *) args+=("$a") ;;
-  esac
-done
-set -- ${args+"${args[@]}"}
 
 if [[ -z "$HOST" && -f "$REPO/.vpn-host" ]]; then
   HOST="$(<"$REPO/.vpn-host")"
@@ -44,23 +22,6 @@ fi
 
 ssh_opts=(-o StrictHostKeyChecking=accept-new)
 [[ -n "$SSH_KEY" ]] && ssh_opts+=(-i "$SSH_KEY")
-
-echo_cmd() { printf '\033[2m+ %s\033[0m\n' "$*" >&2; }
-
-# Every external command goes through here, so --dry-run cannot miss one.
-run() {
-  [[ "$VERBOSE" == 1 || "$DRY" == 1 ]] && echo_cmd "$@"
-  [[ "$DRY" == 1 ]] && return 0
-  "$@"
-}
-
-# For the commands that are pipelines rather than a single call. Returns
-# non-zero under --dry-run so the caller skips the real work.
-dry_note() {
-  [[ "$VERBOSE" == 1 || "$DRY" == 1 ]] && echo_cmd "$*"
-  [[ "$DRY" == 1 ]] && return 1
-  return 0
-}
 
 need_host() {
   if [[ -z "$HOST" ]]; then
@@ -87,7 +48,7 @@ remote() {
   local cmd
   cmd="$(printf '%q ' "$@")"
   # shellcheck disable=SC2029
-  run ssh "${ssh_opts[@]}" "${tty[@]}" "$HOST" \
+  ssh "${ssh_opts[@]}" "${tty[@]}" "$HOST" \
     "cd $REMOTE_PATH && flock /run/vpn-stack.lock /usr/local/bin/vpnctl $cmd"
 }
 
@@ -95,20 +56,16 @@ case "${1:-}" in
   init)
     target="${2:?usage: ./vpn init <user@host>}"
     shift 2
-    dry_args=()
-    [[ "$DRY" == 1 ]] && dry_args=(--dry-run)
-    bash "$REPO/scripts/install.sh" "$target" ${dry_args+"${dry_args[@]}"} "$@"
+    bash "$REPO/scripts/install.sh" "$target" "$@"
     # The whole target, user included. Stripping it left every later ./vpn call
     # connecting as the local user instead of root, which fails with a
     # permission error that says nothing about where it came from.
-    [[ "$DRY" == 1 ]] || echo "$target" > "$REPO/.vpn-host"
+    echo "$target" > "$REPO/.vpn-host"
     ;;
 
   deploy)
     need_host
-    VPN_DRY_RUN="$DRY" VPN_VERBOSE="$VERBOSE" \
-    SSH_OPTS="${ssh_opts[*]}" REPO_PATH="$REMOTE_PATH" \
-      bash "$REPO/scripts/deploy.sh" "$HOST"
+    SSH_OPTS="${ssh_opts[*]}" REPO_PATH="$REMOTE_PATH" bash "$REPO/scripts/deploy.sh" "$HOST"
     ;;
 
   share)
@@ -117,14 +74,13 @@ case "${1:-}" in
     shift 2
     # The credential is fetched to THIS machine and served from here. The VPN
     # server never gains a listener and never learns who you handed it to.
-    dry_note "ssh $HOST 'vpnctl user export $name --json --protocol all' | python3 scripts/share.py $*" || exit 0
     remote user export "$name" --json --protocol all \
       | python3 "$REPO/scripts/share.py" "$@"
     ;;
 
   smoke)
     need_host
-    run ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
+    ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
     ;;
 
   backup)
@@ -137,7 +93,6 @@ case "${1:-}" in
     # Without it every certificate this server ever issued is unrecoverable.
     # rendered-* is excluded on purpose -- it is derived, `vpnctl apply`
     # rebuilds it, and a backup should contain only what cannot be remade.
-    dry_note "ssh $HOST 'tar cz -C /etc/vpn-stack --exclude=./rendered* . ; docker run --rm -v vpn-stack_ikev2-vpn-data:/v alpine tar cz -C /v .' | age -p" || exit 0
     ssh "${ssh_opts[@]}" "$HOST" '
       set -e
       tar cz -C /etc/vpn-stack --exclude="./rendered*" . 2>/dev/null > /tmp/.vpn-state.tgz
@@ -158,7 +113,7 @@ case "${1:-}" in
 
     # Restoring over a server that already has users overwrites live
     # credentials with older ones, and every profile issued since diverges.
-    if [[ "$force" != "--force" && "$DRY" != 1 ]]; then
+    if [[ "$force" != "--force" ]]; then
       if ssh "${ssh_opts[@]}" "$HOST" 'test -s /etc/vpn-stack/users.json' 2>/dev/null; then
         echo "$HOST already has a user database." >&2
         echo "Restoring would replace it, and every profile issued since this" >&2
@@ -168,7 +123,6 @@ case "${1:-}" in
       fi
     fi
 
-    dry_note "age -d $file | ssh $HOST '<stop ipsec-vpn-server; untar into /etc/vpn-stack and the ikev2 volume>' && vpnctl apply && smoke.sh" || exit 0
     echo "Decrypting locally and streaming to $HOST..." >&2
     age -d "$file" | ssh "${ssh_opts[@]}" "$HOST" '
       set -e
@@ -188,101 +142,13 @@ case "${1:-}" in
 
     echo "Converging..." >&2
     remote apply
-    run ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
+    ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
     ;;
 
   logs)
     need_host
     shift
-    run ssh "${ssh_opts[@]}" -t "$HOST" "cd $REMOTE_PATH && docker compose logs -f ${*:-sing-box}"
-    ;;
-
-  explain)
-    h="${HOST:-root@<server>}"
-    cat <<MSG
-./vpn is a forwarder, not a framework. Here is every command and the literal
-thing it runs. Nothing is hidden -- run any of these by hand if you prefer.
-
-  ./vpn status | user ... | protocol ... | ikev2 ...
-      ssh $h "cd $REMOTE_PATH && flock /run/vpn-stack.lock \\
-              /usr/local/bin/vpnctl <your arguments>"
-      The flock is the only thing the wrapper adds: two operators running
-      ./vpn at once serialise instead of interleaving writes to users.json.
-
-  ./vpn init <user@host>
-      bash scripts/install.sh <user@host>
-      Five separate SSH sessions: host packages -> push code -> vpnctl shim
-      -> keyring -> firewall (behind a deadman) -> apply -> smoke.
-      \`./vpn init <host> --dry-run\` prints each one without running it.
-
-  ./vpn deploy
-      bash scripts/deploy.sh $h
-        -> scripts/push.sh   rsync --filter=':- .gitignore'  (never --delete-excluded)
-        -> ssh "uv sync --frozen && vpnctl apply"
-        -> ssh "bash scripts/smoke.sh"
-      The same script CI runs, so the two cannot drift.
-
-  ./vpn share <user>
-      ssh $h 'vpnctl user export <user> --json --protocol all' \\
-        | python3 scripts/share.py
-      The page is served from THIS machine, on a private address only.
-
-  ./vpn smoke
-      ssh $h "cd $REMOTE_PATH && bash scripts/smoke.sh"
-
-  ./vpn backup > f.age
-      ssh $h 'tar cz -C /etc/vpn-stack --exclude=./rendered* . ;
-              docker run --rm -v vpn-stack_ikev2-vpn-data:/v alpine tar cz -C /v .' \\
-        | age -p
-      age runs here, so the passphrase never reaches the server.
-
-  ./vpn restore f.age
-      age -d f.age | ssh $h '<untar into /etc/vpn-stack and the volume>'
-      then vpnctl apply, then smoke.sh.
-
-  ./vpn logs [service]
-      ssh -t $h "cd $REMOTE_PATH && docker compose logs -f <service>"
-
-What an install leaves on the server, and why each one has to be there:
-
-  /opt/vpn-stack                        the code (rsync target)
-  /etc/vpn-stack                        0700: secrets, users.json, state.json,
-                                        .env, the rendered config
-  /etc/sysctl.d/99-vpn-stack.conf       ip_forward, rp_filter -- the containers
-                                        run in network_mode: host, so they have
-                                        no netns of their own and compose
-                                        cannot set these for them
-  /etc/modules-load.d/vpn-stack.conf    ppp_generic, so /dev/ppp exists
-  /etc/systemd/system/vpn-stack.service re-applies the IKEv2 FORWARD rules at
-                                        boot; they are raw iptables inserts and
-                                        do not persist on their own
-  /usr/local/bin/vpnctl                 3-line shim: cd /opt/vpn-stack && uv run
-  /usr/local/bin/uv                     symlink, only if uv is somewhere a
-                                        systemd unit's PATH cannot see it, and
-                                        only if nothing is already there
-  /etc/apt/sources.list.d/docker.list    only when it installs docker itself
-  /etc/apt/apt.conf.d/99-vpn-stack-ipv6  only if download.docker.com refuses
-                                        IPv4 from this host (CloudFront does,
-                                        for some ranges) and IPv6 works
-  ufw rules                             tagged 'vpn-stack:<protocol>', so
-                                        reconcile only ever touches its own.
-                                        22/tcp is never removed. ufw is only
-                                        enabled if it was off; rules you added
-                                        by hand are never read or deleted.
-  iptables -I FORWARD                   two inserts for the IKEv2 client pool,
-                                        in memory only -- hence the boot unit
-
-Anything already installed is left alone: docker, git, rsync, ufw, iptables and
-uv are each guarded by \`command -v\`. If you install docker yourself, this
-touches neither the daemon, nor /etc/docker/daemon.json, nor apt.
-
-One of the sysctls is a loosening, not a hardening: rp_filter=0, which IPsec
-needs. The file is numbered 99, so it wins over anything you set lower.
-
-Everything above is written by scripts in this repo. If something breaks, fix
-the code and re-run -- the install is idempotent, and nothing here expects the
-server to have been edited by hand.
-MSG
+    ssh "${ssh_opts[@]}" -t "$HOST" "cd $REMOTE_PATH && docker compose logs -f ${*:-sing-box}"
     ;;
 
   ""|-h|--help|help)
@@ -303,12 +169,6 @@ Everything else is forwarded to vpnctl on the server:
   ./vpn user add <name>
   ./vpn user export <name> --qr
   ./vpn protocol list | on <name> | off <name>
-
-Seeing what it does before it does it:
-
-  ./vpn explain               every command mapped to what it actually runs
-  ./vpn --dry-run <command>   print the commands, execute nothing
-  ./vpn -v <command>          run it, echoing each command first
 MSG
     ;;
 

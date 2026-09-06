@@ -1,10 +1,7 @@
 #!/bin/bash
 # Bare Ubuntu VPS -> serving VPN, in one command. Idempotent; safe to re-run.
 #
-#   scripts/install.sh root@<ip> [--dry-run]
-#
-# --dry-run prints every command it would run, on both sides, and touches
-# nothing. Read it before you trust it.
+#   scripts/install.sh root@<ip>
 #
 # This script is also the future app's entire deploy path: "type your IP and
 # your root password" is this file executed over SSH. Keep it self-contained,
@@ -18,10 +15,8 @@
 set -euo pipefail
 
 TARGET="${1:?usage: install.sh <user@host>}"; shift || true
-DRY="${VPN_DRY_RUN:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -n|--dry-run) DRY=1; shift ;;
     # Accepted and ignored: install.sh used to clone from GitHub. It now pushes
     # the checkout it lives in, so there is no URL to point anywhere.
     --repo) echo "note: --repo is obsolete; the local checkout is pushed" >&2; shift 2 ;;
@@ -39,21 +34,12 @@ ssh_opts=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
-# Every remote call goes through on(); under --dry-run it prints the script it
-# would have piped in, indented, and runs nothing.
-on() {
-  if [[ "$DRY" == 1 ]]; then
-    printf '\033[2m    ssh %s %s\033[0m\n' "$TARGET" "$*"
-    if [[ ! -t 0 ]]; then sed 's/^/      | /'; fi
-    return 0
-  fi
-  ssh "${ssh_opts[@]}" "$TARGET" "$@"
-}
+on()   { ssh "${ssh_opts[@]}" "$TARGET" "$@"; }
 
 # --------------------------------------------------------------- 0. a key
 # Five sessions follow. Without a key that is five password prompts, and the
 # deadman verification below cannot run in BatchMode at all.
-if [[ "$DRY" != 1 ]] && ! ssh "${ssh_opts[@]}" -o BatchMode=yes "$TARGET" true 2>/dev/null; then
+if ! ssh "${ssh_opts[@]}" -o BatchMode=yes "$TARGET" true 2>/dev/null; then
   KEY="${VPN_SSH_KEY:-$HOME/.ssh/vpn-stack_ed25519}"
   step "installing an SSH key ($KEY)"
   [[ -f "$KEY" ]] || ssh-keygen -t ed25519 -f "$KEY" -N '' -C "vpn-stack operator"
@@ -69,105 +55,72 @@ HOST="$1"
 export DEBIAN_FRONTEND=noninteractive
 
 have() { command -v "$1" >/dev/null 2>&1; }
-note() { printf '   %s\n' "$*"; }
 
-# Docker's apt repository, not `curl https://get.docker.com | sh`. Same
-# packages, but signed, upgradable with the rest of the system, and auditable
-# before it runs -- which a piped shell script is not.
+# Docker's own apt repository rather than `curl get.docker.com | sh`: signed,
+# upgradable with the rest of the system, and readable before it runs.
 install_docker() {
-  echo "-- installing docker from Docker's own apt repository"
+  echo "-- installing docker (apt, from download.docker.com)"
   apt-get update -qq || true
   apt-get install -y -qq ca-certificates curl
 
-  # The repository is behind CloudFront, which answers 403 to some IPv4 ranges
-  # while serving the same bytes over IPv6. Choose a family that works instead
-  # of failing three layers down with a bare 403 and no explanation.
-  local family
-  if curl -4 -fsS -m 15 -o /dev/null https://download.docker.com/linux/ubuntu/gpg 2>/dev/null; then
-    family=4
-  elif curl -6 -fsS -m 15 -o /dev/null https://download.docker.com/linux/ubuntu/gpg 2>/dev/null; then
-    family=6
-    note "IPv4 to download.docker.com is refused from this host; using IPv6"
-  else
-    echo "Cannot reach download.docker.com over IPv4 or IPv6." >&2
-    echo "Install docker however you like and re-run: if docker is already on" >&2
-    echo "PATH this script leaves it completely alone." >&2
-    return 1
-  fi
+  # CloudFront fronts that repository and answers 403 to some IPv4 ranges while
+  # serving the same bytes over IPv6. Pick a family that works, instead of
+  # failing three layers down with a bare 403 and no explanation.
+  local key=https://download.docker.com/linux/ubuntu/gpg family=
+  for f in 4 6; do
+    if curl -"$f" -fsS -m 15 -o /dev/null "$key" 2>/dev/null; then family=$f; break; fi
+  done
+  [[ -n "$family" ]] || {
+    echo "download.docker.com is unreachable over IPv4 and IPv6." >&2
+    echo "Install docker yourself and re-run: if it is present, this leaves" >&2
+    echo "it completely alone." >&2
+    return 1; }
+  [[ "$family" == 6 ]] && echo "   IPv4 to download.docker.com refused; using IPv6"
 
   install -m 0755 -d /etc/apt/keyrings
-  curl -"$family" -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    -o /etc/apt/keyrings/docker.asc
+  curl -"$family" -fsSL "$key" -o /etc/apt/keyrings/docker.asc
   chmod a+r /etc/apt/keyrings/docker.asc
-
   . /etc/os-release
   printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
     "$(dpkg --print-architecture)" "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list
 
-  if [[ "$family" == 6 ]]; then
-    # Persisted rather than passed once: without it *your* next `apt update`
-    # fails on this repository too. Named after the project so it is obvious
-    # who put it there, and safe to delete the day IPv4 starts working.
-    cat > /etc/apt/apt.conf.d/99-vpn-stack-ipv6 <<'APTCONF'
-// download.docker.com (CloudFront) returns 403 to this host over IPv4 and
-// serves the same files over IPv6. Without this, apt fails on the docker
-// repository. Delete this file if IPv4 to Docker ever starts working.
-Acquire::ForceIPv6 "true";
-APTCONF
-    if ! apt-get update -qq 2>/dev/null; then
-      # The system's own mirror may have no IPv6. Do not leave apt broken.
-      rm -f /etc/apt/apt.conf.d/99-vpn-stack-ipv6 /etc/apt/sources.list.d/docker.list
-      apt-get update -qq || true
-      echo "Docker's repository needs IPv6 from this host, but the system's" >&2
-      echo "apt mirror is not reachable over IPv6. Reverted; install docker" >&2
-      echo "yourself and re-run." >&2
-      return 1
-    fi
-  else
-    apt-get update -qq
-  fi
+  # Persisted, not passed once: otherwise *your* next `apt update` fails on
+  # this repository too. Reverted rather than left behind if it turns out the
+  # system's own mirror has no IPv6.
+  [[ "$family" == 6 ]] && echo 'Acquire::ForceIPv6 "true";' > /etc/apt/apt.conf.d/99-vpn-stack-ipv6
+  apt-get update -qq || {
+    rm -f /etc/apt/apt.conf.d/99-vpn-stack-ipv6 /etc/apt/sources.list.d/docker.list
+    apt-get update -qq || true
+    echo "apt could not read the docker repository; reverted, nothing left behind." >&2
+    return 1; }
 
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
                          docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker
 }
 
-if have docker; then
-  note "docker: already installed ($(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)) -- left alone"
-else
-  install_docker
-fi
+# Everything below is guarded: what is already installed is reported and left
+# alone, so bringing your own docker (or uv) is a supported way to run this.
+if have docker; then echo "   docker: $(docker --version) -- left alone"
+else install_docker; fi
 docker compose version >/dev/null 2>&1 || {
-  echo "docker is present but 'docker compose' is not." >&2
-  echo "Install the plugin (docker-compose-plugin, or Ubuntu's" >&2
-  echo "docker-compose-v2) and re-run." >&2
-  exit 1; }
+  echo "docker is here but 'docker compose' is not; install the plugin." >&2; exit 1; }
 
 for pkg in git rsync ufw iptables; do
   have "$pkg" || { echo "-- installing $pkg"; apt-get install -y -qq "$pkg"; }
 done
 
-if have uv; then
-  note "uv: already installed ($(uv --version 2>/dev/null | awk '{print $2}')) at $(command -v uv) -- left alone"
-else
-  echo "-- installing uv"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
+if have uv; then echo "   uv: $(command -v uv) -- left alone"
+else echo "-- installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh; fi
 
-# systemd units and non-interactive SSH get a minimal PATH that does not
-# include /root/.local/bin, where uv installs itself. Put a link where they
-# will look -- but never replace a binary somebody else put there.
+# systemd units and non-interactive SSH get a PATH without /root/.local/bin,
+# where uv installs itself. Link it where they look -- but never over a file
+# somebody else put there.
 uv_path="$(command -v uv || true)"
-[[ -n "$uv_path" ]] || { echo "uv is still not on PATH" >&2; exit 1; }
+[[ -n "$uv_path" ]] || { echo "uv is not on PATH" >&2; exit 1; }
 case "$uv_path" in
   /usr/local/bin/*|/usr/bin/*|/bin/*) ;;
-  *)
-    if [[ -e /usr/local/bin/uv ]]; then
-      note "uv: /usr/local/bin/uv already exists -- left alone"
-    else
-      ln -s "$uv_path" /usr/local/bin/uv
-      note "uv: linked /usr/local/bin/uv -> $uv_path (so systemd can find it)"
-    fi ;;
+  *) [[ -e /usr/local/bin/uv ]] || ln -s "$uv_path" /usr/local/bin/uv ;;
 esac
 
 echo "-- state directory"
@@ -223,7 +176,7 @@ REMOTE
 
 # ---------------------------------------------------------------- 2. the code
 step "pushing the checkout to $REPO_PATH"
-VPN_DRY_RUN="$DRY" SSH_OPTS="${ssh_opts[*]}" bash "$HERE/push.sh" "$TARGET" "$REPO_PATH"
+SSH_OPTS="${ssh_opts[*]}" bash "$HERE/push.sh" "$TARGET" "$REPO_PATH"
 
 step "installing vpnctl"
 on bash -s -- "$REPO_PATH" <<'REMOTE'
@@ -283,10 +236,7 @@ REMOTE
 # Reusing the session above would prove nothing -- an established conntrack
 # entry survives a firewall that would reject every new one.
 step "verifying SSH still works through the new rules"
-if [[ "$DRY" == 1 ]]; then
-  printf '\033[2m    ssh -o ControlMaster=no -o ControlPath=none %s true\033[0m\n' "$TARGET"
-  printf '\033[2m    (on success) kill the deadman; on failure, leave it armed\033[0m\n'
-elif ssh "${ssh_opts[@]}" -o ControlMaster=no -o ControlPath=none \
+if ssh "${ssh_opts[@]}" -o ControlMaster=no -o ControlPath=none \
        -o BatchMode=yes "$TARGET" true; then
   echo "  fresh connection accepted -- disarming the deadman"
   on 'pid=$(cat /run/vpn-stack.deadman 2>/dev/null || true)
@@ -306,8 +256,6 @@ on "vpnctl apply"
 
 step "smoke test"
 on "cd $REPO_PATH && bash scripts/smoke.sh"
-
-[[ "$DRY" == 1 ]] && { echo; echo "(--dry-run: nothing above was executed)"; exit 0; }
 
 cat <<DONE
 
