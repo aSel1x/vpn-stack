@@ -23,7 +23,7 @@ Live deployment: `root@203.0.113.10`, checkout at `/opt/vpn-stack`, state at `/e
 ./vpn user add <name>
 ./vpn user export <name> --qr      # ASCII QR in YOUR terminal
 ./vpn protocol list | on <x> | off <x>
-./vpn deploy                       # same script CI runs
+./vpn deploy                       # sync code, validate, converge
 ./vpn smoke                        # assert it is actually serving
 ./vpn backup > f.age               # encrypted here, never on the server
 ./vpn restore f.age                # onto a rebuilt box
@@ -100,9 +100,9 @@ The readiness wait matters: `docker compose up` returns immediately but `hwdsl2/
 
 "Bound" means bound on a non-loopback address, in both `composectl` and `scripts/smoke.sh`. Substring-matching the port number reports dnstt's `53/udp` as served on any stock Ubuntu, because `systemd-resolved` holds `127.0.0.53:53`.
 
-**A deploy is not an install.** `deploy.sh` updates code on a server that `init` already provisioned; it checks for `vpnctl`, `/etc/vpn-stack` and `uv` *before* the rsync and stops with that list if any is absent. Against a rebuilt box it used to rsync the code and then die on `uv: command not found`, exit 127, explaining nothing. CI therefore cannot provision a host: a push to `main` updates a running server, and standing up a new one stays a deliberate act run from a checkout.
+**A deploy is not an install.** `deploy.sh` updates code on a server that `init` already provisioned; it checks for `vpnctl`, `/etc/vpn-stack` and `uv` *before* the rsync and stops with that list if any is absent. Against a rebuilt box it used to rsync the code and then die on `uv: command not found`, exit 127, explaining nothing.
 
-`scripts/check.sh` is the single definition of validity. `scripts/push.sh` is the single definition of *what gets sent* — the one dangerous rsync flag combination in this repo exists in one place, and both `install.sh` and `deploy.sh` call it. `scripts/deploy.sh` is the single deploy path; CI and `./vpn deploy` both call it, so the manual route cannot drift from the automated one. `deploy.sh` deliberately does **not** bootstrap: on a server whose state directory has been damaged, generating fresh secrets would silently invalidate every profile already handed out, so `apply` fails loudly instead and points at `bootstrap` or a backup.
+`scripts/check.sh` is the single definition of validity. `scripts/push.sh` is the single definition of *what gets sent* — the one dangerous rsync flag combination in this repo exists in one place, and both `install.sh` and `deploy.sh` call it. `scripts/deploy.sh` is the single deploy path, and `./vpn deploy` is the only thing that calls it. `deploy.sh` deliberately does **not** bootstrap: on a server whose state directory has been damaged, generating fresh secrets would silently invalidate every profile already handed out, so `apply` fails loudly instead and points at `bootstrap` or a backup.
 
 ## Users
 
@@ -138,7 +138,7 @@ Arbitrary UDP reaches the server while no client's IKE ever has: the drop is on 
 
 ## Deployment
 
-Push to `main` → `.github/workflows/deploy.yml` → `scripts/deploy.sh root@$DEPLOY_HOST`. The rsync (in `scripts/push.sh`) uses `--filter=':- .gitignore'` and **not** `--delete-excluded` (which would delete the very files the filter protects, from the server). Then `uv sync --frozen`, `vpnctl apply`, `scripts/smoke.sh`.
+`./vpn deploy` → `scripts/deploy.sh root@<host>`. **There is no CI, deliberately.** Deploy-on-push bought nothing here — one operator, one laptop, one command — and cost a standing credential with root on the VPN server held by GitHub, plus a live server mutated by every `git push`. That is not a theoretical objection: a push did exactly that to a server that had just been deliberately wiped. The rsync (in `scripts/push.sh`) uses `--filter=':- .gitignore'` and **not** `--delete-excluded` (which would delete the very files the filter protects, from the server). Then `uv sync --frozen`, `vpnctl apply`, `scripts/smoke.sh`.
 
 `scripts/install.sh` takes a bare Ubuntu 22.04/24.04 box to a serving VPN in one command, in five separate SSH sessions rather than one long heredoc — the firewall step has to prove a *fresh* connection still works before disarming its own safety net, and it cannot do that from inside the connection it might be about to sever.
 

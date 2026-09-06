@@ -19,8 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # --filter=':- .gitignore' is NOT optional. Without it a developer checkout
 # pushes its own users.json, .env, rendered fragments and certs over the
-# server's live ones. CI is safe only because its checkout has none of those;
-# this script has to be safe from either.
+# server's live ones.
 #
 # NOT --delete-excluded: that would delete the very files the filter protects
 # (users.json, .env, secrets) from the SERVER. Excluding means "do not send",

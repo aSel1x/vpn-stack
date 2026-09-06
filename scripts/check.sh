@@ -3,7 +3,7 @@
 #
 # Called by vpnctl before promoting a candidate tree, and by deploy.sh before
 # restarting anything. Previously this command existed in three places that had
-# to be kept in sync (compose.yml, sbctl.py, deploy.yml); it now exists here.
+# to be kept in sync (compose.yml, sbctl.py, the CI workflow); it now lives here.
 #
 #   scripts/check.sh <sing-box-config-dir>
 #

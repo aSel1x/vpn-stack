@@ -1,6 +1,5 @@
 #!/bin/bash
-# The single deploy path. CI calls it, `./vpn deploy` calls it, and because
-# there is only one, the manual route cannot drift from the automated one.
+# The single deploy path, called by `./vpn deploy` and nothing else.
 #
 #   scripts/deploy.sh <user@host>
 #
