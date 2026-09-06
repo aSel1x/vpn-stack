@@ -630,6 +630,11 @@ def main() -> None:
         die(str(e))
     except secrets_store.MissingSecret as e:
         die(str(e))
+    except users_store.UsersError as e:
+        # The database being unreadable is an operator problem with a stated
+        # remedy, not a bug. A traceback here buries the one sentence that
+        # says what to do.
+        die(str(e))
 
 
 if __name__ == "__main__":

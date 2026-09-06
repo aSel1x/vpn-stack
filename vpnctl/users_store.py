@@ -3,7 +3,7 @@ import os
 import re
 import secrets
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 
 from vpnctl.paths import USERS_JSON
@@ -71,8 +71,34 @@ def load() -> list[User]:
     if not USERS_JSON.exists():
         return []
     data = json.loads(USERS_JSON.read_text())
+
+    # Rolling the code back is easy -- push.sh will happily rsync an older
+    # checkout over a newer one -- while the database only moves forward. That
+    # combination used to surface as `TypeError: User.__init__() got an
+    # unexpected keyword argument`, from which the cause is unguessable.
+    #
+    # Refuse rather than drop the unknown fields: ignoring them would let the
+    # next save() write the record back without them, quietly destroying a
+    # credential this code is simply too old to know about.
+    version = data.get("schema_version", SCHEMA_VERSION)
+    if version > SCHEMA_VERSION:
+        raise UsersError(
+            f"{USERS_JSON} has schema {version}, this vpnctl understands "
+            f"{SCHEMA_VERSION}. The database is newer than the code -- deploy "
+            "the matching version. Nothing was changed."
+        )
+
+    known = {f.name for f in fields(User)}
     users = []
     for u in data["users"]:
+        unknown = sorted(set(u) - known)
+        if unknown:
+            raise UsersError(
+                f"{USERS_JSON}: user {u.get('name')!r} has fields this vpnctl "
+                f"does not know ({', '.join(unknown)}). The database is newer "
+                "than the code -- deploy the matching version. Nothing was "
+                "changed."
+            )
         u.setdefault("ikev2_provisioned", False)
         u.setdefault("enabled", True)
         # Not a rotation risk: absent means never issued, so a default of
