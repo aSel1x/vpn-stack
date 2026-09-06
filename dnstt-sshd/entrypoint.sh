@@ -10,12 +10,11 @@ set -eu
 : "${SSH_USER:?SSH_USER is required}"
 : "${SSH_PASSWORD:?SSH_PASSWORD is required}"
 SSH_PORT="${SSH_PORT:-2222}"
-# Where this login may forward. Not just the SOCKS exit: the mobile clients
-# resolve names over DNS-over-TLS *through the tunnel* before they open
-# anything else, so without their resolver here every session dies at the
-# first lookup. Observed: 17 requests for 1.1.1.1:853, 17 denials, and not one
-# connection to the SOCKS exit.
-PERMIT_OPEN="${PERMIT_OPEN:-127.0.0.1:7300 1.1.1.1:853}"
+# Where this login may forward. See dnstt.py for why the default is "any":
+# the clients use SSH *dynamic* forwarding, so every site is a fresh
+# destination and no fixed list can ever match. Narrow it by rendering a
+# different PERMIT_OPEN; the log names every destination it refuses.
+PERMIT_OPEN="${PERMIT_OPEN:-any}"
 HOST_KEY=/host-keys/ssh_host_ed25519_key
 
 mkdir -p /host-keys
@@ -37,7 +36,8 @@ AllowUsers $SSH_USER
 PasswordAuthentication yes
 KbdInteractiveAuthentication no
 
-# The whole purpose of this login: forward to the SOCKS exit, and nothing else.
+# This login exists to forward, and nothing else: no shell worth having, no
+# agent, no X11, no tun device, and it cannot bind a port for anybody else.
 AllowTcpForwarding yes
 AllowAgentForwarding no
 X11Forwarding no

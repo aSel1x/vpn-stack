@@ -22,10 +22,24 @@ NAME = "dnstt"
 ZONE = "tun.example.net"
 IMAGE = "dnstt-server:latest"
 SOCKS_ADDR = "127.0.0.1:7300"
-# What the SSH front is allowed to forward to. The mobile apps resolve over
-# DNS-over-TLS through the tunnel before opening anything else, so their
-# resolver has to be here or every session stalls on the first lookup.
-PERMIT_OPEN = (SOCKS_ADDR, "1.1.1.1:853")
+# What the SSH front may forward to. The clients use SSH *dynamic* forwarding,
+# so the destination is a different address for every site and no fixed list
+# can ever match. Proven twice from the server's own log: first 17 refusals of
+# the DoT resolver, then, once that was allowed, refusals of twenty-odd web
+# hosts on :443 -- Apple, Google, Fastly, IPv6 among them.
+#
+# Less of a loss than it looks. The other three protocols on this server
+# already hand unrestricted network access to anyone holding their
+# credentials; restricting the last-resort protocol alone would buy nothing
+# and would leave the people in the most locked-down networks with the least
+# useful of the four. What this reaches on the host's loopback is either
+# already public (sshd on 22, open in ufw) or loopback-by-design (microsocks).
+#
+# The narrowing that would actually help is a smaller blast radius on the
+# credential, not a shorter list: the password is random, the sshd binds
+# loopback only, and the sole route to it is a tunnel that already requires
+# the pinned Noise key.
+PERMIT_OPEN = ("any",)
 # The decoded stream goes to an sshd running in its own container, not to the
 # host's. iOS clients speak DNSTT -> SSH and need a login; keeping that login
 # out of the host means no real account, no edit to the host's sshd_config, and
