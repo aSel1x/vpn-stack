@@ -48,7 +48,10 @@ def up(enabled: list[protocols.Protocol], recreate: bool = True) -> tuple[bool, 
     services = ["sing-box"]
     for proto in enabled:
         services.extend(proto.compose_services)
-    args = ["up", "-d", "--no-deps"]
+    # --build, or a change to a Dockerfile or an entrypoint script is rsynced
+    # to the server and then silently ignored: compose reuses the existing
+    # image because the tag already exists. Cheap when nothing changed.
+    args = ["up", "-d", "--no-deps", "--build"]
     if recreate:
         args.append("--force-recreate")
     return _compose(*args, *services, profiles=profiles)

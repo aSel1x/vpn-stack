@@ -22,6 +22,10 @@ NAME = "dnstt"
 ZONE = "tun.example.net"
 IMAGE = "dnstt-server:latest"
 SOCKS_ADDR = "127.0.0.1:7300"
+# What the SSH front is allowed to forward to. The mobile apps resolve over
+# DNS-over-TLS through the tunnel before opening anything else, so their
+# resolver has to be here or every session stalls on the first lookup.
+PERMIT_OPEN = (SOCKS_ADDR, "1.1.1.1:853")
 # The decoded stream goes to an sshd running in its own container, not to the
 # host's. iOS clients speak DNSTT -> SSH and need a login; keeping that login
 # out of the host means no real account, no edit to the host's sshd_config, and
@@ -37,6 +41,7 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
         f"SSH_PASSWORD={password}\n"
         f"SSH_PORT={EXIT.rsplit(':', 1)[1]}\n"
         f"SOCKS_EXIT={SOCKS_ADDR}\n"
+        f"PERMIT_OPEN={' '.join(PERMIT_OPEN)}\n"
     )
     return {
         "dnstt/server.key": secrets.raw("dnstt.server.key"),

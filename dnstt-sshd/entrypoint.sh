@@ -10,7 +10,12 @@ set -eu
 : "${SSH_USER:?SSH_USER is required}"
 : "${SSH_PASSWORD:?SSH_PASSWORD is required}"
 SSH_PORT="${SSH_PORT:-2222}"
-SOCKS_EXIT="${SOCKS_EXIT:-127.0.0.1:7300}"
+# Where this login may forward. Not just the SOCKS exit: the mobile clients
+# resolve names over DNS-over-TLS *through the tunnel* before they open
+# anything else, so without their resolver here every session dies at the
+# first lookup. Observed: 17 requests for 1.1.1.1:853, 17 denials, and not one
+# connection to the SOCKS exit.
+PERMIT_OPEN="${PERMIT_OPEN:-127.0.0.1:7300 1.1.1.1:853}"
 HOST_KEY=/host-keys/ssh_host_ed25519_key
 
 mkdir -p /host-keys
@@ -40,7 +45,7 @@ GatewayPorts no
 PermitTunnel no
 
 Match User $SSH_USER
-    PermitOpen $SOCKS_EXIT
+    PermitOpen $PERMIT_OPEN
 CONF
 
 exec /usr/sbin/sshd -D -e
