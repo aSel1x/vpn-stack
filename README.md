@@ -49,7 +49,8 @@ Point it at a server with `.vpn-host` (gitignored) or `VPN_HOST=`; the SSH key w
 ## Changing code
 
 Edit, commit, push — CI runs `scripts/deploy.sh`, the same script `./vpn deploy` runs, so the
-manual and automated paths cannot diverge. Secrets live in `/etc/vpn-stack` on the server and are
+manual and automated paths cannot diverge. Deploy *updates* a server; it does not set one up,
+and it says so plainly if the server has not been through `./vpn init`. Secrets live in `/etc/vpn-stack` on the server and are
 never in this repo, so a deploy cannot overwrite them.
 
 `vpnctl` refuses to touch live state from anywhere that is not the server. For local work,

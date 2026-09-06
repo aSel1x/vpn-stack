@@ -100,6 +100,8 @@ The readiness wait matters: `docker compose up` returns immediately but `hwdsl2/
 
 "Bound" means bound on a non-loopback address, in both `composectl` and `scripts/smoke.sh`. Substring-matching the port number reports dnstt's `53/udp` as served on any stock Ubuntu, because `systemd-resolved` holds `127.0.0.53:53`.
 
+**A deploy is not an install.** `deploy.sh` updates code on a server that `init` already provisioned; it checks for `vpnctl`, `/etc/vpn-stack` and `uv` *before* the rsync and stops with that list if any is absent. Against a rebuilt box it used to rsync the code and then die on `uv: command not found`, exit 127, explaining nothing. CI therefore cannot provision a host: a push to `main` updates a running server, and standing up a new one stays a deliberate act run from a checkout.
+
 `scripts/check.sh` is the single definition of validity. `scripts/push.sh` is the single definition of *what gets sent* — the one dangerous rsync flag combination in this repo exists in one place, and both `install.sh` and `deploy.sh` call it. `scripts/deploy.sh` is the single deploy path; CI and `./vpn deploy` both call it, so the manual route cannot drift from the automated one. `deploy.sh` deliberately does **not** bootstrap: on a server whose state directory has been damaged, generating fresh secrets would silently invalidate every profile already handed out, so `apply` fails loudly instead and points at `bootstrap` or a backup.
 
 ## Users
