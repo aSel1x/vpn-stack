@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# /opt/vpn-stack/deploy -- this project's half of the contract every stack on this host
+# keeps: an executable called `deploy`, in the project's own directory, and that is the
+# only thing anything else has to know about how it is deployed.
+#
+# NOT THE SAME FILE AS scripts/deploy.sh. That one runs on YOUR machine and is what
+# `./vpn deploy` calls: it checks the server's preconditions, pushes this tree, and then
+# converges. This one runs ON THE SERVER and only converges, because by the time anything
+# calls it the code is already here.
+#
+# THIS PROJECT IS DELIBERATELY NOT IN /opt/infra/projects, so nothing automatic ever runs
+# this. That is not an oversight, it is commit 61457b7:
+#
+#     A push to main deployed to the server. That is how /opt/vpn-stack reappeared on a
+#     box that had just been deliberately wiped -- CI acting on production because someone
+#     committed, not because anyone asked it to.
+#
+# Registering it would hand the shared deploy key - which lives in two GitHub repositories
+# - the ability to re-render this host's firewall and restart the VPN, and `vpnctl apply`
+# needs root, so it would need a sudoers rule to go with it. There is one operator, one
+# laptop, and `./vpn deploy` is twenty seconds. The file exists so that someone reading
+# /opt/<anything> finds the same entry point, and finds this explanation at the moment they
+# wonder why this one is different.
+#
+# Two things worth knowing before running it by hand:
+#
+#   * `vpnctl apply` is NEVER a no-op. composectl.up() always passes --force-recreate, so
+#     every apply recreates every enabled container and drops every live VPN session for as
+#     long as they take to come back - about thirty seconds for ipsec-vpn-server, which
+#     rebuilds nothing but binds slowly. That is true of `./vpn deploy` too; it is the
+#     shape of the tool, not a cost this file adds.
+#   * It warns rather than fails on ports that never bind, on ufw reconciliation, and on
+#     IKEv2 FORWARD rules, so a zero exit here means "apply ran", not "the VPN is serving".
+#     `./vpn smoke` is the thing that asserts the second.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || {
+  echo "deploy: needs root - vpnctl renders into /etc/vpn-stack (0700) and reconciles ufw." >&2
+  echo "        From a laptop use ./vpn deploy, which does the push as well." >&2
+  exit 77 # EX_NOPERM
+}
+
+# The same lock ./vpn takes around every forwarded command (vpn:52). vpnctl holds no lock
+# of its own, so without this a hand-run apply can interleave with an operator's `./vpn
+# user add` - two candidate trees rendering over each other, which is precisely what the
+# atomic promote downstream cannot save you from.
+exec flock /run/vpn-stack.lock /usr/local/bin/vpnctl apply

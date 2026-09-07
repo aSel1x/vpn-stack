@@ -2,6 +2,20 @@
 # never depends on what the checkout directory happens to be called.
 name: vpn-stack
 
+# Docker's json-file driver keeps every line forever unless max-size is set, and this box
+# shares one 9.8 GB disk with the infra stack and its databases. Five services were writing
+# uncapped: quiet today at a handful of lines an hour, but sing-box under load and dnstt
+# under junk traffic are not quiet, and the container that fills the disk is not
+# necessarily the one that suffers for it.
+#
+# 10m x 3 matches every other service on this host, so "how much log does a container get
+# to keep" is one answer rather than per-stack folklore.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 volumes:
   ikev2-vpn-data:
   # The dnstt SSH front's host key. Regenerating it on every restart would make
@@ -23,6 +37,7 @@ services:
     # prevent. Bump deliberately, with scripts/check.sh to prove it first.
     image: ghcr.io/sagernet/sing-box:v1.14.0
     container_name: sing-box
+    logging: *logging
     restart: always
     network_mode: host
     volumes:
@@ -46,6 +61,7 @@ services:
     # any of those silently breaks user management on the next pull.
     image: hwdsl2/ipsec-vpn-server@sha256:2e939ffe5913c9a34a3f5b72d75a97e9a2f16824d223bf042b88a567ffeabe9b
     container_name: ipsec-vpn-server
+    logging: *logging
     restart: always
     network_mode: host
     profiles: ["ikev2"]
@@ -74,6 +90,7 @@ services:
     build: ./dnstt
     image: dnstt-server:latest
     container_name: dnstt-server
+    logging: *logging
     restart: always
     network_mode: host
     profiles: ["dnstt"]
@@ -93,6 +110,7 @@ services:
     build: ./dnstt-sshd
     image: dnstt-sshd:latest
     container_name: dnstt-sshd
+    logging: *logging
     restart: always
     network_mode: host
     profiles: ["dnstt"]
@@ -112,6 +130,7 @@ services:
     build: ./dnstt-socks
     image: dnstt-socks:latest
     container_name: dnstt-socks
+    logging: *logging
     restart: always
     network_mode: host
     profiles: ["dnstt"]
