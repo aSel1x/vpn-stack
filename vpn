@@ -79,8 +79,18 @@ case "${1:-}" in
     shift 2
     # The credential is fetched to THIS machine and served from here. The VPN
     # server never gains a listener and never learns who you handed it to.
+    # Through uv when it is here, so share.py can import qrcode - it is a
+    # declared dependency of this project and was simply absent from the system
+    # python3, which is why the QR of the link never once appeared. Plain
+    # python3 still works as the fallback; the page is identical, only the QR is
+    # missing, and share.py now says so instead of skipping it in silence.
+    if command -v uv >/dev/null; then
+      py=(uv run --quiet --project "$REPO" python)
+    else
+      py=(python3)
+    fi
     remote user export "$name" --json --protocol all \
-      | python3 "$REPO/scripts/share.py" "$@"
+      | "${py[@]}" "$REPO/scripts/share.py" "$@"
     ;;
 
   smoke)

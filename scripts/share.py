@@ -192,6 +192,35 @@ def render_page(bundle: Bundle, token: str) -> bytes:
     return PAGE.format(user=html.escape(bundle.user), body="\n".join(parts)).encode()
 
 
+class QuietServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that does not shout when a phone hangs up.
+
+    socketserver prints a full traceback for ANY exception out of a handler
+    thread, and the overwhelmingly common one here is not a bug: mobile Safari
+    and Chrome open speculative connections and reset them without sending a
+    request, so every share session filled the terminal with
+
+        ConnectionResetError: [Errno 104] Connection reset by peer
+
+    stacks from socket.recv_into. A partially-downloaded .mobileconfig does the
+    same through wfile.write, as BrokenPipeError. Both mean "the client went
+    away", which on a page whose whole job is to be opened once by one phone is
+    the normal ending, not a fault.
+
+    Only that family is swallowed. Anything else still gets its traceback,
+    because the reason this noise was worth removing is that it was hiding the
+    errors that do matter.
+    """
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        # ConnectionError covers reset/aborted/broken-pipe; TimeoutError is what
+        # a socket timeout raises from 3.10 on.
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(bundle: Bundle, bind: str, port: int) -> None:
     token = secrets.token_urlsafe(24)
     state = {"fetched_at": None, "dead": False}
@@ -243,19 +272,28 @@ def serve(bundle: Bundle, bind: str, port: int) -> None:
             # Anything else, including a wrong token, is indistinguishable.
             self.send_error(404)
 
-    server = ThreadingHTTPServer((bind, port), Handler)
+    server = QuietServer((bind, port), Handler)
     url = f"http://{bind}:{server.server_port}/{token}"
 
     print(f"\n  {url}\n")
+    # A QR of the LINK, so the phone that is about to open this page does not
+    # have to be handed a URL with a 32-character token in it by hand.
+    #
+    # `qrcode` is a declared dependency of this project, but ./vpn used to run
+    # this file with the system python3, where it is not installed - and the
+    # ImportError was swallowed, so the QR silently never appeared and nothing
+    # said why. ./vpn now runs it under `uv run` when uv is present; if it still
+    # cannot be imported, say so rather than quietly printing less.
     try:
         import qrcode
-
+    except ImportError:
+        print("  (no QR: `qrcode` is not importable - run this through"
+              " `uv run --project <repo>`, or pip install qrcode)\n")
+    else:
         qr = qrcode.QRCode(border=1)
         qr.add_data(url)
         qr.make(fit=True)
         qr.print_ascii(invert=True)
-    except ImportError:
-        pass
 
     print(f"  Bound to {bind} (private address only).")
     print("  Plain HTTP: anyone already on this network could read it inside the")
