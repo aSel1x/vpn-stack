@@ -12,9 +12,26 @@ dependencies = [
 [project.scripts]
 vpnctl = "vpnctl.cli:main"
 
+# Not in [project.dependencies]: the server installs this package and has no
+# business carrying a test runner. Note that uv syncs this group by DEFAULT, so
+# `uv sync --frozen` in scripts/deploy.sh and scripts/install.sh now puts pytest
+# on the server too; `--no-dev` there drops it again.
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vpnctl"]
+
+[tool.pytest.ini_options]
+# The suite must run on a bare runner: no server, no Docker, no root. Anything
+# that would need one belongs in scripts/smoke.sh, which runs against a real
+# box on purpose.
+testpaths = ["tests"]
+# A typo'd marker or ini key is an error, not a test that quietly runs as
+# something else. Nothing here skips on its own; the only skips are the ones
+# that need ss(8), and they say so.
+addopts = "--strict-markers --strict-config"

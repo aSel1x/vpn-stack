@@ -50,9 +50,21 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
 
 
 def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
-    # The public key is derived, never stored: the private key stays the single
-    # source of truth and no rotation is needed for share links to keep working.
-    pbk = derive_public_key(secrets.text("reality.key"))
+    # The public half is stored, so this seam never touches the private key.
+    # It used to be derived, which meant the pure seam CLAUDE.md advertises --
+    # a client app building its own share links, no server round-trip -- could
+    # only be handed the private X25519 key, and whoever holds that can stand
+    # up a server this one's clients cannot tell apart.
+    #
+    # The fallback is the compatibility path, and only that: a keyring
+    # bootstrapped before reality.pub existed has the private half and nothing
+    # else. Deliberately not in secret_names -- requiring it would make every
+    # such server fail to render instead of quietly carrying on.
+    pbk = (
+        secrets.text("reality.pub")
+        if secrets.has("reality.pub")
+        else derive_public_key(secrets.text("reality.key"))
+    )
     uri = (
         f"vless://{user.vless_uuid}@{host}:{PORT}"
         f"?encryption=none&flow=xtls-rprx-vision&security=reality"
@@ -64,8 +76,15 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
 
 
 def bootstrap() -> dict[str, bytes]:
+    # One keypair, both halves written together. Derived here rather than in
+    # share() so the two cannot disagree: they come out of the same call.
+    private = generate_private_key()
     return {
-        "reality.key": generate_private_key().encode(),
+        "reality.key": private.encode(),
+        # Not a secret -- every client carries it in its share link -- and it
+        # sits in the keyring beside its private half exactly like
+        # dnstt.server.pub, so the two cannot drift apart.
+        "reality.pub": derive_public_key(private).encode(),
         "reality.short_id": pysecrets.token_hex(8).encode(),
     }
 

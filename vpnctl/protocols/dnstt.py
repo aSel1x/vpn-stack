@@ -14,16 +14,39 @@ from __future__ import annotations
 
 import sys
 
+from vpnctl.paths import ENV_FILE
 from vpnctl.protocols import Kind, Port, Protocol, RenderError, ShareItem
 from vpnctl.secrets_store import Secrets
 from vpnctl.users_store import User
 
 NAME = "dnstt"
-# Delegated at the registrar: tun.example.net NS ns-tun.example.net, and
-# ns-tun.example.net A <this server>. compose.yml repeats these two literals
-# because a compose `command:` cannot read them from anywhere; this module is
-# the canonical copy.
-ZONE = "tun.example.net"
+
+# The delegated zone is deployment config and never a constant in git: it used
+# to be the author's own, hardcoded here and repeated verbatim in compose.yml,
+# so a stranger who cloned this repo and ran `protocol on dnstt` served the
+# *author's* zone and their clients resolved a domain somebody else controls.
+#
+# One operator-facing source of truth -- VPN_DNSTT_ZONE in .env, which compose
+# interpolates into the container's `command:`. Python reaches it the way
+# export.py reaches VPN_SERVER_HOST: the impure caller reads it and passes it
+# in. Here the caller is render.snapshot(), which folds it into the Secrets
+# snapshot under ZONE_KEY, so render() and share() stay pure functions of their
+# arguments and a GUI holding a snapshot builds share links with no server
+# round-trip. Held in a module global read at import instead, share() raised
+# for exactly the caller the purity rule exists for.
+#
+# The trade-off, stated: Secrets stops being only the keyring and becomes "the
+# immutable input the pure layer is given", and a caller that skips the edge
+# gets no zone. The alternative -- a fourth `settings` argument -- changes the
+# signature of all four protocols and every call site for a value only this one
+# has ever wanted.
+ZONE_VAR = "VPN_DNSTT_ZONE"
+ZONE_KEY = "dnstt.zone"
+NO_ZONE = (
+    f"dnstt has no zone. Set {ZONE_VAR}=<your delegated zone> in {ENV_FILE} "
+    "-- compose.yml reads the same variable -- and delegate that zone NS to "
+    "this host. See dnstt/SETUP.md."
+)
 IMAGE = "dnstt-server:latest"
 SOCKS_ADDR = "127.0.0.1:7300"
 # What the SSH front may forward to. The clients use SSH *dynamic* forwarding,
@@ -51,7 +74,27 @@ PERMIT_OPEN = ("any",)
 EXIT = "127.0.0.1:2222"
 
 
+def _zone(secrets: Secrets) -> str:
+    """The zone as the snapshot carries it. Absent and empty are the same thing."""
+    return secrets.text(ZONE_KEY) if secrets.has(ZONE_KEY) else ""
+
+
 def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
+    # Nothing rendered here carries the zone -- compose's `command:` does -- so
+    # a missing one is said out loud, not raised. Raising bricked the server:
+    # `protocol on dnstt` before the zone was set wrote dnstt into state.json
+    # and then apply, `user add`, `deploy` and the systemd boot unit all exited
+    # 1, with users.json already written and diverging from the served config.
+    # A warning does not brick a boot. The hard refusal belongs at `protocol
+    # on`, which is the last point that can still roll the toggle back.
+    if not _zone(secrets):
+        print(
+            f"warning: dnstt is enabled with no zone -- set {ZONE_VAR} in {ENV_FILE} "
+            "(compose.yml reads the same variable) and delegate that zone NS to "
+            "this host, or the tunnel answers for a zone nobody can reach",
+            file=sys.stderr,
+        )
+
     # One login per enabled user, so `user rm` and `user disable` actually cut
     # dnstt access. They did not before: everyone shared one account, so
     # removing somebody left their tunnel working with nothing to revoke.
@@ -95,7 +138,17 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
     layer treat them as one: a QR code nothing can read, a tappable link on
     the share page that imports nothing.
     """
-    pub = secrets.text("dnstt.server.pub") if secrets.has("dnstt.server.pub") else "<not generated>"
+    # Still a hard failure, unlike render(): the zone IS the connection
+    # parameter here, and a settings card naming a zone nobody delegated is an
+    # hour of somebody's debugging handed out as if it worked.
+    zone = _zone(secrets)
+    if not zone:
+        raise RenderError(NO_ZONE)
+    pub = (
+        secrets.text("dnstt.server.pub")
+        if secrets.has("dnstt.server.pub")
+        else "<not generated>"
+    )
     # Zone and pubkey are the transport and identical for everyone. The login
     # is this person's own, which is what makes revoking one of them possible.
     password = user.dnstt_password or "<none issued -- see dnstt/SETUP.md>"
@@ -105,7 +158,7 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
             filename=None,
             uri=None,
             fields=(
-                ("Nameserver / domain", ZONE),
+                ("Nameserver / domain", zone),
                 ("Public key", pub),
                 ("DNS resolver", "the blocked network's OWN resolver, :53, plain UDP"),
                 ("SSH username", user.name),
@@ -117,10 +170,14 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
             filename=None,
             uri=None,
             fields=(
-                ("1. open the tunnel",
-                 f"dnstt-client -udp <resolver>:53 -pubkey {pub} {ZONE} 127.0.0.1:7000"),
-                ("2. SOCKS through it",
-                 f"ssh -N -D 1080 -p 7000 {user.name}@127.0.0.1"),
+                (
+                    "1. open the tunnel",
+                    f"dnstt-client -udp <resolver>:53 -pubkey {pub} {zone} 127.0.0.1:7000",
+                ),
+                (
+                    "2. SOCKS through it",
+                    f"ssh -N -D 1080 -p 7000 {user.name}@127.0.0.1",
+                ),
                 ("then", "point the browser at socks5://127.0.0.1:1080"),
             ),
         ),
@@ -153,25 +210,33 @@ def prepare() -> dict[str, bytes]:
 
     build = subprocess.run(
         ["docker", "build", "-t", IMAGE, str(ROOT / "dnstt")],
-        capture_output=True, text=True, timeout=900,
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     if build.returncode != 0:
         raise RenderError(
-            "could not build the dnstt image:\n" + (build.stdout + build.stderr).strip()[-2000:]
+            "could not build the dnstt image:\n"
+            + (build.stdout + build.stderr).strip()[-2000:]
         )
 
     gen = subprocess.run(
         ["docker", "run", "--rm", IMAGE, "-gen-key"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     if gen.returncode != 0:
         raise RenderError(
-            "dnstt-server -gen-key failed:\n" + (gen.stdout + gen.stderr).strip()[-2000:]
+            "dnstt-server -gen-key failed:\n"
+            + (gen.stdout + gen.stderr).strip()[-2000:]
         )
 
     found = dict(re.findall(r"^(privkey|pubkey)\s+([0-9a-f]{64})$", gen.stdout, re.M))
     if {"privkey", "pubkey"} - found.keys():
-        raise RenderError(f"could not parse -gen-key output:\n{gen.stdout.strip()[:500]}")
+        raise RenderError(
+            f"could not parse -gen-key output:\n{gen.stdout.strip()[:500]}"
+        )
 
     return {
         # dnstt reads -privkey-file as hex text, which is what it printed.
@@ -198,7 +263,10 @@ PROTOCOL = Protocol(
     compose_services=("dnstt", "dnstt-sshd", "dnstt-socks"),
     per_user=True,
     notes=(
-        f"Needs a delegated zone ({ZONE}) pointing NS at this host, and "
-        "ufw allow 53/udp. See dnstt/SETUP.md."
+        # Names the variable, not the value: this string is built at import
+        # and `protocol list` is most often read on a box where the zone is
+        # not set yet, where the value is the one thing that says nothing.
+        f"Needs a delegated zone ({ZONE_VAR} in {ENV_FILE}) pointing NS at "
+        "this host, and ufw allow 53/udp. See dnstt/SETUP.md."
     ),
 )

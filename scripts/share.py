@@ -94,9 +94,9 @@ class Bundle:
 
     def __init__(self, payload: dict):
         self.user: str = payload.get("user", "user")
-        self.uris: list[tuple[str, str]] = []      # (label, uri)
+        self.uris: list[tuple[str, str]] = []  # (label, uri)
         self.files: dict[str, tuple[str, bytes]] = {}  # filename -> (label, bytes)
-        self.qr: dict[str, bytes] = {}             # label -> png
+        self.qr: dict[str, bytes] = {}  # label -> png
         # Settings typed into a form by hand. DNSTT-over-SSH has no import
         # format, so this is the only shape that is honest about it.
         self.forms: list[tuple[str, list[tuple[str, str]]]] = []
@@ -107,13 +107,18 @@ class Bundle:
                 if item.get("uri"):
                     self.uris.append((f"{proto} — {label}", item["uri"]))
                     if item.get("png_b64"):
-                        self.qr[f"{proto} — {label}"] = base64.b64decode(item["png_b64"])
+                        self.qr[f"{proto} — {label}"] = base64.b64decode(
+                            item["png_b64"]
+                        )
                 elif item.get("fields"):
                     self.forms.append(
                         (f"{proto} — {label}", [(k, v) for k, v in item["fields"]])
                     )
                 elif item.get("filename") and item.get("b64"):
-                    self.files[item["filename"]] = (label, base64.b64decode(item["b64"]))
+                    self.files[item["filename"]] = (
+                        label,
+                        base64.b64decode(item["b64"]),
+                    )
 
     def empty(self) -> bool:
         return not self.uris and not self.files and not self.forms
@@ -170,11 +175,12 @@ def render_page(bundle: Bundle, token: str) -> bytes:
     if bundle.forms:
         parts.append("<h2>Type these in by hand</h2>")
         for title, rows in bundle.forms:
-            parts.append(f"<h3 class=\"form\">{html.escape(title)}</h3><table class=\"form\">")
+            parts.append(
+                f'<h3 class="form">{html.escape(title)}</h3><table class="form">'
+            )
             for key, value in rows:
                 parts.append(
-                    f"<tr><th>{html.escape(key)}</th>"
-                    f"<td>{html.escape(value)}</td></tr>"
+                    f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
                 )
             parts.append("</table>")
     if bundle.files:
@@ -237,7 +243,10 @@ def serve(bundle: Bundle, bind: str, port: int) -> None:
                 return True
             if time.monotonic() - started > HARD_TIMEOUT:
                 state["dead"] = True
-            elif state["fetched_at"] and time.monotonic() - state["fetched_at"] > GRACE_AFTER_FETCH:
+            elif (
+                state["fetched_at"]
+                and time.monotonic() - state["fetched_at"] > GRACE_AFTER_FETCH
+            ):
                 state["dead"] = True
             return state["dead"]
 
@@ -247,7 +256,9 @@ def serve(bundle: Bundle, bind: str, port: int) -> None:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             if filename:
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header(
+                    "Content-Disposition", f'attachment; filename="{filename}"'
+                )
             self.end_headers()
             self.wfile.write(body)
 
@@ -263,11 +274,15 @@ def serve(bundle: Bundle, bind: str, port: int) -> None:
                 return
             prefix = f"{token}/"
             if path.startswith(prefix):
-                name = path[len(prefix):]
+                name = path[len(prefix) :]
                 if name in bundle.files:
                     _, blob = bundle.files[name]
-                    suffix = name[name.rfind("."):] if "." in name else ""
-                    self._send(blob, CONTENT_TYPES.get(suffix, "application/octet-stream"), name)
+                    suffix = name[name.rfind(".") :] if "." in name else ""
+                    self._send(
+                        blob,
+                        CONTENT_TYPES.get(suffix, "application/octet-stream"),
+                        name,
+                    )
                     return
             # Anything else, including a wrong token, is indistinguishable.
             self.send_error(404)
@@ -287,8 +302,10 @@ def serve(bundle: Bundle, bind: str, port: int) -> None:
     try:
         import qrcode
     except ImportError:
-        print("  (no QR: `qrcode` is not importable - run this through"
-              " `uv run --project <repo>`, or pip install qrcode)\n")
+        print(
+            "  (no QR: `qrcode` is not importable - run this through"
+            " `uv run --project <repo>`, or pip install qrcode)\n"
+        )
     else:
         qr = qrcode.QRCode(border=1)
         qr.add_data(url)
@@ -297,15 +314,20 @@ def serve(bundle: Bundle, bind: str, port: int) -> None:
 
     print(f"  Bound to {bind} (private address only).")
     print("  Plain HTTP: anyone already on this network could read it inside the")
-    print(f"  window. Dies {int(GRACE_AFTER_FETCH)}s after first open, or in "
-          f"{int(HARD_TIMEOUT / 60)} minutes. Ctrl-C to kill it now.\n")
+    print(
+        f"  window. Dies {int(GRACE_AFTER_FETCH)}s after first open, or in "
+        f"{int(HARD_TIMEOUT / 60)} minutes. Ctrl-C to kill it now.\n"
+    )
 
     def reaper() -> None:
         while not state["dead"]:
             time.sleep(1)
             if time.monotonic() - started > HARD_TIMEOUT:
                 state["dead"] = True
-            elif state["fetched_at"] and time.monotonic() - state["fetched_at"] > GRACE_AFTER_FETCH:
+            elif (
+                state["fetched_at"]
+                and time.monotonic() - state["fetched_at"] > GRACE_AFTER_FETCH
+            ):
                 state["dead"] = True
         server.shutdown()
 
@@ -324,12 +346,16 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="one-shot LAN credential handoff")
     parser.add_argument("--bind", help="private address to bind (default: auto-detect)")
-    parser.add_argument("--port", type=int, default=0, help="default: an ephemeral port")
+    parser.add_argument(
+        "--port", type=int, default=0, help="default: an ephemeral port"
+    )
     args = parser.parse_args()
 
     raw = sys.stdin.read().strip()
     if not raw:
-        raise SystemExit("nothing on stdin: pipe `vpn user export <name> --json` into this")
+        raise SystemExit(
+            "nothing on stdin: pipe `vpn user export <name> --json` into this"
+        )
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as e:

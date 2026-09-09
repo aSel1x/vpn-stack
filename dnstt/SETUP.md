@@ -14,7 +14,7 @@ The tunnel is Noise-encrypted and the client pins the server's public key — th
 ## Prerequisites
 
 - A VPS with a static public IP (`SERVER_IP`) and Docker.
-- A domain you control (`example.com`) — you'll delegate `tun.example.com` to the box.
+- A domain you control (`example.com`) — you'll delegate `tun.example.com` to the box. **Yours, not this repo's:** there is no default zone anywhere in the code, and there deliberately is not one, because a shipped default would have every deployment serving somebody else's domain.
 - `udp/53` free and world-reachable on the box (nothing else public may hold port 53).
 
 ---
@@ -29,6 +29,14 @@ tun.example.com.      NS   ns-tun.example.com.
 ```
 
 Verify once propagated: `dig +short NS tun.example.com` → `ns-tun.example.com`.
+
+Then tell the server which zone it owns. This is deployment config, not code — it lives in `/etc/vpn-stack/.env`, the file `docker compose` reads from the project directory (`./.env` is a symlink to it) and the same place `VPN_SERVER_HOST` lives:
+
+```bash
+echo 'VPN_DNSTT_ZONE=tun.example.com' >> /etc/vpn-stack/.env
+```
+
+One variable, read twice: compose interpolates it into the `dnstt` container's `command:`, and `vpnctl` reads it for the settings it hands to clients. Unset, `vpnctl apply` refuses to render dnstt and says so by name — it does not fall back to anything.
 
 ## 2. Generate the server keypair
 
@@ -67,7 +75,7 @@ ENTRYPOINT ["/usr/local/bin/dnstt-server"]
     command: >-
       -udp ${VPN_SERVER_HOST}:53
       -privkey-file /keys/server.key
-      tun.example.com 127.0.0.1:2222
+      ${VPN_DNSTT_ZONE} 127.0.0.1:2222
 ```
 
 > **#1 mistake:** bind `SERVER_IP:53`, **not** wildcard `:53`. `systemd-resolved` already owns `127.0.0.53:53`, so a wildcard bind dies with *"address already in use."* An explicit public IP sidesteps it.
@@ -242,6 +250,6 @@ grep tunuser /var/log/auth.log                 # Variant B: "session opened" = S
 
 *dnstt — Noise-encrypted DNS tunnel by David Fifield (www.bamsoftware.com/software/dnstt). Authorized use only: run against networks and infrastructure you own or are cleared to test.*
 
-*This deployment: zone `tun.example.net`, delegated as `tun.example.net NS ns-tun.example.net` with `ns-tun.example.net A 203.0.113.10`. Exit is Variant B: dnstt → **containerised** sshd on `127.0.0.1:2222` → microsocks `127.0.0.1:7300`.*
+*This stack's shape: zone from `VPN_DNSTT_ZONE` (yours, delegated as in § 1 — no zone is recorded here, because a zone written into the repo is one every clone would serve). Exit is Variant B: dnstt → **containerised** sshd on `127.0.0.1:2222` → microsocks `127.0.0.1:7300`.*
 
 *The pubkey is **not** written down here. It is generated per deployment by `vpnctl protocol on dnstt` and read back with `./vpn user export <name> --protocol dnstt`. An earlier one was recorded in this file and in `dnstt/keys/server.pub`, and both outlived the private half by a server rebuild — a pinned key that no longer exists is worse than no key at all.*

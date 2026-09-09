@@ -26,8 +26,8 @@ from vpnctl.users_store import User
 
 
 class Kind(Enum):
-    SINGBOX = "singbox"   # an inbound merged into the sing-box config tree
-    COMPOSE = "compose"   # its own container, toggled by compose profile
+    SINGBOX = "singbox"  # an inbound merged into the sing-box config tree
+    COMPOSE = "compose"  # its own container, toggled by compose profile
 
 
 @dataclass(frozen=True)
@@ -53,9 +53,9 @@ class ShareItem:
     scan, a tappable link that imports nothing.
     """
 
-    label: str            # human name, e.g. "iOS/macOS"
+    label: str  # human name, e.g. "iOS/macOS"
     filename: str | None  # set for files, None otherwise
-    uri: str | None       # set for URIs, None otherwise
+    uri: str | None  # set for URIs, None otherwise
     content: bytes | None = None
     fields: tuple[tuple[str, str], ...] = ()  # (setting, value), in order
 

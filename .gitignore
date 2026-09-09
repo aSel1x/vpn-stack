@@ -13,6 +13,17 @@ sing-box/hysteria2/
 dnstt/keys/*
 scripts/.deploy_key*
 
+# Backups and issued client bundles. `./vpn backup` writes a tar of the WHOLE
+# state directory plus the IKEv2 volume — every secret, every user's password,
+# and the CA private key — under one passphrase. One landed in a commit once;
+# filename-exact rules would not have caught it, so these are extension-wide.
+# Write backups outside the checkout (see README): the tree is rsynced to live
+# servers, and this file is what decides what goes.
+*.age
+*.p12
+*.mobileconfig
+*.sswan
+
 # --- runtime state ---
 data/
 state.json
@@ -26,3 +37,6 @@ __pycache__/
 *.egg-info/
 
 .vpn-host
+
+# Local working notes; not part of what ships.
+notes/

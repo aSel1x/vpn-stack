@@ -135,6 +135,18 @@ echo "-- state directory"
 install -d -m 700 /etc/vpn-stack /etc/vpn-stack/secrets /etc/vpn-stack/data
 grep -q '^VPN_SERVER_HOST=' /etc/vpn-stack/.env 2>/dev/null \
   || echo "VPN_SERVER_HOST=$HOST" >> /etc/vpn-stack/.env
+# dnstt's zone belongs to whoever runs this box, so it is deployment config
+# here rather than a literal in git -- a shipped default would have every
+# install serving somebody else's domain. Left commented: this script cannot
+# know the zone, but the variable name belongs in the file it has to be set
+# in, not only in dnstt/SETUP.md. No trailing comment on the value line --
+# vpnctl's .env reader does not strip one, so uncommenting would set the zone
+# to the comment.
+grep -q 'VPN_DNSTT_ZONE' /etc/vpn-stack/.env 2>/dev/null || cat >> /etc/vpn-stack/.env <<'ENV'
+# dnstt only, and there is no default. Set YOUR delegated zone here before
+# `vpn protocol on dnstt`; see dnstt/SETUP.md.
+#VPN_DNSTT_ZONE=tun.example.com
+ENV
 chmod 600 /etc/vpn-stack/.env
 
 # Said out loud because one of these is a loosening, not a hardening:
@@ -192,15 +204,21 @@ set -euo pipefail
 REPO_PATH="$1"
 cd "$REPO_PATH"
 ln -sfn /etc/vpn-stack/.env "$REPO_PATH/.env"
-uv sync --frozen
+# --no-dev: uv syncs the `dev` group by DEFAULT, and a fresh VPN server has no
+# business carrying pytest and its transitive deps.
+uv sync --frozen --no-dev
 
 # The shim prepends uv's own directory rather than trusting the caller's PATH:
 # systemd and non-interactive ssh both invoke this with a minimal environment.
+# --no-dev again, not just on the sync above: `uv run` re-syncs the environment
+# on every invocation and includes the dev group by default, so the very first
+# `vpnctl` call -- the one on the next line, or the one systemd runs at boot --
+# would put pytest straight back and undo it.
 cat > /usr/local/bin/vpnctl <<SHIM
 #!/bin/sh
 PATH="/usr/local/bin:/root/.local/bin:\$PATH"
 export PATH
-cd "$REPO_PATH" && exec uv run vpnctl "\$@"
+cd "$REPO_PATH" && exec uv run --no-dev vpnctl "\$@"
 SHIM
 chmod 755 /usr/local/bin/vpnctl
 vpnctl --help >/dev/null

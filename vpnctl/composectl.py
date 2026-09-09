@@ -1,21 +1,72 @@
 """Bring the enabled set of containers up, and the disabled set down.
 
-The subtle part is teardown. Verified on Docker Compose v5.3.1: removing a
-service's profile from COMPOSE_PROFILES and running `up -d --remove-orphans`
-leaves that container RUNNING. Explicit `rm -sf <service>` does stop it, because
-Compose auto-enables a named service's own profile. Relying on --remove-orphans
-here would mean "protocol off" quietly leaves the protocol serving traffic.
+Two subtleties, both measured rather than assumed, on Compose v5.3.1.
+
+Teardown: removing a service's profile from COMPOSE_PROFILES and running
+`up -d --remove-orphans` leaves that container RUNNING. Explicit `rm -sf
+<service>` does stop it, because Compose auto-enables a named service's own
+profile. Relying on --remove-orphans here would mean "protocol off" quietly
+leaves the protocol serving traffic.
+
+Pickup: `up -d` recreates a container whose *definition* changed, and an
+env_file is part of the definition -- Compose reads its contents at project
+load and folds them into `environment` before hashing it. It is blind to the
+rendered tree, though: the bind mount source is the same string either side of
+a `rendered` symlink swap, so the hash is unchanged and the container keeps the
+directory it resolved when it started. That blindness is why this used to pass
+--force-recreate unconditionally, and why dropping the flag without replacing
+it would leave `user add` rendering a config that nothing ever reads.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 from vpnctl import protocols
 from vpnctl.paths import ROOT, STATE_DIR
+
+# Which service consumes each rendered path, and how it reaches the process.
+#
+#   MOUNT     bind-mounted, and the container derives nothing from it that
+#             outlives a restart. Docker re-resolves the mount source every time
+#             the container starts, so `restart` lands it on the new tree --
+#             verified by swapping the symlink under a running container: the old
+#             contents survive an `up -d`, the new ones appear after a restart.
+#   RECREATE  a restart is not enough; only a new container is. Two reasons, and
+#             both are here: an env_file is read once at create time, so a
+#             restart re-runs the entrypoint with the OLD environment; and a
+#             container that builds state from its input at create time keeps
+#             that state across a restart, because the writable layer survives.
+#             dnstt-sshd is the second kind and the reason this distinction is
+#             not cosmetic -- see its entry below.
+#
+# Written out by hand because `docker compose config` can only answer half of
+# it: the volumes are in there, the env_file provenance is not (it becomes
+# `environment` and the path is forgotten). Nor is the name a rule -- dnstt.env
+# is dnstt-sshd's file, not dnstt's.
+MOUNT = "mount"
+RECREATE = "recreate"
+
+_CONSUMERS: tuple[tuple[str, str, str], ...] = (
+    ("sing-box/", "sing-box", MOUNT),
+    ("dnstt/", "dnstt", MOUNT),
+    # RECREATE, not MOUNT, even though the logins file is a plain bind mount.
+    # dnstt-sshd/entrypoint.sh:36 is `id "$name" || adduser` -- it only ever
+    # ADDS. Nothing deletes an account that dropped out of the list, and the
+    # entrypoint says so itself: the container is disposable and /etc/passwd
+    # resets with it. Restart it instead and the writable layer survives, so a
+    # removed user keeps their account, their group and their hash, and
+    # AllowGroups tunnel still lets them in. `user rm` would report success and
+    # revoke nothing -- which is the whole reason dnstt has a login per person.
+    ("dnstt-sshd/", "dnstt-sshd", RECREATE),
+    ("dnstt.env", "dnstt-sshd", RECREATE),
+    ("ikev2.env", "ikev2", RECREATE),
+)
 
 
 def _env() -> dict[str, str]:
@@ -42,19 +93,108 @@ def _compose(*args: str, profiles: list[str] | None = None) -> tuple[bool, str]:
     return result.returncode == 0, (result.stdout + result.stderr).strip()
 
 
-def up(enabled: list[protocols.Protocol], recreate: bool = True) -> tuple[bool, str]:
-    """Start sing-box plus every enabled container-level protocol."""
+def changed_services(previous: Path | None, candidate: Path) -> dict[str, str] | None:
+    """Which services' inputs differ between the live tree and the candidate.
+
+    `{}` means nothing changed and nothing has to be bounced -- the case that
+    matters, because it covers every `deploy`, every boot and every `protocol
+    on` for a protocol whose siblings were left alone. `None` means "could not
+    tell" (no live tree yet, or a rendered file this table does not know), and
+    the caller falls back to recreating everything.
+    """
+    if previous is None or not previous.is_dir():
+        return None
+
+    changed: dict[str, str] = {}
+    for rel in _tree_files(previous) | _tree_files(candidate):
+        old, new = previous / rel, candidate / rel
+        if old.is_file() and new.is_file() and old.read_bytes() == new.read_bytes():
+            continue
+        consumer = _consumer(rel)
+        if consumer is None:
+            # A protocol grew an output and this table did not hear about it.
+            # Bouncing everything is the old behaviour: slow, never stale.
+            return None
+        service, how = consumer
+        # A service that also needs new environment needs a new container, so
+        # RECREATE wins over MOUNT when both of its inputs moved.
+        if changed.get(service) != RECREATE:
+            changed[service] = how
+    return changed
+
+
+def _tree_files(root: Path) -> set[str]:
+    return {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
+
+
+def _consumer(rel: str) -> tuple[str, str] | None:
+    for prefix, service, how in _CONSUMERS:
+        if rel == prefix or (prefix.endswith("/") and rel.startswith(prefix)):
+            return service, how
+    return None
+
+
+def up(
+    enabled: list[protocols.Protocol], changed: dict[str, str] | None = None
+) -> tuple[bool, str]:
+    """Start sing-box plus every enabled container-level protocol.
+
+    `changed` is what `changed_services` found. Only those services get
+    bounced, so a `user add` no longer tears down the containers it did not
+    touch -- dnstt keeps its tunnel up while sing-box and the sshd take the new
+    user list, and an `apply` that changed nothing (deploy, boot) drops no
+    session at all. `None` means the diff could not be taken; then every
+    service is recreated, which is what this function always used to do.
+    """
     profiles = [p.compose_profile for p in enabled if p.compose_profile]
     services = ["sing-box"]
     for proto in enabled:
         services.extend(proto.compose_services)
+
+    before = _container_ids()
     # --build, or a change to a Dockerfile or an entrypoint script is rsynced
     # to the server and then silently ignored: compose reuses the existing
     # image because the tag already exists. Cheap when nothing changed.
-    args = ["up", "-d", "--no-deps", "--build"]
-    if recreate:
-        args.append("--force-recreate")
-    return _compose(*args, *services, profiles=profiles)
+    ok, output = _compose(
+        "up", "-d", "--no-deps", "--build", *services, profiles=profiles
+    )
+    if not ok:
+        return ok, output
+
+    # Everything compose noticed for itself -- a new image, a changed
+    # definition, a changed env_file -- it has already recreated, and a
+    # container it just created is running the new tree by construction. So
+    # compare identities and nudge only what is left: the same container, still
+    # holding the directory the old symlink pointed at. Identity, not liveness:
+    # a container that was merely stopped keeps its id across `up -d`, and
+    # reading that as "freshly created" is what left a removed dnstt login
+    # working. See _container_ids.
+    after = _container_ids()
+    # An undiffable tree gets the strongest nudge on everything, which is what
+    # this function used to do unconditionally.
+    pending = changed if changed is not None else {s: RECREATE for s in services}
+    notes = [output]
+    for service, how in sorted(pending.items()):
+        if service not in services:
+            continue  # protocol was turned off; down_disabled deals with it
+        if (
+            before is not None
+            and after is not None
+            and (service not in before or before[service] != after.get(service))
+        ):
+            continue  # compose just gave it a fresh container; already current
+        if how == RECREATE:
+            ok, out = _compose(
+                "up", "-d", "--no-deps", "--force-recreate", service, profiles=profiles
+            )
+        else:
+            ok, out = _compose("restart", service, profiles=profiles)
+        notes.append(
+            f"{service}: {'recreated' if how == RECREATE else 'restarted'}\n{out}".strip()
+        )
+        if not ok:
+            return False, "\n".join(notes)
+    return True, "\n".join(n for n in notes if n)
 
 
 def down_disabled(enabled: list[protocols.Protocol]) -> tuple[bool, str]:
@@ -98,7 +238,48 @@ def _running_services() -> set[str] | None:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def wait_ready(enabled: list[protocols.Protocol], timeout: float = 240.0) -> tuple[bool, list[str]]:
+def _container_ids() -> dict[str, str] | None:
+    """service -> container id, for every container that EXISTS, running or not.
+
+    The id is the whole point: it is how `up` tells "compose recreated this for
+    me" from "this is the same container it was a second ago". None means the
+    query failed, and the caller then bounces the changed services anyway -- a
+    needless restart is recoverable, a config nothing has read is not.
+
+    `--all`, and not `--status running`, because the difference is a credential
+    left working. A stopped container is absent from a running-only listing, so
+    `up` read "service not in before" as "compose created this one just now,
+    it already holds the new tree" and skipped the nudge. But `up -d` does not
+    create a stopped container, it STARTS it: same id, same writable layer. So a
+    `user rm` while dnstt-sshd happened to be down left the removed account in
+    /etc/passwd -- proven with a real password login -- and `user rm` reported
+    success. Ask for every container and the test means what it says.
+    """
+    result = subprocess.run(
+        ["docker", "compose", "ps", "--all", "--format", "json"],
+        cwd=ROOT,
+        env=_env(),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    payload = result.stdout.strip()
+    try:
+        # v5.3.1 emits one object per line; other versions emit a single array.
+        rows = (
+            json.loads(payload)
+            if payload.startswith("[")
+            else [json.loads(line) for line in payload.splitlines() if line.strip()]
+        )
+        return {row["Service"]: row["ID"] for row in rows}
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def wait_ready(
+    enabled: list[protocols.Protocol], timeout: float = 240.0
+) -> tuple[bool, list[str]]:
     """Block until every enabled protocol's ports are bound, or time out.
 
     `docker compose up` returns as soon as the container starts, but
@@ -120,7 +301,9 @@ def wait_ready(enabled: list[protocols.Protocol], timeout: float = 240.0) -> tup
         if pending:
             time.sleep(2)
     if pending:
-        return False, [f"{n}/{pr} still not bound after {timeout:.0f}s" for n, pr in pending]
+        return False, [
+            f"{n}/{pr} still not bound after {timeout:.0f}s" for n, pr in pending
+        ]
     return True, [f"all {len(wanted)} port(s) bound"]
 
 
@@ -134,7 +317,8 @@ def _is_bound(port: int, proto: str) -> bool:
     """
     result = subprocess.run(
         ["ss", "-H", "-ln", "-t" if proto == "tcp" else "-u", f"sport = :{port}"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         # Fall back to trying to bind it ourselves: if we can, nothing else has

@@ -51,9 +51,12 @@ services:
   # compose under network_mode: host (no separate netns), so they live on the
   # host -- see scripts/install.sh.
   #
-  # Diagnosed 2026-09-05: the server side of IKEv2 is correct end to end and
-  # no client IKE has ever reached it; the drop is on the client's network.
-  # See scripts/diagnose-ikev2.sh before spending time here.
+  # Diagnosed 2026-09-08: the server side of IKEv2 is correct end to end and
+  # no client IKE has ever reached it. A DPI box inside the client's ISP drops
+  # UDP whose payload parses as an ISAKMP header, toward foreign destinations
+  # only. Nothing here can change that, and moving IKE to another UDP port does
+  # not help -- the filter ignores the port. See CLAUDE.md, "IKEv2 client
+  # connectivity", and scripts/diagnose-ikev2.sh before spending time here.
   ikev2:
     # Pinned by digest. ikev2ctl.py hard-codes this image's CLI contract --
     # --addclient / --deleteclient / --revokeclient / --exportclient, and the
@@ -96,10 +99,17 @@ services:
     profiles: ["dnstt"]
     volumes:
       - ${VPN_STATE:-/etc/vpn-stack}/rendered/dnstt:/keys:ro
+    # The zone is the operator's own -- deployment config in .env, not a
+    # literal in git, or every clone of this repo would serve the author's
+    # zone. Interpolated plainly and NOT as ${VPN_DNSTT_ZONE:?...}: measured on
+    # v5.3.1, `:?` on an unset variable fails project load, so `config`, `ps`
+    # and even `up sing-box` all die while dnstt is merely switched off -- the
+    # same trap that put `required: false` on ikev2.env above. The loud failure
+    # lives in vpnctl/protocols/dnstt.py, which refuses to render without it.
     command: >-
       -udp ${VPN_SERVER_HOST}:53
       -privkey-file /keys/server.key
-      tun.example.net 127.0.0.1:2222
+      ${VPN_DNSTT_ZONE} 127.0.0.1:2222
 
   # The SSH front the mobile clients log into. In a container, not on the host:
   # iOS apps speak DNSTT -> SSH and need a login, and putting that login on the

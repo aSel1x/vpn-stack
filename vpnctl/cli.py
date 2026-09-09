@@ -64,7 +64,11 @@ def emit(ok: bool = True, **data) -> None:
 
 def die(message: str, **data) -> None:
     if _JSON:
-        print(json.dumps({"schema": SCHEMA, "ok": False, "error": message, **data}, indent=2))
+        print(
+            json.dumps(
+                {"schema": SCHEMA, "ok": False, "error": message, **data}, indent=2
+            )
+        )
     else:
         warn(message)
     raise SystemExit(1)
@@ -138,22 +142,65 @@ def apply(restart: bool = True, quiet: bool = False) -> dict:
         shutil.rmtree(candidate, ignore_errors=True)
         die(f"sing-box rejected the new config; nothing changed.\n{output}")
 
+    # Read before the swap: afterwards `rendered` points at the candidate and
+    # there is nothing left to compare it against. This is what decides which
+    # containers get bounced -- a `user add` used to recreate every one of them,
+    # including the protocols whose rendered output was byte-identical.
+    previous = RENDERED_LINK.resolve() if RENDERED_LINK.exists() else None
     render.promote(candidate)
+    changed = composectl.changed_services(previous, candidate)
+
+    # A tree promoted by an earlier --no-restart is live on disk and in nothing
+    # else: the containers still run the tree from before it. The diff cannot
+    # see that -- it compares two directories, never a directory against a
+    # running container -- so `bootstrap --force` (which promotes without
+    # restarting, on purpose) followed by a plain `apply` found the two trees
+    # identical, bounced nothing, and left sing-box serving the OLD REALITY key
+    # and the OLD Hysteria2 certificate for good, every port bound and smoke
+    # green, while every re-exported profile failed.
+    #
+    # state.converge_pending carries that fact forward; see its comment in
+    # state.py for why it is its own field and not an empty last_applied.
+    st = state.load()
+    if st.converge_pending:
+        changed = None
+
     result = {
         "rendered": candidate.name,
         "enabled_protocols": [p.name for p in enabled],
         "restarted": restart,
+        "config_changed": None if changed is None else sorted(changed),
+        "converge_pending": not restart or st.converge_pending,
     }
     if not quiet:
-        say(f"rendered {candidate.name}: {', '.join(p.name for p in enabled) or 'nothing'}")
+        say(
+            f"rendered {candidate.name}: {', '.join(p.name for p in enabled) or 'nothing'}"
+        )
 
     if not restart:
-        say("note: NOT applied (--no-restart). Containers still run the previous config.")
+        st.converge_pending = True
+        state.save(st)
+        say(
+            "note: NOT applied (--no-restart). Containers still run the previous config,\n"
+            "      so a convergence is now PENDING: the next `vpnctl apply` recreates\n"
+            "      every service, whether or not the rendered tree changes again."
+        )
         return result
 
-    ok, output = composectl.up(enabled)
+    ok, output = composectl.up(enabled, changed)
     if not ok:
-        die(f"docker compose up failed:\n{output}")
+        die(f"could not converge the containers:\n{output}")
+    if not quiet:
+        say(
+            "  "
+            + (
+                "no live config to compare against; converged everything"
+                if changed is None
+                else f"config changed: {', '.join(sorted(changed))}"
+                if changed
+                else "config unchanged; nothing restarted"
+            )
+        )
     ok, output = composectl.down_disabled(enabled)
     if not ok:
         warn(f"warning: could not tear down disabled services:\n{output}")
@@ -183,6 +230,7 @@ def apply(restart: bool = True, quiet: bool = False) -> dict:
 
     st = state.load()
     st.last_applied = [p.name for p in enabled]
+    st.converge_pending = False
     state.save(st)
     render.prune()
     return result
@@ -218,7 +266,11 @@ def reconcile_ikev2() -> dict:
     if ok:
         for line in listing.splitlines():
             parts = line.split()
-            if len(parts) >= 2 and parts[1] in ("valid", "revoked") and parts[0] != "Client":
+            if (
+                len(parts) >= 2
+                and parts[1] in ("valid", "revoked")
+                and parts[0] != "Client"
+            ):
                 present.add(parts[0])
 
     added, removed, failed = [], [], []
@@ -259,6 +311,11 @@ def cmd_bootstrap(args) -> None:
         say("existing users found -- re-rendering them into the new keyring")
         apply(restart=False, quiet=True)
         say("credentials are NEW: re-export every profile for every user.")
+        say(
+            "nothing was restarted, so run `vpnctl apply` BEFORE exporting anything: "
+            "until it converges, the containers still serve the old keys and every "
+            "freshly exported profile fails to connect."
+        )
     emit(ok=True, message=message)
 
 
@@ -328,6 +385,17 @@ def _set_protocol(name: str, on: bool) -> None:
         emit(ok=True, changed=False)
         return
 
+    # Before state.json is written and before _prepare_secrets pays for an
+    # ~800 MB image build. `protocol on dnstt` with no zone used to save the
+    # toggle first: the operator then had dnstt enabled, a tunnel answering for
+    # an empty zone, and nothing naming the variable that was missing. Same
+    # footing as _prepare_secrets' rollback, one step earlier -- nothing
+    # written is nothing to roll back.
+    if on:
+        gap = render.missing_deployment_config(proto)
+        if gap:
+            die(gap)
+
     st.enabled = (
         sorted(set(st.enabled) | {proto.name})
         if on
@@ -336,7 +404,9 @@ def _set_protocol(name: str, on: bool) -> None:
     state.save(st)
     say(f"{'enabled' if on else 'disabled'} {proto.name}")
     if not on:
-        say("  secrets are kept, so turning it back on restores every existing profile.")
+        say(
+            "  secrets are kept, so turning it back on restores every existing profile."
+        )
 
     if on:
         _prepare_secrets(proto, st)
@@ -464,13 +534,19 @@ def cmd_user_export(args) -> None:
     except ExportError as e:
         die(str(e))
 
+    # The keyring plus the deployment config share() is a pure function of.
+    # Built once, at the edge: reading it inside a protocol module is what made
+    # share() unusable to any caller that is not this process.
+    keyring = render.snapshot()
     payload: dict[str, list[dict]] = {}
     failures: list[str] = []
     for name in names:
         proto = protocols.get(name)
         if proto.share_via_container:
             if not user.ikev2_provisioned:
-                warn(f"[{name}] no certificate provisioned for {user.name!r}; skipping.")
+                warn(
+                    f"[{name}] no certificate provisioned for {user.name!r}; skipping."
+                )
                 continue
             ok, message, bundles = ikev2ctl.export_client(user.name)
             say(f"\n[{name}]\n{message}")
@@ -486,7 +562,7 @@ def cmd_user_export(args) -> None:
             ]
             continue
 
-        items = proto.share(secrets_store.load(), user, host)
+        items = proto.share(keyring, user, host)
         payload[name] = []
         for item in items:
             say(f"\n[{name}] {item.label}")
@@ -495,7 +571,11 @@ def cmd_user_export(args) -> None:
                 if args.qr and not _JSON:
                     export.print_ascii_qr(item.uri)
                 payload[name].append(
-                    {"label": item.label, "uri": item.uri, "png_b64": _b64(export.png_bytes(item.uri))}
+                    {
+                        "label": item.label,
+                        "uri": item.uri,
+                        "png_b64": _b64(export.png_bytes(item.uri)),
+                    }
                 )
             elif item.fields:
                 # Settings for a form. No QR: there is nothing to scan them
@@ -507,8 +587,7 @@ def cmd_user_export(args) -> None:
                 payload[name].append(
                     {"label": item.label, "fields": [list(f) for f in item.fields]}
                 )
-    emit(ok=not failures, user=user.name, host=host,
-         protocols=payload, failed=failures)
+    emit(ok=not failures, user=user.name, host=host, protocols=payload, failed=failures)
 
 
 def _b64(blob: bytes) -> str:
@@ -572,10 +651,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    c = sub.add_parser("status", help="what this server is currently running", parents=[common])
+    c = sub.add_parser(
+        "status", help="what this server is currently running", parents=[common]
+    )
     c.set_defaults(func=cmd_status)
 
-    c = sub.add_parser("bootstrap", help="generate any missing secrets", parents=[common])
+    c = sub.add_parser(
+        "bootstrap", help="generate any missing secrets", parents=[common]
+    )
     c.add_argument(
         "--force",
         action="store_true",
@@ -583,10 +666,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     c.set_defaults(func=cmd_bootstrap)
 
-    c = sub.add_parser("apply", help="render, validate and converge the server", parents=[common])
+    c = sub.add_parser(
+        "apply", help="render, validate and converge the server", parents=[common]
+    )
     c.add_argument("--no-restart", action="store_true", help="render and validate only")
     c.set_defaults(func=cmd_apply)
-
 
     pr = sub.add_parser("protocol", help="turn protocols on and off", parents=[common])
     pr_sub = pr.add_subparsers(dest="protocol_command", required=True)
@@ -613,7 +697,9 @@ def build_parser() -> argparse.ArgumentParser:
     c = u_sub.add_parser("list", parents=[common])
     c.add_argument("--show-secrets", action="store_true")
     c.set_defaults(func=cmd_user_list)
-    c = u_sub.add_parser("export", help="share links and client bundles", parents=[common])
+    c = u_sub.add_parser(
+        "export", help="share links and client bundles", parents=[common]
+    )
     c.add_argument("name")
     c.add_argument("--protocol", default="all")
     c.add_argument("--host")
@@ -624,7 +710,9 @@ def build_parser() -> argparse.ArgumentParser:
     ik_sub = ik.add_subparsers(dest="ikev2_command", required=True)
     c = ik_sub.add_parser("list-clients", parents=[common])
     c.set_defaults(func=cmd_ikev2_list)
-    c = ik_sub.add_parser("reconcile", help="make certificates match the enabled users", parents=[common])
+    c = ik_sub.add_parser(
+        "reconcile", help="make certificates match the enabled users", parents=[common]
+    )
     c.set_defaults(func=cmd_ikev2_reconcile)
 
     return p

@@ -44,7 +44,9 @@ def desired(enabled: list[protocols.Protocol]) -> dict[str, str]:
     return {str(port): proto.name for proto in enabled for port in proto.ports}
 
 
-def reconcile(enabled: list[protocols.Protocol], dry_run: bool = False) -> tuple[bool, list[str]]:
+def reconcile(
+    enabled: list[protocols.Protocol], dry_run: bool = False
+) -> tuple[bool, list[str]]:
     if not available():
         return True, ["ufw not installed, skipping firewall reconciliation"]
 

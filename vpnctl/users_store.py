@@ -165,4 +165,3 @@ def new_user(name: str) -> User:
         created_at=_now(),
         dnstt_password=new_dnstt_password(),
     )
-

@@ -26,6 +26,16 @@ class State:
     # What `apply` last actually brought up, so it can diff and explicitly tear
     # down what is no longer enabled -- `--remove-orphans` does not do this.
     last_applied: list[str] = field(default_factory=list)
+    # A tree was promoted to disk without bouncing anything (`apply
+    # --no-restart`, or `bootstrap --force`), so the containers are still
+    # running the previous config and no directory diff can tell: the diff
+    # compares two trees, never a tree against a container. Same shape as
+    # revoke_pending -- an intent that must outlive the command that formed it,
+    # survive a reboot into the boot unit's own apply, and be cleared only by a
+    # converge that succeeded. A separate field rather than `not last_applied`,
+    # which is also empty when every protocol is disabled and left that server
+    # force-recreating on every apply, for ever.
+    converge_pending: bool = False
 
 
 def default() -> State:
@@ -40,6 +50,7 @@ def load() -> State:
         enabled=data.get("enabled", []),
         revoke_pending=data.get("revoke_pending", []),
         last_applied=data.get("last_applied", []),
+        converge_pending=data.get("converge_pending", False),
     )
 
 

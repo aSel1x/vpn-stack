@@ -1,0 +1,103 @@
+# CI that checks the code and CANNOT touch a server.
+#
+# There is no deploy step here, and adding one would be a regression, not a
+# feature. The previous pipeline (.github/workflows/deploy.yml, deleted in
+# 61457b7 "Drop CI: deploy-on-push cost more than it bought") ran
+# scripts/deploy.sh on every push to main. That is how /opt/vpn-stack
+# reappeared on a box that had just been deliberately wiped -- CI acting on
+# production because someone committed, not because anyone asked it to. It cost
+# a standing key with root on the VPN server, held by GitHub, and its
+# `ssh-keyscan` accepted whatever host key the server presented. Deploying is
+# `./vpn deploy` from a checkout, one deliberate command, and stays that way.
+#
+# So, deliberately: no `secrets:`, no `environment:`, no ssh, no rsync, no
+# `deploy`, no network target of any kind. `permissions: contents: read` is
+# stated rather than inherited, because the repo default is settable elsewhere
+# and a workflow that reads its scope out of a settings page does not document
+# itself. If you find yourself adding a secret to this file, the thing you want
+# is a laptop, not a runner.
+#
+# One loose end this file cannot close: DEPLOY_HOST and DEPLOY_SSH_KEY outlived
+# the workflow that used them by months, sitting in the repo's Actions secrets
+# with nothing referencing them. Delete them there; a workflow cannot.
+
+name: ci
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned for the same reason the images in compose.yml are: unpinned, a ruff
+  # release turns a green tree red with no commit in between. Exactly, not
+  # `0.14.*` -- `ruff format` is a *style* tool, its output is only stable for
+  # one build of it, and a wildcard hands the next patch release a veto over
+  # every branch at once. This is the version the tree was formatted with; to
+  # bump it, bump it here and run `uvx --from "ruff==<new>" ruff format .` in
+  # the same commit, or CI goes red on a tree nobody touched.
+  RUFF: "ruff==0.14.14"
+
+jobs:
+  python:
+    name: lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: uv sync --frozen
+        run: uv sync --frozen
+
+      # ruff is not in pyproject.toml and this workflow is not the place to put
+      # it there -- uvx runs it out-of-tree, on its defaults.
+      - name: ruff check
+        run: uvx --from "$RUFF" ruff check .
+
+      - name: ruff format --check
+        run: uvx --from "$RUFF" ruff format --check .
+
+      # pytest is not a project dependency either, so `uv run pytest` alone
+      # would die on "command not found"; --with layers it over the synced env
+      # without touching the lockfile. Note that pytest exits 5 when it collects
+      # nothing, and that stays a failure on purpose: a green check that ran no
+      # tests is the exact shape of the wrong-subnet health checks this repo has
+      # already been bitten by.
+      - name: pytest
+        run: uv run --frozen --with pytest pytest -q
+
+  shell:
+    name: bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Half this repo is bash and none of it is exercised until a server runs
+      # it, at which point install.sh is a third of the way through a firewall
+      # change. `bash -n` is the cheapest check that would have caught an
+      # unterminated quote before that. Files are found by shebang rather than
+      # by a list, because a list goes stale silently -- this way a new script
+      # is covered the day it lands. (`bash -n` on a #!/bin/sh script parses a
+      # superset: it catches syntax, not bashisms.)
+      - name: bash -n every shell script
+        run: |
+          rc=0
+          n=0
+          while IFS= read -r f; do
+            head -n1 -- "$f" | grep -qE '^#!.*\b(ba)?sh$' || continue
+            n=$((n + 1))
+            bash -n -- "$f" || rc=1
+          done < <(git ls-files)
+          echo "checked $n script(s)"
+          [ "$n" -gt 0 ] || { echo "no shell scripts matched -- the finder is broken, not the tree" >&2; exit 1; }
+          exit $rc

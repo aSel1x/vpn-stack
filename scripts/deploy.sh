@@ -49,7 +49,11 @@ set -euo pipefail
 REPO_PATH="$1"
 export PATH="/usr/local/bin:/root/.local/bin:$PATH"
 cd "$REPO_PATH"
-uv sync --frozen
+# --no-dev: uv syncs the `dev` group by DEFAULT, so a plain `uv sync` installs
+# pytest and its transitive deps onto the VPN server. The server runs vpnctl;
+# it has no business carrying a test runner. Sync makes the environment match,
+# so this also removes one a previous deploy left behind.
+uv sync --frozen --no-dev
 vpnctl apply
 REMOTE
 

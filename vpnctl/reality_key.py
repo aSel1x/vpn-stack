@@ -34,5 +34,7 @@ def derive_public_key(private_key_b64: str) -> str:
 def generate_private_key() -> str:
     """Generate a fresh REALITY (X25519) private key, sing-box's own encoding."""
     private_key = X25519PrivateKey.generate()
-    raw_private = private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    raw_private = private_key.private_bytes(
+        Encoding.Raw, PrivateFormat.Raw, NoEncryption()
+    )
     return _b64url_encode(raw_private)

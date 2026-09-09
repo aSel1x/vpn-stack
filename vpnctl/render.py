@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vpnctl import protocols, secrets_store, state, users_store
-from vpnctl.paths import RENDERED_LINK, SING_BOX_COMMON, STATE_DIR
+from vpnctl.dotenv import read as read_env
+from vpnctl.paths import ENV_FILE, RENDERED_LINK, SING_BOX_COMMON, STATE_DIR
+from vpnctl.protocols import dnstt
 
 KEEP_GENERATIONS = 5
 
@@ -95,9 +97,58 @@ def prune(keep: int = KEEP_GENERATIONS) -> list[Path]:
     return removed
 
 
+def dnstt_zone() -> str:
+    """dnstt's delegated zone, read here because the registry may not read it.
+
+    os.environ first, then .env: that is compose's own precedence -- a shell
+    variable beats the file -- and reading only the file would let an exported
+    value move the container's zone while Python went on handing out the other.
+    Nothing sources .env into this process (the vpnctl shim does not, and
+    `uv run` only does when told to), so os.environ alone would be empty on the
+    server.
+    """
+    return os.environ.get(dnstt.ZONE_VAR) or read_env(ENV_FILE).get(dnstt.ZONE_VAR, "")
+
+
+def snapshot() -> secrets_store.Secrets:
+    """The keyring plus the deployment config the pure layer needs, as one value.
+
+    render() and share() take (secrets, ...) and nothing else, which is what
+    keeps them free of open() and usable by an app with no server round-trip.
+    Non-secret deployment config -- dnstt's zone -- therefore has to arrive the
+    same way, and this is the edge where the impure read happens. dnstt.py held
+    it in a module global resolved at import instead, so a caller holding only
+    (secrets, user, host) got an empty zone and share() raised at it: the exact
+    seam the purity rule exists to keep open, closed by the fix to a different
+    bug.
+
+    Absent stays absent rather than becoming an empty entry, mirroring
+    secrets_store.load(): a zero-length value is not a value. render() warns
+    about it, share() refuses.
+    """
+    keyring = secrets_store.load()
+    zone = dnstt_zone()
+    if not zone:
+        return keyring
+    return secrets_store.Secrets(
+        values={**keyring.values, dnstt.ZONE_KEY: zone.encode()}
+    )
+
+
+def missing_deployment_config(proto: protocols.Protocol) -> str | None:
+    """What `protocol on` has to refuse for, before it writes anything.
+
+    Lives beside the read it depends on rather than in cli.py, so the command
+    surface stays free of protocol names; the registry's own home for this is a
+    field on Protocol, and until it has one the single case is here.
+    """
+    if proto.name == dnstt.NAME and not dnstt_zone():
+        return dnstt.NO_ZONE
+    return None
+
+
 def render_all() -> tuple[dict[str, bytes], list[protocols.Protocol]]:
     """Build the tree for the current state. Does not write anything."""
-    secrets = secrets_store.load()
     users = users_store.load()
     enabled = state.enabled_protocols()
-    return build_tree(secrets, users, enabled), enabled
+    return build_tree(snapshot(), users, enabled), enabled

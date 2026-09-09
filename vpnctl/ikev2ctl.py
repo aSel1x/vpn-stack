@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import subprocess
 
@@ -62,14 +63,68 @@ def apply_env() -> tuple[bool, str]:
     return True, output
 
 
-# hwdsl2/ipsec-vpn-server's default IPv4 pool shared by both L2TP and IKEv2
-# clients (not overridden by anything in ikev2/.env for this deployment --
-# confirmed against the live nftables ruleset).
-_IKEV2_IPV4_NET = "192.168.42.0/24"
+# The pool IKEv2 clients are actually assigned addresses from.
+#
+# This said 192.168.42.0/24 until 2026-09-08, and that was the wrong subnet.
+# hwdsl2's run.sh defines two: L2TP_NET (192.168.42.0/24) and XAUTH_NET
+# (192.168.43.0/24). ikev2.sh builds `conn ikev2-cp` with `rightaddresspool`
+# pointing at the *XAUTH* pool, so an IKEv2 client is handed a .43 address and
+# never a .42 one -- confirmed on the live box:
+#   rightaddresspool=192.168.43.10-192.168.43.250,fddd:500:500:500::1000-...
+# Every rule this function installed therefore protected a subnet no client is
+# ever given, and both health checks (scripts/smoke.sh, scripts/diagnose-ikev2.sh)
+# asserted that same wrong subnet -- reporting green in precisely the failure
+# they exist to catch. The rules that do carry IKEv2 traffic today come from
+# the image's own run.sh, which this repo neither owns nor verifies.
+#
+# The pool is overridable (VPN_XAUTH_POOL, with VPN_XAUTH_NET moving the rules
+# run.sh writes), so the value is read from the running container and this is
+# only the fallback for when it cannot be. Same principle as IKEv2
+# certificates: reconcile from observed truth, not from a remembered intent.
+_IKEV2_IPV4_NET_DEFAULT = "192.168.43.0/24"
+
+
+def _ikev2_ipv4_net() -> tuple[str, str]:
+    """Return (network, how we know it) for the pool IKEv2 clients draw from.
+
+    `conn ikev2-cp`'s own `rightaddresspool` is authoritative, because it is
+    literally the range pluto hands out -- checked first for that reason.
+    VPN_XAUTH_NET is only a fallback: run.sh uses it for its *firewall* rules
+    while ikev2.sh builds the pool from VPN_XAUTH_POOL, so the two can be set
+    apart and trusting the net would reproduce exactly the bug this replaced
+    (rules for addresses no client is given). The pool branch assumes a /24,
+    which is what every stock deployment uses.
+    """
+    ok, conf = _docker_exec("cat", "/etc/ipsec.d/ikev2.conf")
+    if ok:
+        for line in conf.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("rightaddresspool="):
+                continue
+            for entry in stripped.split("=", 1)[1].split(","):
+                first = entry.split("-")[0].strip()
+                try:
+                    addr = ipaddress.ip_address(first)
+                except ValueError:
+                    continue
+                if addr.version == 4:
+                    net = ipaddress.ip_network(f"{first}/24", strict=False)
+                    return str(net), "conn ikev2-cp rightaddresspool"
+
+    ok, value = _docker_exec("printenv", "VPN_XAUTH_NET")
+    if ok and value:
+        try:
+            return str(ipaddress.ip_network(value, strict=False)), "VPN_XAUTH_NET"
+        except ValueError:
+            pass
+
+    return _IKEV2_IPV4_NET_DEFAULT, "image default -- container config unreadable"
 
 
 def _default_iface() -> str | None:
-    result = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["ip", "route", "show", "default"], capture_output=True, text=True
+    )
     if result.returncode != 0:
         return None
     parts = result.stdout.split()
@@ -77,35 +132,56 @@ def _default_iface() -> str | None:
 
 
 def ensure_ipv4_forwarding() -> tuple[bool, str]:
-    """Insert the FORWARD-chain accepts run.sh never adds for its own L2TP_NET pool.
+    """Guarantee the net0<->net0 FORWARD accepts IKEv2 IPv4 clients depend on.
 
-    Confirmed against a live instance's nftables ruleset: run.sh installs
-    net0<->net0 FORWARD accepts for XAUTH_NET (Cisco IPsec, 192.168.43.0/24)
-    and for its IPv6 pool, plus ppp+<->net0 accepts for L2TP-over-ppp -- but
-    never a net0<->net0 pair for L2TP_NET (192.168.42.0/24) itself. IKEv2
-    IPv4 clients share that pool but, unlike L2TP, have no ppp interface --
-    their decrypted traffic reappears directly on the physical interface via
-    XFRM -- so without this rule their IKE/IPsec SA establishes fine but no
-    traffic can ever forward: FORWARD's default DROP policy swallows it
-    silently, with nothing logged. Idempotent (checks before inserting);
-    safe to call anytime, including after every ikev2 container restart.
+    IKEv2 IPv4 clients draw from XAUTH_NET and, unlike L2TP, have no ppp
+    interface -- their decrypted traffic reappears directly on the physical
+    interface via XFRM. Without a net0<->net0 accept pair their IKE/IPsec SA
+    establishes fine but no traffic can ever forward: FORWARD's default DROP
+    policy swallows it silently, with nothing logged.
+
+    run.sh does install that pair, so on a healthy box these are already
+    present -- but its idempotence guard tests a rule in the *nat* table while
+    the accepts it protects live in *filter*. Anything that clears filter alone
+    loses them with nothing to put them back, and the loss is invisible until
+    someone notices IKEv2 carries no traffic. Re-ensuring them here costs two
+    iptables -C calls and closes that hole.
+
+    Idempotent (checks before inserting); safe to call anytime, including after
+    every ikev2 container restart.
     """
     iface = _default_iface()
     if not iface:
         return False, "could not determine default network interface"
 
+    net, provenance = _ikev2_ipv4_net()
     rules = [
-        ["-i", iface, "-d", _IKEV2_IPV4_NET, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-        ["-s", _IKEV2_IPV4_NET, "-o", iface, "-j", "ACCEPT"],
+        [
+            "-i",
+            iface,
+            "-d",
+            net,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ],
+        ["-s", net, "-o", iface, "-j", "ACCEPT"],
     ]
     for rule in rules:
-        check = subprocess.run(["iptables", "-C", "FORWARD", *rule], capture_output=True, text=True)
+        check = subprocess.run(
+            ["iptables", "-C", "FORWARD", *rule], capture_output=True, text=True
+        )
         if check.returncode == 0:
             continue
-        add = subprocess.run(["iptables", "-I", "FORWARD", "1", *rule], capture_output=True, text=True)
+        add = subprocess.run(
+            ["iptables", "-I", "FORWARD", "1", *rule], capture_output=True, text=True
+        )
         if add.returncode != 0:
             return False, (add.stdout + add.stderr).strip()
-    return True, f"IKEv2 IPv4 FORWARD rules ensured on {iface} for {_IKEV2_IPV4_NET}"
+    return True, f"IKEv2 IPv4 FORWARD rules ensured on {iface} for {net} ({provenance})"
 
 
 def add_client(name: str) -> tuple[bool, str]:
@@ -183,29 +259,42 @@ def export_client(name: str) -> tuple[bool, str, dict[str, bytes]]:
     problems: list[str] = []
     for suffix, dest_suffix, label in _CLIENT_FILES:
         result = subprocess.run(
-            ["docker", "exec", IKEV2_CONTAINER_NAME,
-             "cat", f"/etc/ipsec.d/{name}{suffix}"],
+            [
+                "docker",
+                "exec",
+                IKEV2_CONTAINER_NAME,
+                "cat",
+                f"/etc/ipsec.d/{name}{suffix}",
+            ],
             capture_output=True,
             timeout=60,
         )
         if result.returncode != 0 or not result.stdout:
-            problems.append(f"  FAILED {name}{suffix} ({label}): {result.stderr.decode().strip()}")
+            problems.append(
+                f"  FAILED {name}{suffix} ({label}): {result.stderr.decode().strip()}"
+            )
             continue
         bundles[f"{name}{dest_suffix}"] = result.stdout
 
     # Read, then remove. Regenerating them is one --exportclient away; leaving
     # them is a credential sitting on disk for as long as the volume lives.
     _docker_exec(
-        "sh", "-c",
+        "sh",
+        "-c",
         "rm -f " + " ".join(f"/etc/ipsec.d/{name}{sfx}" for sfx, _, _ in _CLIENT_FILES),
     )
 
     if not bundles:
         _, listing = list_clients()
-        return False, (
-            "None of the client files could be read:\n" + "\n".join(problems)
-            + f"\n--listclients output for reference:\n{listing}"
-        ), {}
+        return (
+            False,
+            (
+                "None of the client files could be read:\n"
+                + "\n".join(problems)
+                + f"\n--listclients output for reference:\n{listing}"
+            ),
+            {},
+        )
 
     lines = [f"  {fn}  ({len(b)} bytes)" for fn, b in bundles.items()]
     if problems:
