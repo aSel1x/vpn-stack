@@ -36,7 +36,7 @@ Then tell the server which zone it owns. This is deployment config, not code —
 echo 'VPN_DNSTT_ZONE=tun.example.com' >> /etc/vpn-stack/.env
 ```
 
-One variable, read twice: compose interpolates it into the `dnstt` container's `command:`, and `vpnctl` reads it for the settings it hands to clients. Unset, `vpnctl apply` refuses to render dnstt and says so by name — it does not fall back to anything.
+One variable, read twice: compose interpolates it into the `dnstt` container's `command:`, and `vpnctl` reads it for the settings it hands to clients. Unset, `protocol on dnstt` refuses before it writes anything or builds the image, and says so by name. If dnstt is already on and the variable later goes missing, `apply` warns on stderr and still renders — a boot must not die on it — but `user export` refuses, because a share link for a zone that does not exist is worse than an error. It does not fall back to anything.
 
 ## 2. Generate the server keypair
 

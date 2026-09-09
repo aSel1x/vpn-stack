@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import qrcode
 
-from vpnctl import protocols, secrets_store
+from vpnctl import protocols, render
 from vpnctl.dotenv import read as read_env
 from vpnctl.paths import ENV_FILE
 from vpnctl.protocols import ShareItem
@@ -34,8 +34,14 @@ def resolve_host(explicit_host: str | None) -> str:
 
 
 def items_for(user: User, host: str, names: list[str]) -> dict[str, list[ShareItem]]:
-    """Registry-driven: {protocol name: share items}. Pure apart from the keyring read."""
-    secrets = secrets_store.load()
+    """Registry-driven: {protocol name: share items}. Pure apart from the snapshot.
+
+    render.snapshot(), not secrets_store.load(): the snapshot is the impure edge
+    where deployment config that the pure layer needs -- dnstt's zone -- is
+    folded in. Reading the keyring alone here handed share() a snapshot with no
+    zone, so dnstt refused on a server where the zone was set all along.
+    """
+    secrets = render.snapshot()
     out: dict[str, list[ShareItem]] = {}
     for proto in protocols.ordered(names):
         # Note there is no per_user filter here. A protocol with no per-user

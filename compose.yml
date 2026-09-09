@@ -105,7 +105,9 @@ services:
     # v5.3.1, `:?` on an unset variable fails project load, so `config`, `ps`
     # and even `up sing-box` all die while dnstt is merely switched off -- the
     # same trap that put `required: false` on ikev2.env above. The loud failure
-    # lives in vpnctl/protocols/dnstt.py, which refuses to render without it.
+    # lives in vpnctl/protocols/dnstt.py. Unset, `protocol on dnstt` refuses
+    # outright; an already-enabled dnstt renders with a warning and this
+    # argument simply vanishes, which dnstt-server rejects as a usage error.
     command: >-
       -udp ${VPN_SERVER_HOST}:53
       -privkey-file /keys/server.key
