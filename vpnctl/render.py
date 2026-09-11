@@ -55,11 +55,18 @@ def write_candidate(tree: dict[str, bytes]) -> Path:
     for rel, content in tree.items():
         target = candidate / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        # Anything that is a key stays 0600; the rest is world-readable inside
-        # a 0700 parent, which the sing-box container needs in order to read it.
+        # 0600 for everything, decided by default rather than by filename.
+        # This used to be `0600 if name ends in .key or .env else 0644`, and
+        # `dnstt-sshd/logins` ends in neither -- so the plaintext list of every
+        # user's dnstt password was rendered world-readable, contained only by
+        # the 0700 parent. Same failure shape as an exact-path .gitignore rule:
+        # a new credential-bearing output is covered only if somebody remembers
+        # to extend the list, and nobody did. Nothing needs the wider mode --
+        # every rendered path is bind-mounted :ro into a container that reads it
+        # as root, and no service in compose.yml declares a `user:`.
         # The mode is set at creation, not after: write_bytes() then chmod()
         # leaves a private key at the umask default for the width of a syscall.
-        mode = 0o600 if target.name.endswith((".key", ".env")) else 0o644
+        mode = 0o600
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "wb") as fh:
             fh.write(content)

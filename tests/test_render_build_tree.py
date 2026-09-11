@@ -8,6 +8,7 @@ collision, or a secret nobody generated.
 from __future__ import annotations
 
 import json
+import stat
 
 import pytest
 
@@ -120,3 +121,25 @@ def test_build_tree_is_deterministic(secrets, users) -> None:
 def test_build_tree_writes_nothing(secrets, users, state_dir) -> None:
     render.build_tree(secrets, users, ALL)
     assert list(state_dir.iterdir()) == []
+
+
+def test_every_rendered_file_is_0600(secrets, users, state_dir) -> None:
+    """No rendered output is readable by anyone but root.
+
+    The mode used to be chosen by filename -- 0600 for `.key` and `.env`, 0644
+    for the rest -- and `dnstt-sshd/logins` ends in neither, so the plaintext
+    list of every user's dnstt password was rendered world-readable, contained
+    only by the 0700 parent directory. Asserting the property over the WHOLE
+    tree rather than over a list of names is the point: a protocol that grows a
+    new credential-bearing output cannot slip through by being unlisted.
+    """
+    candidate = render.write_candidate(render.build_tree(secrets, users, ALL))
+    rendered = [p for p in candidate.rglob("*") if p.is_file()]
+    assert rendered, "nothing was rendered, so this asserts nothing"
+    wider = {
+        str(p.relative_to(candidate)): oct(stat.S_IMODE(p.stat().st_mode))
+        for p in rendered
+        if stat.S_IMODE(p.stat().st_mode) != 0o600
+    }
+    assert wider == {}, f"rendered wider than 0600: {wider}"
+    assert stat.S_IMODE(candidate.stat().st_mode) == 0o700
