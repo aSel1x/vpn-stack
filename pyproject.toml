@@ -1,8 +1,9 @@
 [project]
 name = "vpnctl"
 version = "0.1.0"
-description = "CLI to manage sing-box VPN users (VLESS+REALITY, Hysteria2)"
+description = "CLI that operates a personal VPN server: VLESS+REALITY, Hysteria2, IKEv2/L2TP and a DNS tunnel, over one user database"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
 dependencies = [
     "cryptography>=42",
     "qrcode>=7.4",
