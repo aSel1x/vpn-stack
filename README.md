@@ -209,3 +209,15 @@ AGPL-3.0. See `LICENSE`.
 `CLAUDE.md` — the architecture in full: the protocol registry, the apply pipeline, and the
 things learned the hard way, each with the failure that taught it. `dnstt/SETUP.md` — building
 the DNS tunnel from scratch, zone delegation included.
+
+Two measurements are written up on their own, because they are the parts most likely to be
+useful to somebody who never runs this code:
+
+- `docs/ike-filter-measurement.md` — why IKEv2 clients on one access network cannot reach this
+  server, localised with a TTL ceiling so the probes cannot have reached the destination, and
+  why the obvious test (a junk datagram on udp/500) would have returned the same answer against
+  a provider that really was blocking.
+- `docs/dnstt-per-user-revocation.md` — running a DNS tunnel where access is revocable per
+  person, given that the tunnel's own key belongs to the server and cannot be, and why the
+  container behind it has to be recreated rather than restarted for a revocation to mean
+  anything.
