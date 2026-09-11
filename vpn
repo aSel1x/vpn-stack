@@ -52,6 +52,35 @@ remote() {
     "cd $REMOTE_PATH && flock /run/vpn-stack.lock /usr/local/bin/vpnctl $cmd"
 }
 
+# Where the backup identity lives: on THIS machine, outside the repo, and never
+# on the server. `age -p` was the old scheme and its whole security was one
+# passphrase a human had to be able to type -- which is also the reason a single
+# committed .age file was a real incident rather than a shrug. An age identity is
+# high-entropy by construction and is never typed.
+#
+# The trade-off is real and points the other way: a passphrase you remember
+# cannot be lost with a laptop. Keep this file in a password manager -- it is one
+# line of text -- because a backup whose key is gone is indistinguishable from no
+# backup, and the moment you find out is the moment the server is already gone.
+BACKUP_KEY="${VPN_BACKUP_KEY:-$HOME/.config/vpn-stack/backup.key}"
+
+need_backup_key() {
+  command -v age >/dev/null || { echo "install age(1) first" >&2; exit 1; }
+  [[ -f "$BACKUP_KEY" ]] && return 0
+  cat >&2 <<EOF
+no backup identity at $BACKUP_KEY
+
+Create one, then copy it into your password manager:
+
+  ./vpn backup-key
+
+Backups are encrypted to that identity instead of to a passphrase. Existing
+passphrase-encrypted .age files still restore -- \`./vpn restore\` detects which
+kind it was handed.
+EOF
+  exit 1
+}
+
 case "${1:-}" in
   init)
     target="${2:?usage: ./vpn init <user@host>}"
@@ -98,11 +127,36 @@ case "${1:-}" in
     ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
     ;;
 
+  backup-key)
+    # Deliberately a separate command and not something `backup` creates for
+    # you. A key minted silently is a key nobody copied anywhere, and the first
+    # time that matters is a restore onto a box whose predecessor is gone.
+    command -v age-keygen >/dev/null || { echo "install age(1) first" >&2; exit 1; }
+    if [[ -f "$BACKUP_KEY" ]]; then
+      echo "already have one: $BACKUP_KEY" >&2
+      echo "recipient: $(age-keygen -y "$BACKUP_KEY")" >&2
+      echo "Refusing to replace it -- every existing backup is encrypted to it." >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$BACKUP_KEY")"
+    ( umask 077; age-keygen -o "$BACKUP_KEY" 2>/dev/null )
+    chmod 600 "$BACKUP_KEY"
+    cat >&2 <<EOF
+wrote $BACKUP_KEY (0600)
+recipient: $(age-keygen -y "$BACKUP_KEY")
+
+Copy the contents of that file into your password manager NOW. It is one line.
+Every backup from here on is encrypted to it and to nothing else, so losing it
+loses every backup -- including the ones taken before you noticed it was gone.
+It is never sent to the server, and it is outside the repo on purpose.
+EOF
+    ;;
+
   backup)
     need_host
-    # Streams through the SSH pipe into age on THIS machine: the passphrase
-    # never reaches the server and the plaintext never lands on either disk.
-    command -v age >/dev/null || { echo "install age(1) first" >&2; exit 1; }
+    # Streams through the SSH pipe into age on THIS machine: the key never
+    # reaches the server and the plaintext never lands on either disk.
+    need_backup_key
     # Both halves, and the second is the one people forget: the ikev2 volume
     # holds cert9.db/key4.db, the NSS database with the IKEv2 CA private key.
     # Without it every certificate this server ever issued is unrecoverable.
@@ -113,7 +167,8 @@ case "${1:-}" in
       tar cz -C /etc/vpn-stack --exclude="./rendered*" . 2>/dev/null > /tmp/.vpn-state.tgz
       docker run --rm -v vpn-stack_ikev2-vpn-data:/v alpine tar cz -C /v . > /tmp/.vpn-ikev2.tgz
       tar c -C /tmp .vpn-state.tgz .vpn-ikev2.tgz
-      rm -f /tmp/.vpn-state.tgz /tmp/.vpn-ikev2.tgz' | age -p
+      rm -f /tmp/.vpn-state.tgz /tmp/.vpn-ikev2.tgz' \
+      | age -r "$(age-keygen -y "$BACKUP_KEY")"
     ;;
 
   restore)
@@ -125,6 +180,25 @@ case "${1:-}" in
     file="${2:?usage: ./vpn restore <file.age> [--force]}"
     [[ -f "$file" ]] || { echo "no such file: $file" >&2; exit 1; }
     force="${3:-}"
+
+    # age records its scheme in the header: `-> scrypt` for a passphrase, an
+    # `-> X25519` stanza for a recipient. Sniff it rather than asking, so a
+    # backup taken before the identity existed still restores without a flag --
+    # and so the wrong answer is an immediate error instead of a prompt that
+    # looks like the right one.
+    #
+    # `-a` is load-bearing, not tidiness. The header is ASCII but the payload
+    # right after it is not, so grep calls the stream binary and exits 1 without
+    # looking -- which sent every passphrase-era backup down the identity branch
+    # and failed it with age's own unhelpful error, on a rebuilt box, which is
+    # the only occasion anybody runs this command.
+    if head -c 200 "$file" | grep -qa -- '-> scrypt'; then
+      age_decrypt=(age -d "$file")
+      echo "note: $file is passphrase-encrypted (the old scheme)." >&2
+    else
+      need_backup_key
+      age_decrypt=(age -d -i "$BACKUP_KEY" "$file")
+    fi
 
     # Restoring over a server that already has users overwrites live
     # credentials with older ones, and every profile issued since diverges.
@@ -139,7 +213,7 @@ case "${1:-}" in
     fi
 
     echo "Decrypting locally and streaming to $HOST..." >&2
-    age -d "$file" | ssh "${ssh_opts[@]}" "$HOST" '
+    "${age_decrypt[@]}" | ssh "${ssh_opts[@]}" "$HOST" '
       set -e
       umask 077
       tmp=$(mktemp -d)
@@ -174,7 +248,8 @@ case "${1:-}" in
   ./vpn deploy                sync code, validate, converge
   ./vpn share <user>          one-shot LAN page: tap-to-import on a phone
   ./vpn smoke                 assert the server is actually serving
-  ./vpn backup > f.age        encrypted backup, decrypted only on this machine
+  ./vpn backup-key            create the local age identity backups use
+  ./vpn backup > f.age        encrypted to it, decrypted only on this machine
   ./vpn restore f.age         put one back on a rebuilt server
   ./vpn logs [service]        tail logs
 

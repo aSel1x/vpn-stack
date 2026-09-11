@@ -115,8 +115,9 @@ as one at the top of `scripts/share.py`.
 ```
 
 The backup covers `/etc/vpn-stack` **and** the IKEv2 Docker volume, which holds the CA private
-key — without it every certificate this server issued is unrecoverable. `age -p` encrypts on
-your machine, so the passphrase never reaches the server and the plaintext never lands on
+key — without it every certificate this server issued is unrecoverable. `age` encrypts on
+your machine to the identity `./vpn backup-key` made, so the key never reaches the server and
+the plaintext never lands on
 either disk. Restoring brings back the same keys, so profiles already on people's phones keep
 working. `restore` refuses to run against a server that already has users unless you pass
 `--force`.
