@@ -36,11 +36,10 @@ sealed class ProvisionException implements Exception {
 /// it ran at all is unknown.
 final class ProvisionTransportError extends ProvisionException {
   ProvisionTransportError({
-    required String step,
+    required super.step,
     required this.cause,
     String? what,
   }) : super(
-          step: step,
           message: what == null
               ? 'the connection failed: $cause'
               : 'the connection failed during $what, so whether it ran is '
@@ -55,12 +54,11 @@ final class ProvisionTransportError extends ProvisionException {
 /// A remote program ran and exited non-zero.
 final class ProvisionCommandError extends ProvisionException {
   ProvisionCommandError({
-    required String step,
+    required super.step,
     required this.what,
     required this.exitCode,
     required this.output,
   }) : super(
-          step: step,
           message: output.trim().isEmpty
               ? '$what exited $exitCode and printed nothing'
               : '$what exited $exitCode:\n${output.trim()}',
@@ -80,8 +78,7 @@ final class ProvisionCommandError extends ProvisionException {
 /// Not a Debian or Ubuntu box, not root, or otherwise outside what this
 /// sequence knows how to do.
 final class UnsupportedHostError extends ProvisionException {
-  const UnsupportedHostError({required String step, required String message})
-      : super(step: step, message: message);
+  const UnsupportedHostError({required super.step, required super.message});
 }
 
 /// The server is already provisioned, and re-running would destroy credentials.
@@ -91,9 +88,7 @@ final class UnsupportedHostError extends ProvisionException {
 /// with no error anywhere. So this refuses instead, exactly as `deploy.sh`
 /// refuses to bootstrap.
 final class AlreadyProvisionedError extends ProvisionException {
-  AlreadyProvisionedError({required String step, required this.evidence})
-      : super(
-          step: step,
+  AlreadyProvisionedError({required super.step, required this.evidence}) : super(
           message: 'this server is already provisioned '
               '(${evidence.join('; ')}). Provisioning it again would generate a '
               'fresh keyring and silently invalidate every profile already '
@@ -110,13 +105,12 @@ final class AlreadyProvisionedError extends ProvisionException {
 /// just installed, so it deliberately did not disarm the deadman.
 final class FirewallLockoutError extends ProvisionException {
   FirewallLockoutError({
-    required String step,
+    required super.step,
     required this.reason,
     required this.deadmanSeconds,
     required this.deadmanPid,
     this.attempts = const <String>[],
   }) : super(
-          step: step,
           message: _describe(reason, deadmanSeconds, attempts),
         );
 
@@ -160,11 +154,10 @@ final class FirewallLockoutError extends ProvisionException {
 /// Ports never came up.
 final class ReadinessTimeoutError extends ProvisionException {
   ReadinessTimeoutError({
-    required String step,
+    required super.step,
     required this.pending,
     required this.waited,
   }) : super(
-          step: step,
           message: 'after ${waited.inSeconds}s these ports are still not bound '
               'on a non-loopback address: ${pending.join(', ')}. The containers '
               'are up but not serving; `docker logs` on the server says why.',

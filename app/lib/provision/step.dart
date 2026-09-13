@@ -65,8 +65,8 @@ class ProvisionContext {
     required this.connector,
     required this.hostKeys,
     this.clock = const ProvisionClock(),
-    ProvisionReporter? onEvent,
-  }) : _onEvent = onEvent;
+    ProvisionReporter? this._onEvent,
+  });
 
   final ProvisionConfig config;
   final SshConnector connector;

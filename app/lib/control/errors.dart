@@ -32,7 +32,7 @@ sealed class VpnctlException implements Exception {
 
 /// The SSH transport failed before the command produced an exit status.
 final class VpnctlTransportError extends VpnctlException {
-  VpnctlTransportError({required List<String> argv, required this.cause})
+  VpnctlTransportError({required super.argv, required this.cause})
       : super(_describe(argv, cause), argv);
 
   /// Whatever the injected session threw. Deliberately `Object`: this layer
@@ -47,7 +47,7 @@ final class VpnctlTransportError extends VpnctlException {
 /// vpnctl ran and refused.
 final class VpnctlCommandError extends VpnctlException {
   VpnctlCommandError({
-    required List<String> argv,
+    required super.argv,
     required this.exitCode,
     required this.error,
     required this.payload,
@@ -73,7 +73,7 @@ final class VpnctlCommandError extends VpnctlException {
   /// be answering in JSON -- so it stays in this class, where the message is
   /// whatever it did print.
   factory VpnctlCommandError.unparsed({
-    required List<String> argv,
+    required super.argv,
     required int exitCode,
     required String stdout,
     required String stderr,
@@ -82,7 +82,6 @@ final class VpnctlCommandError extends VpnctlException {
         .where((String s) => s.isNotEmpty)
         .join('\n');
     return VpnctlCommandError(
-      argv: argv,
       exitCode: exitCode,
       error: detail.isEmpty
           ? '`${shellCommand(argv)}` exited $exitCode and printed nothing'
@@ -96,7 +95,7 @@ final class VpnctlCommandError extends VpnctlException {
 /// vpnctl answered, and the answer is not one this app can read.
 class VpnctlProtocolError extends VpnctlException {
   VpnctlProtocolError({
-    required List<String> argv,
+    required super.argv,
     required this.reason,
     required this.raw,
   }) : super(_describe(reason, raw), argv);
@@ -135,14 +134,12 @@ final class VpnctlSchemaError extends VpnctlProtocolError {
   // nullable because the other constructor leaves it unset, but here it is
   // known and the comparison below has to be able to say so.
   VpnctlSchemaError.mismatch({
-    required List<String> argv,
+    required super.argv,
     required int this.serverSchema,
     required int appSchema,
-    required String raw,
+    required super.raw,
   })  : unknownField = null,
         super(
-          argv: argv,
-          raw: raw,
           reason: serverSchema > appSchema
               ? 'the server answers --json schema $serverSchema and this app '
                   'understands $appSchema. The server is newer than the app -- '
@@ -153,14 +150,12 @@ final class VpnctlSchemaError extends VpnctlProtocolError {
         );
 
   VpnctlSchemaError.unknownField({
-    required List<String> argv,
+    required super.argv,
     required String where,
     required this.unknownField,
-    required String raw,
+    required super.raw,
   })  : serverSchema = null,
         super(
-          argv: argv,
-          raw: raw,
           reason: '$where has a field this app does not know '
               '($unknownField). The server is newer than the app -- update the '
               'app. $_unread',

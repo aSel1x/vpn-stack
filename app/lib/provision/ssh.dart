@@ -101,12 +101,10 @@ class HostKeyPolicy {
   /// reached), who to ask, and where to put the answer.
   HostKeyPolicy.ask({
     required this.target,
-    required HostKeyPrompt prompt,
-    SshHostKey? pinned,
-    HostKeyRecorder? remember,
-  })  : _pinned = pinned,
-        _prompt = prompt,
-        _remember = remember;
+    required HostKeyPrompt this._prompt,
+    SshHostKey? this._pinned,
+    HostKeyRecorder? this._remember,
+  });
 
   /// Refuses every key. The policy a caller that forgot to plumb one should
   /// get: it fails closed, by name, instead of connecting to anything.
