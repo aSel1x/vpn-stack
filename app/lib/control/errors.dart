@@ -32,7 +32,7 @@ sealed class VpnctlException implements Exception {
 
 /// The SSH transport failed before the command produced an exit status.
 final class VpnctlTransportError extends VpnctlException {
-  VpnctlTransportError({required super.argv, required this.cause})
+  VpnctlTransportError({required List<String> argv, required this.cause})
       : super(_describe(argv, cause), argv);
 
   /// Whatever the injected session threw. Deliberately `Object`: this layer
@@ -47,7 +47,7 @@ final class VpnctlTransportError extends VpnctlException {
 /// vpnctl ran and refused.
 final class VpnctlCommandError extends VpnctlException {
   VpnctlCommandError({
-    required super.argv,
+    required List<String> argv,
     required this.exitCode,
     required this.error,
     required this.payload,
@@ -73,7 +73,7 @@ final class VpnctlCommandError extends VpnctlException {
   /// be answering in JSON -- so it stays in this class, where the message is
   /// whatever it did print.
   factory VpnctlCommandError.unparsed({
-    required super.argv,
+    required List<String> argv,
     required int exitCode,
     required String stdout,
     required String stderr,
@@ -82,6 +82,7 @@ final class VpnctlCommandError extends VpnctlException {
         .where((String s) => s.isNotEmpty)
         .join('\n');
     return VpnctlCommandError(
+      argv: argv,
       exitCode: exitCode,
       error: detail.isEmpty
           ? '`${shellCommand(argv)}` exited $exitCode and printed nothing'
@@ -95,7 +96,7 @@ final class VpnctlCommandError extends VpnctlException {
 /// vpnctl answered, and the answer is not one this app can read.
 class VpnctlProtocolError extends VpnctlException {
   VpnctlProtocolError({
-    required super.argv,
+    required List<String> argv,
     required this.reason,
     required this.raw,
   }) : super(_describe(reason, raw), argv);

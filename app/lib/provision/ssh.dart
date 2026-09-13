@@ -102,8 +102,8 @@ class HostKeyPolicy {
   HostKeyPolicy.ask({
     required this.target,
     required HostKeyPrompt this._prompt,
-    SshHostKey? this._pinned,
-    HostKeyRecorder? this._remember,
+    this._pinned,
+    this._remember,
   });
 
   /// Refuses every key. The policy a caller that forgot to plumb one should

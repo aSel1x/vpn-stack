@@ -65,7 +65,7 @@ class ProvisionContext {
     required this.connector,
     required this.hostKeys,
     this.clock = const ProvisionClock(),
-    ProvisionReporter? this._onEvent,
+    this._onEvent,
   });
 
   final ProvisionConfig config;

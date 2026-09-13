@@ -24,8 +24,8 @@ import 'ports.dart';
 class ServerAccess {
   ServerAccess._({
     required this.server,
-    required SshConnector this._connector,
-    required HostKeyPolicy this._hostKeys,
+    required this._connector,
+    required this._hostKeys,
   });
 
   /// The only way to build one: a credential, the pin this device already
