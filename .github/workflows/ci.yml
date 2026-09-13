@@ -101,3 +101,68 @@ jobs:
           echo "checked $n script(s)"
           [ "$n" -gt 0 ] || { echo "no shell scripts matched -- the finder is broken, not the tree" >&2; exit 1; }
           exit $rc
+
+  # The app half of the app<->vpnctl contract, on EVERY push -- which is the
+  # whole point of it being here and not in .github/workflows/app.yml.
+  #
+  # app/README.md gives one reason for the Flutter client living in this
+  # repository: a breaking change to `--json` should not be able to land
+  # without the app's tests running against it. app.yml triggers on `app/**`
+  # only, so for a commit that renames a key in vpnctl/cli.py -- the exact
+  # change that breaks the app -- the Dart suite did not run at all. Adding
+  # `vpnctl/**` to app.yml instead would rebuild five artifacts, two of them on
+  # macOS runners, for a server-side one-liner. So the cheap half runs here,
+  # where there is no path filter, and app.yml keeps the expensive half.
+  #
+  # Be precise about what this buys, because app/README.md is now precise about
+  # it too: the Dart fixtures are hand-copied from cli.py's output and nothing
+  # compares the two, so renaming `enabled_protocols` leaves this job GREEN.
+  # It catches a payload the parser cannot read, a command line assembled
+  # wrongly, and any Dart-side regression -- and it is the job the missing
+  # key-set diff would run in, once it exists.
+  dart:
+    name: app analyze and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Read out of app.yml rather than restated here, for the reason
+      # scripts/check.sh reads the sing-box tag out of compose.yml: two
+      # literals drift, silently, and then the contract is checked on one
+      # toolchain and shipped on another. app.yml stays the single definition
+      # of which Flutter this tree builds with.
+      - name: Read the pinned Flutter version out of app.yml
+        id: flutter
+        working-directory: .
+        run: |
+          v=$(sed -n 's/^[[:space:]]*FLUTTER_VERSION:[[:space:]]*"\([^"]*\)".*/\1/p' .github/workflows/app.yml)
+          [ -n "$v" ] || { echo "no FLUTTER_VERSION in .github/workflows/app.yml -- the pin moved and this job cannot guess what to install" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Install Flutter ${{ steps.flutter.outputs.version }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      # Plain `flutter analyze`, matching app.yml: errors and warnings fail,
+      # lint infos do not, and app/analysis_options.yaml escalates the one lint
+      # worth a red build on its own.
+      - name: flutter analyze
+        run: flutter analyze
+
+      # No pubspec.lock is committed yet, so this resolves fresh every run and
+      # a new release of a dependency can turn this red with no commit in
+      # between. app.yml's check job uploads the lock it resolved; commit it
+      # and both jobs freeze. That is a real loose end, not a style note.
+      - name: flutter test
+        run: flutter test

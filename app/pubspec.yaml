@@ -1,0 +1,42 @@
+name: vpn_stack_app
+description: Provision a server and connect to it. Client for the vpn-stack CLI.
+publish_to: none
+version: 0.1.0
+
+environment:
+  # Flutter 3.47.4 stable ships Dart 3.13.3; taken from the release manifest,
+  # not guessed. Raise this deliberately, not because a lockfile drifted.
+  sdk: ^3.13.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Pure Dart SSH, so provision/ and control/ run unchanged on all six targets
+  # and need no platform channel.
+  #
+  # Nothing imports it yet -- `lib/ui/missing_backend.dart` is the placeholder
+  # that throws where the connection would be opened -- and it stays declared
+  # anyway. The lockfile is not committed: CI resolves this file and the first
+  # green run's pubspec.lock is what gets frozen. Leaving dartssh2 out until the
+  # transport lands would freeze a resolution that has never been shown to admit
+  # it, and move the conflict onto the branch trying to land the transport,
+  # after the versions are pinned. Resolving it now, while nothing is frozen, is
+  # where a conflict is cheap. Nothing else declares it, so `flutter pub get` is
+  # the only thing that reads this line.
+  dartssh2:
+  # SSH credentials and VPN credentials never go in plain preferences.
+  flutter_secure_storage:
+  provider:
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints:
+
+# Versions are deliberately unpinned at this stage and resolved by CI, which is
+# the only place this builds. A pinned version written by somebody who could not
+# run `flutter pub get` is a guess wearing a number; pubspec.lock from the first
+# green CI run is the honest place to freeze them.
+
+flutter:
+  uses-material-design: true

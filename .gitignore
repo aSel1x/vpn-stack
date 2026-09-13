@@ -30,6 +30,22 @@ state.json
 rendered
 rendered-*/
 
+# --- the Flutter client ---
+# The platform directories are scaffolding: `flutter create` regenerates them in
+# CI, they are large, and a hand-edited Xcode project is a file nobody can
+# review. .dart_tool/package_config.json carries absolute paths into whoever ran
+# `pub get` last, and Generated.xcconfig carries their FLUTTER_ROOT -- neither
+# belongs in a public repo.
+app/android/
+app/ios/
+app/macos/
+app/windows/
+app/linux/
+app/build/
+app/.dart_tool/
+app/.flutter-plugins*
+app/ephemeral/
+
 # --- python tooling ---
 .venv/
 __pycache__/

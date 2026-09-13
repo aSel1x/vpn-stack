@@ -1,0 +1,482 @@
+# The only place the Flutter client builds.
+#
+# app/README.md says building happens in CI rather than on a developer's
+# machine, and it is not a preference: iOS and macOS artifacts can only be
+# produced on a macOS runner, and the runners are free because this repository
+# is public. One workflow, five artifacts, no local toolchain required.
+#
+# It keeps the four properties ci.yml has, for the same reasons ci.yml states:
+# no `secrets:`, no deploy step of any kind, every action pinned, and
+# `permissions: contents: read` written out rather than inherited from a
+# settings page this file cannot document.
+#
+# NOTHING HERE IS SIGNED, and that is the intended end state, not a TODO.
+# The .ipa is built with --no-codesign and installs on no device until somebody
+# with an Apple organization membership signs it (App Store Review Guideline
+# 5.4 gates VPN apps on that, and a free Apple ID has no Network Extension
+# entitlement at all -- app/README.md has the detail). The macOS .app and the
+# Windows .exe are unsigned too: Gatekeeper will refuse the first launch until
+# it is opened through the context menu, and SmartScreen will warn. The APK is
+# signed with Flutter's debug key, which is what the generated Gradle template
+# falls back to and is not a distribution identity either. Do not add signing
+# steps, and do not add placeholder secrets for signing -- an empty secret that
+# a step reads is how a workflow starts silently producing unsigned output
+# while claiming otherwise.
+#
+# It does not run on every push. The server-side checks in ci.yml already do,
+# and burning a macOS runner because somebody fixed a typo in README.md is
+# rude. Pull requests are not a separate trigger here for the same reason:
+# there is one operator, branches arrive as pushes, and a PR would otherwise
+# build everything twice.
+#
+# THE PATH FILTER GOVERNS ARTIFACTS, NOT THE CONTRACT CHECK. `app/**` is the
+# right filter for "should we spend two macOS runners", and the wrong one for
+# "did anybody break app<->vpnctl --json": renaming a key in vpnctl/cli.py
+# touches no file under app/, so for as long as this filter was the only
+# trigger, the one test suite that exists to catch that never ran against the
+# side that breaks it. The fix is not to add `vpnctl/**` here -- that rebuilds
+# five artifacts for a server-side commit. `flutter analyze` and `flutter test`
+# are duplicated in ci.yml's `dart` job, which has no path filter at all.
+# The `check` job below stays, because GitHub has no cross-workflow `needs:`
+# and something has to gate the five builds; the cost is one cheap ubuntu job
+# running twice on an `app/**` push. Read app/README.md before trusting what
+# that job proves: it catches a payload the Dart parser cannot read, NOT a
+# renamed key, because the fixtures are hand-copied from cli.py.
+
+name: app
+
+on:
+  push:
+    paths:
+      - 'app/**'
+      - '.github/workflows/app.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned exactly, for the reason ci.yml pins ruff: an unpinned toolchain hands
+  # the next Flutter release a veto over every branch at once, and turns
+  # somebody else's release into your red build. 3.47.4 stable ships Dart
+  # 3.13.3, which is the constraint app/pubspec.yaml declares. Bump both in the
+  # same commit or the SDK constraint and the toolchain drift apart.
+  FLUTTER_VERSION: "3.47.4"
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  # Everything else `needs:` this. A missing semicolon should cost one cheap
+  # ubuntu runner, not five runners including two macOS ones.
+  check:
+    name: analyze and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      # app/pubspec.yaml deliberately carries no version constraints and no
+      # lockfile is committed, because they would have been written by somebody
+      # who could not run a resolver. This is the resolver's answer: download
+      # it from the first green run, commit it, and the resolution is frozen
+      # from then on. Uploaded before analyze so a red analysis still hands you
+      # the lockfile.
+      - name: Upload the resolved pubspec.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: pubspec.lock
+          path: app/pubspec.lock
+          if-no-files-found: error
+
+      # Plain `flutter analyze`: errors and warnings fail, lint infos do not.
+      # --fatal-infos would hand flutter_lints' next release the same veto the
+      # pinned SDK above exists to prevent, on a tree nobody touched.
+      # app/analysis_options.yaml already escalates the one lint that is worth a
+      # red build (unawaited_futures) to an error by itself.
+      - name: flutter analyze
+        run: flutter analyze
+
+      - name: flutter test
+        run: flutter test
+
+  android:
+    name: Android APK
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Gradle uses whatever JAVA_HOME the runner image happens to set, and that
+      # moves with the image. Pin it: AGP in the current template needs 17+, and
+      # "works until the image rolls" is not a build.
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # The platform directories are not committed (app/README.md: they are
+      # scaffolding, they are large, and a hand-edited Xcode project is a file
+      # nobody can review), so every platform job generates its own and only its
+      # own. `flutter create` over an existing project writes only files that
+      # are absent -- --overwrite defaults to false -- so lib/, test/,
+      # pubspec.yaml and analysis_options.yaml are left exactly as checked out.
+      # --project-name and --org are passed explicitly because they are only
+      # consulted while generating, and nothing that records them is committed:
+      # leave --org off and every artifact is stamped com.example forever. The
+      # name must stay equal to `name:` in app/pubspec.yaml, and the org is the
+      # repository owner lowercased, because an Android applicationId segment is
+      # a Java identifier and nothing here is going near a store anyway.
+      - name: Generate android/
+        run: flutter create --platforms=android --project-name vpn_stack_app --org io.github.asel1x .
+
+      - name: flutter build apk --release
+        run: flutter build apk --release
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+  ios:
+    name: iOS .ipa (unsigned)
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate ios/
+        run: flutter create --platforms=ios --project-name vpn_stack_app --org io.github.asel1x .
+
+      - name: flutter build ios --no-codesign
+        run: flutter build ios --release --no-codesign
+
+      # `flutter build ipa` cannot be used here: exporting an archive is an
+      # Xcode signing operation and there is no identity on this runner. An .ipa
+      # is a zip with the .app under Payload/, so build that shape directly.
+      # It is installable by nothing -- no device, no simulator, no TestFlight
+      # -- until it is re-signed. It exists so the iOS target is proven to
+      # compile on every push instead of rotting until somebody pays Apple.
+      - name: Wrap Runner.app as an unsigned .ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=build/ios/iphoneos/Runner.app
+          [ -d "$app" ] || { echo "no $app -- the iOS output layout moved" >&2; exit 1; }
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$app" build/ipa/Payload/
+          cd build/ipa && zip -qry vpn-stack-app-unsigned.ipa Payload
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-unsigned
+          path: app/build/ipa/vpn-stack-app-unsigned.ipa
+          if-no-files-found: error
+
+  macos:
+    name: macOS app
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate macos/
+        run: flutter create --platforms=macos --project-name vpn_stack_app --org io.github.asel1x .
+
+      - name: flutter build macos --release
+        run: flutter build macos --release
+
+      # upload-artifact does not preserve the executable bit or symlinks, and a
+      # .app is a directory that is nothing but those two things: uploaded raw
+      # it downloads as a bundle that cannot launch. ditto archives it the way
+      # the platform expects, and the artifact zip then just carries one file.
+      - name: Archive the .app
+        shell: bash
+        run: |
+          set -euo pipefail
+          rel=build/macos/Build/Products/Release
+          [ -d "$rel" ] || { echo "no $rel -- the macOS output layout moved" >&2; exit 1; }
+          # -print -quit rather than a pipe to head: under pipefail a SIGPIPE'd
+          # find fails the step with find's exit code instead of the message
+          # below, which is the opposite of legible.
+          app=$(find "$rel" -maxdepth 1 -name '*.app' -print -quit)
+          [ -n "$app" ] || { echo "no .app in $rel -- the build produced nothing to archive" >&2; exit 1; }
+          ditto -c -k --keepParent "$app" build/vpn-stack-app-macos.zip
+
+      - name: Upload the macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: app/build/vpn-stack-app-macos.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows exe
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate windows/
+        run: flutter create --platforms=windows --project-name vpn_stack_app --org io.github.asel1x .
+
+      - name: flutter build windows --release
+        run: flutter build windows --release
+
+      # The whole Release directory, not just the .exe: the launcher is useless
+      # without flutter_windows.dll, the plugin DLLs beside it and data/, which
+      # holds the AOT blob and the ICU data. Shipping the bare .exe produces a
+      # download that fails at startup with a missing-DLL box and no clue.
+      # upload-artifact zips the directory, so the artifact is already the
+      # archive a human wants. (Path note: Flutter moved this out of
+      # build/windows/runner/Release into the x64/ level -- if this step ever
+      # reports no files, look there first.)
+      - name: Upload the Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: app/build/windows/x64/runner/Release
+          if-no-files-found: error
+
+  linux:
+    name: Linux .deb
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Flutter's Linux embedder links against GTK 3 and builds with clang and
+      # ninja; the runner image ships neither the GTK headers nor liblzma's.
+      # dpkg-dev is what provides dpkg-shlibdeps below.
+      #
+      # libsecret-1-dev is not optional and is not about GTK: app/pubspec.yaml
+      # declares flutter_secure_storage, whose Linux implementation opens its
+      # CMakeLists with
+      #   pkg_check_modules(LIBSECRET REQUIRED IMPORTED_TARGET libsecret-1>=0.18.4)
+      # -- REQUIRED, so without the headers the plugin's CMake CONFIGURE step
+      # fails, which means `flutter build linux` never compiles anything, the
+      # .deb is never packaged and the upload never runs. The whole job is red
+      # on a missing -dev package, not on any code in this tree. If
+      # flutter_secure_storage ever leaves pubspec.yaml, this package leaves
+      # with it.
+      #
+      # Nothing below needs editing for the runtime half: the plugin's .so lands
+      # in the bundle's lib/, and dpkg-shlibdeps reads its NEEDED entries and
+      # puts libsecret-1-0 in Depends by itself. That is the point of measuring
+      # the list rather than writing it.
+      #
+      # libjsoncpp-dev is deliberately NOT here. The plugin needed it once and
+      # its 1.2.0 changelog is "Remove and replace libjsoncpp1 dependency"
+      # (it bundles a header-only JSON library now); flutter_secure_storage
+      # 11.x -- what an unpinned `flutter_secure_storage:` resolves to -- will
+      # not accept a Linux implementation below 3.0.1, so nothing in the
+      # resolvable range asks for it. Installing it anyway would be a package
+      # nobody links, kept alive by a stale memory of an old release note.
+      - name: Install the GTK and libsecret build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev dpkg-dev \
+            libsecret-1-dev
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate linux/
+        run: flutter create --platforms=linux --project-name vpn_stack_app --org io.github.asel1x .
+
+      - name: flutter build linux --release
+        run: flutter build linux --release
+
+      # Flutter's Linux output is a bundle directory -- launcher, lib/, data/ --
+      # and not a package. Everything below turns that into one, by hand,
+      # because there is no `flutter build deb`.
+      #
+      # Depends is MEASURED, never written out from memory. dpkg-shlibdeps reads
+      # the NEEDED entries of the launcher and of every .so Flutter bundles and
+      # asks dpkg which package owns each one, which is exactly what a real
+      # Debian build does. A hand-guessed list is how you ship a .deb that
+      # installs cleanly and then dies on the first launch with a missing
+      # libgtk symbol -- the failure this whole step is shaped to avoid. The
+      # consequence to know: the answer describes THIS runner's distribution, so
+      # the package targets that release (Ubuntu's t64 ABI transition renamed
+      # half these packages, so a .deb built here will refuse to install on
+      # Ubuntu 22.04 or Debian 12 rather than install and break). Building for
+      # an older target means building on an older container, not editing the
+      # list by hand.
+      - name: Build the .deb
+        shell: bash
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Every mode in the package comes from this process's umask. The
+          # runner's default is already 022; stating it means the package does
+          # not change shape because an image did.
+          umask 022
+
+          pkgname=vpn-stack-app
+          bundle=build/linux/x64/release/bundle
+          [ -d "$bundle" ] || { echo "no bundle at $bundle -- the Linux output layout moved" >&2; exit 1; }
+          bundle=$(realpath "$bundle")
+
+          # The bundle root holds exactly one executable file, named after the
+          # project by CMake. Find it rather than restate the name here, where a
+          # rename would go unnoticed until the .desktop entry pointed at
+          # nothing.
+          mapfile -t bins < <(find "$bundle" -maxdepth 1 -type f -executable -printf '%f\n')
+          [ "${#bins[@]}" -eq 1 ] || { echo "expected one executable at the bundle root, found: ${bins[*]:-none}" >&2; exit 1; }
+          binary=${bins[0]}
+
+          version=$(awk '/^version:/ {print $2; exit}' pubspec.yaml)
+          [ -n "$version" ] || { echo "no version: in pubspec.yaml" >&2; exit 1; }
+          arch=$(dpkg --print-architecture)
+
+          # Stage into debian/<package>/, where a real Debian build stages,
+          # because dpkg-shlibdeps resolves the launcher's $ORIGIN RPATH
+          # relative to the root of that tree -- and $ORIGIN/lib is exactly
+          # where Flutter puts its private libraries. Run it over the loose
+          # bundle instead and it says so ("the corresponding directory could
+          # not be identified due to lack of DEBIAN sub-directory"), losing its
+          # only way to tell that libflutter_linux_gtk.so ships inside this very
+          # package rather than being a dependency it failed to find.
+          work=$(mktemp -d)
+          root=$work/debian/$pkgname
+          libdir=usr/lib/$pkgname
+          install -d -m 0755 "$root/DEBIAN" "$root/$libdir" "$root/usr/bin" "$root/usr/share/applications"
+          cp -r "$bundle"/. "$root/$libdir/"
+          # mktemp -d is 0700 whatever the umask, and this directory becomes the
+          # package's "/" entry -- unfixed, the mode rides into the .deb.
+          chmod 0755 "$root"
+          find "$root/usr" -type d -exec chmod 0755 {} +
+
+          # A symlink and not a wrapper script: the launcher locates data/ and
+          # lib/ from /proc/self/exe, which resolves through the symlink to the
+          # real directory. A copy in /usr/bin would find neither.
+          ln -s "/$libdir/$binary" "$root/usr/bin/$pkgname"
+
+          # dpkg-shlibdeps refuses to do anything outside a source package, so
+          # give it the smallest debian/control that parses. --ignore-missing-info
+          # is required because the bundled libflutter_linux_gtk.so belongs to no
+          # package and would otherwise be a hard error rather than a warning;
+          # -l puts it on the search path so the libraries IT needs still
+          # resolve.
+          cat > "$work/debian/control" <<EOF
+          Source: $pkgname
+          Maintainer: vpn-stack <$REPO_URL>
+
+          Package: $pkgname
+          Architecture: $arch
+          EOF
+          depends=$(cd "$work" && dpkg-shlibdeps -O --ignore-missing-info \
+            -l"debian/$pkgname/$libdir/lib" \
+            "debian/$pkgname/$libdir/$binary" "debian/$pkgname/$libdir"/lib/*.so \
+            | sed -n 's/^shlibs:Depends=//p')
+          [ -n "$depends" ] || { echo "dpkg-shlibdeps computed no Depends; refusing to ship a package that claims it needs nothing" >&2; exit 1; }
+
+          cat > "$root/usr/share/applications/$pkgname.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=VPN Stack
+          Comment=Provision a server and connect to it
+          Exec=/usr/bin/$pkgname
+          Terminal=false
+          Categories=Network;
+          EOF
+
+          # Maintainer is the repository, deliberately: this is built by CI from
+          # a public tree and there is no person to mail about it.
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: $pkgname
+          Version: $version
+          Section: net
+          Priority: optional
+          Architecture: $arch
+          Depends: $depends
+          Installed-Size: $(du -ks "$root/usr" | cut -f1)
+          Maintainer: vpn-stack <$REPO_URL>
+          Homepage: $REPO_URL
+          Description: Client for the vpn-stack CLI
+           Provisions a server over SSH and connects to it. Talks to vpnctl
+           through its --json interface; implements none of the server itself.
+           This build is unsigned.
+          EOF
+
+          # --root-owner-group: without it every path in the package is owned by
+          # the runner's uid, which dpkg then installs as-is.
+          deb="$PWD/build/${pkgname}_${version}_${arch}.deb"
+          dpkg-deb --root-owner-group --build "$root" "$deb"
+          # Echoed so a failure email, or a doubt about Depends, is answerable
+          # from the log without downloading anything.
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: app/build/*.deb
+          if-no-files-found: error

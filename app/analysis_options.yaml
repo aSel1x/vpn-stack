@@ -1,0 +1,15 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-raw-types: true
+  errors:
+    # An unawaited future in provisioning means a step reporting success before
+    # it finished, which is the failure mode this whole layer exists to avoid.
+    unawaited_futures: error
+
+linter:
+  rules:
+    prefer_final_locals: true
+    avoid_print: true

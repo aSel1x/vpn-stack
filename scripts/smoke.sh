@@ -102,6 +102,48 @@ pool_fields() {
   printf '"xauth_net":%s,"xauth_net_source":%s' "$(json_str "$1")" "$(json_str "$2")"
 }
 
+# Which port sshd is actually reachable on, asked rather than assumed. This
+# check hardcoded 22, so on a box whose sshd listens on 2222 it announced an
+# imminent lockout on a firewall that is exactly right -- the same shape of bug
+# as the IKEv2 pool constant in the check below. Emits "ports|provenance": an
+# assumed 22 must not read as an observed answer.
+ssh_ports() {
+  local p out bin
+  # The port this session came in on. Nothing is more direct: it is the port
+  # that has to keep working, and it just demonstrably did.
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    p=$(awk '{print $4}' <<< "$SSH_CONNECTION")
+    [[ "$p" =~ ^[0-9]+$ ]] && { printf '%s|the port this session arrived on' "$p"; return; }
+  fi
+  # Run from the console instead. `sshd -T` is the *effective* config, so a Port
+  # in an Include or an sshd_config.d drop-in counts and grepping sshd_config
+  # sees neither. Every port it names, not the first: one sshd answers on and
+  # ufw drops is a lockout waiting for whoever uses that one.
+  bin=$(command -v sshd || true); [[ -n "$bin" ]] || bin=/usr/sbin/sshd
+  if [[ -x "$bin" ]]; then
+    out=$("$bin" -T 2>/dev/null | awk '$1=="port" && $2 ~ /^[0-9]+$/ {print $2}' | sort -un | tr '\n' ' ')
+    out=${out% }
+    [[ -n "$out" ]] && { printf '%s|sshd -T' "$out"; return; }
+    printf '22|sshd -T unreadable, assuming the default'; return
+  fi
+  # No sshd at all: a box administered from its console has no ssh access to be
+  # locked out of, and a false alarm here teaches people to ignore smoke tests.
+  printf '|no sshd on this box'
+}
+
+# The port query's answer as fields, for the same reason the pool's is: a caller
+# has to be able to see that 22 was a guess without parsing a sentence.
+ssh_fields() {
+  printf '"ssh_ports":%s,"ssh_ports_source":%s' "$(json_str "$1")" "$(json_str "$2")"
+}
+
+# `ufw allow 2222/tcp` prints "2222/tcp", `ufw allow 2222` prints a bare "2222",
+# and each has a "(v6)" twin. Matching one form only would call a firewall that
+# allows ssh perfectly well a lockout.
+ufw_allows_tcp() {
+  ufw status 2>/dev/null | grep -qE "^$1(/tcp)?( \(v6\))?[[:space:]]+ALLOW"
+}
+
 echo "== rendered config =="
 [[ -L "$STATE/rendered" ]] && ok rendered_symlink "rendered is a symlink -> $(readlink "$STATE/rendered")" \
                            || bad rendered_symlink "$STATE/rendered is not a symlink (promotion never ran)"
@@ -152,8 +194,27 @@ fi
 echo "== firewall =="
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ok ufw_active "ufw active"
-  ufw status 2>/dev/null | grep -qE '^22/tcp\s+ALLOW' && ok ufw_ssh_allowed "22/tcp still allowed" \
-                                                      || bad ufw_ssh_allowed "22/tcp NOT allowed -- you are about to be locked out"
+  # Still named ufw_ssh_allowed, and still exists so nobody enables a firewall
+  # that locks them out. What changed is that it asks which port that is: the
+  # app provisions boxes whose sshd is on 2222 and opens 2222, and this check
+  # then failed at the last step of nine on a server that was serving perfectly.
+  SSHINFO=$(ssh_ports); SSHP=${SSHINFO%%|*}; SSHSRC=${SSHINFO#*|}
+  if [[ -z "$SSHP" ]]; then
+    ok ufw_ssh_allowed "$SSHSRC; no ssh access to lock out of" "$(ssh_fields "" "$SSHSRC")"
+  else
+    read -ra want <<< "$SSHP"
+    allowed=""; blocked=""
+    for p in "${want[@]}"; do
+      if ufw_allows_tcp "$p"; then allowed="${allowed:+$allowed }$p/tcp"
+      else blocked="${blocked:+$blocked }$p/tcp"; fi
+    done
+    if [[ -z "$blocked" ]]; then
+      ok ufw_ssh_allowed "$allowed still allowed ($SSHSRC)" "$(ssh_fields "$SSHP" "$SSHSRC")"
+    else
+      bad ufw_ssh_allowed "$blocked NOT allowed ($SSHSRC) -- you are about to be locked out" \
+          "$(ssh_fields "$SSHP" "$SSHSRC")"
+    fi
+  fi
 else
   bad ufw_active "ufw is not active"
 fi
