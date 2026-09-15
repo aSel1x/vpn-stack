@@ -150,7 +150,7 @@ interface LibboxPlatform : PlatformInterface {
 
     /**
      * procfs is readable by an app only before Android 10; after that
-     * `/proc/net/*` is filtered and a search there finds nothing, which libbox
+     * the `/proc/net` files are filtered and a search there finds nothing, which libbox
      * would report as "not found" rather than as "unavailable".
      */
     override fun useProcFS(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q

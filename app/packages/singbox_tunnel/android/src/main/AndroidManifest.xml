@@ -20,15 +20,15 @@
 
     <!-- Android kills a VpnService that is not in the foreground. From API 34 a
          foreground service must also declare a type, and the type for a VPN is
-         systemExempted -- an app that is the active VPN is exempt by the platform,
+         systemExempted — an app that is the active VPN is exempt by the platform,
          which is why there is no FOREGROUND_SERVICE_TYPE_VPN. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
 
     <!-- From API 33 the ongoing notification is not shown without this, and it is
          a runtime permission: the HOST APP has to request it. Without it the
-         service still runs and the tunnel still works -- the user just has no
-         visible handle on it -- so nothing here treats it as fatal. -->
+         service still runs and the tunnel still works — the user just has no
+         visible handle on it — so nothing here treats it as fatal. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application>
