@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import 'transport/dartssh2_transport.dart';
 import 'tunnel/tunnel.dart';
 import 'tunnel/unimplemented_tunnel.dart';
 import 'ui/app.dart';
@@ -33,17 +34,20 @@ void main() {
       // No explicit element type: SingleChildWidget reaches provider.dart
       // through a re-export, and inference does not need it named.
       providers: [
-        // The one thing nothing implements: SSH itself. control/ and
-        // provision/ are complete and take their transport injected, so this
-        // is the single object that stands between this app and a real server.
+        // SSH itself. control/ and provision/ are complete and take their
+        // transport injected, so this one object is what stands between this
+        // app and a real server.
         //
-        // Whatever replaces it inherits one obligation that is not optional:
-        // `SshConnector.connect` is handed a HostKeyPolicy and must apply it
-        // during the key exchange, before authentication. dartssh2 accepts any
-        // host key when `onVerifyHostKey` is not supplied, and this app asks
-        // for a root password on its second screen. `ui/access.dart` decides
-        // the policy; honouring it is the transport's half.
-        Provider<SshTransport>.value(value: const MissingSshTransport()),
+        // It carries one obligation that is not optional:
+        // `SshConnector.connect` is handed a HostKeyPolicy and applies it
+        // during the key exchange, before authentication -- dartssh2 accepts
+        // any host key when `onVerifyHostKey` is not supplied, and this app
+        // asks for a root password on its second screen. `ui/access.dart`
+        // decides the policy; honouring it is `transport/`'s half.
+        //
+        // `MissingSshTransport` stays in the tree as the honest fallback for a
+        // platform where this one cannot run, and nothing wires it.
+        Provider<SshTransport>.value(value: const Dartssh2Transport()),
         Provider<FileSaver>.value(value: const MissingFileSaver()),
         ChangeNotifierProvider<ServersModel>(
           create: (_) => ServersModel(store)..load(),

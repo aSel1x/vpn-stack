@@ -11,19 +11,22 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # Pure Dart SSH, so provision/ and control/ run unchanged on all six targets
-  # and need no platform channel.
+  # Pure Dart SSH, so provision/ and control/ run unchanged on every target
+  # and need no platform channel. `lib/transport/` is the only thing that
+  # imports it.
   #
-  # Nothing imports it yet -- `lib/ui/missing_backend.dart` is the placeholder
-  # that throws where the connection would be opened -- and it stays declared
-  # anyway. The lockfile is not committed: CI resolves this file and the first
-  # green run's pubspec.lock is what gets frozen. Leaving dartssh2 out until the
-  # transport lands would freeze a resolution that has never been shown to admit
-  # it, and move the conflict onto the branch trying to land the transport,
-  # after the versions are pinned. Resolving it now, while nothing is frozen, is
-  # where a conflict is cheap. Nothing else declares it, so `flutter pub get` is
-  # the only thing that reads this line.
-  dartssh2:
+  # Pinned exactly, and alone among these in being pinned. The security of this
+  # app rests on one parameter of one function -- `SSHClient.onVerifyHostKey`,
+  # which 4.1.0 calls from `SSHTransport._handleMessageKexReply` before it sends
+  # NEWKEYS and therefore before any credential -- and that was established by
+  # reading 4.1.0's source, not its documentation. pubspec.lock is not committed
+  # here, so an unpinned line means the version that ships is whatever pub.dev
+  # holds on the day CI runs, which is not the version anybody checked. 4.0.0
+  # was three days after 3.3.1 and moved `SSHClient.close()`'s return type and
+  # dropped three algorithm families, so the blast radius of a drift is not
+  # theoretical. Bumping it is a deliberate one-line commit whose review is
+  # re-reading that call site.
+  dartssh2: 4.1.0
   # SSH credentials and VPN credentials never go in plain preferences.
   flutter_secure_storage:
   provider:
@@ -33,10 +36,13 @@ dev_dependencies:
     sdk: flutter
   flutter_lints:
 
-# Versions are deliberately unpinned at this stage and resolved by CI, which is
+# The rest are deliberately unpinned at this stage and resolved by CI, which is
 # the only place this builds. A pinned version written by somebody who could not
 # run `flutter pub get` is a guess wearing a number; pubspec.lock from the first
-# green CI run is the honest place to freeze them.
+# green CI run is the honest place to freeze them. dartssh2 is the one exception
+# and the comment above says why: 4.1.0 is not a guess, it is the version whose
+# source was read to establish that no credential is sent before the host key is
+# checked, and that claim does not transfer to a version nobody has looked at.
 
 flutter:
   uses-material-design: true
