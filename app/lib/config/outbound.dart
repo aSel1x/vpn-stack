@@ -162,6 +162,7 @@ final class Hysteria2Outbound extends OutboundConfig {
     this.obfsType,
     this.obfsPassword,
     this.pinSha256,
+    this.spkiSha256,
   });
 
   /// The user's `hysteria2_password`, from the userinfo.
@@ -189,6 +190,16 @@ final class Hysteria2Outbound extends OutboundConfig {
   /// does not check. A UI that connects anyway should say this out loud.
   bool get pinUnenforced => pinSha256 != null;
 
+  /// `spki`: base64(SHA-256(SubjectPublicKeyInfo)), which sing-box CAN check.
+  ///
+  /// The certificate this server issues is self-signed, so it is in no trust
+  /// store and the only way to verify it is to pin it. `pinSHA256` hashes the
+  /// whole DER certificate and sing-box has no field for that; this hashes the
+  /// public key, which is exactly what `tls.certificate_public_key_sha256`
+  /// takes. Optional, because a link issued before the server emitted it has
+  /// none, and refusing those would strand every profile already handed out.
+  final String? spkiSha256;
+
   /// True when the emitted configuration accepts ANY server certificate.
   ///
   /// Separate from [pinUnenforced], which only fires when the link carried a
@@ -196,7 +207,8 @@ final class Hysteria2Outbound extends OutboundConfig {
   /// `tls.insecure` and used to report nothing at all -- the one quadrant the
   /// tests missed, and the dangerous one: anything that can reach the client's
   /// QUIC session gets it, with no warning shown anywhere.
-  bool get acceptsAnyCertificate => trust == Hysteria2Trust.anyCertificate;
+  bool get acceptsAnyCertificate =>
+      spkiSha256 == null && trust == Hysteria2Trust.anyCertificate;
 
   @override
   String get type => 'hysteria2';
@@ -221,7 +233,14 @@ final class Hysteria2Outbound extends OutboundConfig {
         'tls': <String, Object?>{
           'enabled': true,
           'server_name': serverName,
-          if (trust == Hysteria2Trust.anyCertificate) 'insecure': true,
+          // Pin the public key when the link carried one: a self-signed
+          // certificate is in no trust store, so this is the only check that
+          // means anything, and it makes `insecure` unnecessary rather than
+          // merely unset.
+          if (spkiSha256 != null)
+            'certificate_public_key_sha256': <String>[spkiSha256!],
+          if (spkiSha256 == null && trust == Hysteria2Trust.anyCertificate)
+            'insecure': true,
         },
       };
 }

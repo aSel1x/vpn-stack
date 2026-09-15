@@ -59,12 +59,24 @@ const List<List<String>> vlessShareParams = <List<String>>[
   <String>['headerType', 'none'],
 ];
 
+/// base64(SHA-256(SubjectPublicKeyInfo)) -- what `_spki_sha256()` produces in
+/// hysteria2.py's share(), and the only pin sing-box can check.
+const String certificateSpki = 'BzXhPQ2yVCkGDXK5dRJiTlIz3bMUwEZAfTZP1xhbQ0E=';
+
 /// Exactly the parameters hysteria2.py writes, in its order.
+///
+/// This list is transcribed by hand and nothing cross-checks it against the
+/// Python, which is the known weak point of these fixtures: add a parameter to
+/// share() and these tests stay green while every real link is refused, because
+/// the parser rejects parameters it does not know. `spki` is here because that
+/// happened -- the guard is now a test on the Python side asserting this exact
+/// name set, which fails and names this file.
 const List<List<String>> hysteria2ShareParams = <List<String>>[
   <String>['obfs', 'salamander'],
   <String>['obfs-password', obfsPassword],
   <String>['sni', hysteria2Sni],
   <String>['pinSHA256', certificatePin],
+  <String>['spki', certificateSpki],
 ];
 
 /// One share URI.

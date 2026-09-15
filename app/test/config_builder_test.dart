@@ -234,7 +234,10 @@ void main() {
         'tls': <String, Object?>{
           'enabled': true,
           'server_name': hysteria2Sni,
-          'insecure': true,
+          // The link carries `spki`, so the self-signed certificate is pinned
+          // by public key and there is nothing to downgrade. `insecure` is what
+          // this said before the server published a hash sing-box can check.
+          'certificate_public_key_sha256': <String>[certificateSpki],
         },
       });
       // Everything around the outbound is unchanged: that is the point of the

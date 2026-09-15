@@ -99,10 +99,15 @@ void main() {
     });
   });
 
-  group('the pin sing-box has no field for', () {
-    test('is kept on the model and never emitted', () {
-      final Hysteria2Outbound out = parseHysteria2Uri(hysteria2Uri(),
-          trust: Hysteria2Trust.systemRoots);
+  group('the pin sing-box has no field for, on a link that predates spki', () {
+    // These describe a link issued before share() emitted `spki`: pinSHA256
+    // alone, which sing-box has no field for. Every profile already handed out
+    // looks like this, which is why the parser still accepts it.
+    String legacy() => hysteria2Uri(change: <String, String?>{'spki': null});
+
+    test('the certificate pin is kept on the model and never emitted', () {
+      final Hysteria2Outbound out =
+          parseHysteria2Uri(legacy(), trust: Hysteria2Trust.systemRoots);
       expect(out.pinUnenforced, isTrue);
       final Map<String, Object?> tls =
           out.toJson()['tls']! as Map<String, Object?>;
@@ -111,8 +116,8 @@ void main() {
     });
 
     test('systemRoots emits no trust override at all', () {
-      final Map<String, Object?> tls = parseHysteria2Uri(hysteria2Uri(),
-                  trust: Hysteria2Trust.systemRoots)
+      final Map<String, Object?> tls =
+          parseHysteria2Uri(legacy(), trust: Hysteria2Trust.systemRoots)
               .toJson()['tls']! as Map<String, Object?>;
       expect(tls, <String, Object?>{
         'enabled': true,
@@ -121,14 +126,24 @@ void main() {
     });
 
     test('anyCertificate emits tls.insecure, which is the whole downgrade', () {
-      final Map<String, Object?> tls = parseHysteria2Uri(hysteria2Uri(),
-                  trust: Hysteria2Trust.anyCertificate)
+      final Map<String, Object?> tls =
+          parseHysteria2Uri(legacy(), trust: Hysteria2Trust.anyCertificate)
               .toJson()['tls']! as Map<String, Object?>;
       expect(tls, <String, Object?>{
         'enabled': true,
         'server_name': hysteria2Sni,
         'insecure': true,
       });
+    });
+
+    test('a current link needs none of this', () {
+      // The contrast is the point: with spki the same URI is verified, and the
+      // trust argument stops mattering.
+      final Map<String, Object?> tls =
+          parseHysteria2Uri(hysteria2Uri(), trust: Hysteria2Trust.anyCertificate)
+              .toJson()['tls']! as Map<String, Object?>;
+      expect(tls['certificate_public_key_sha256'], <String>[certificateSpki]);
+      expect(tls.containsKey('insecure'), isFalse);
     });
   });
 
@@ -217,6 +232,39 @@ void _regressions() {
         ),
         throwsA(isA<ShareUriException>()),
       );
+    });
+
+    test('a link carrying spki pins the public key and needs no trust decision',
+        () {
+      // The whole point of the server-side change: with a pin sing-box can
+      // check, there is no choice between failing the handshake and trusting
+      // anything. Both trust values must produce the same, verified config.
+      const String spki = 'BzXhPQ2yVCkGDXK5dRJiTlIz3bMUwEZAfTZP1xhbQ0E=';
+      for (final Hysteria2Trust trust in Hysteria2Trust.values) {
+        final Hysteria2Outbound out = parseHysteria2Uri(
+          'hysteria2://pw@203.0.113.10:20443?sni=www.bing.com&spki=$spki#kate',
+          trust: trust,
+        );
+        expect(out.spkiSha256, spki);
+        expect(out.acceptsAnyCertificate, isFalse,
+            reason: 'a pinned key is checked, whatever the trust setting says');
+        final Map<String, Object?> tls =
+            out.toJson()['tls']! as Map<String, Object?>;
+        expect(tls['certificate_public_key_sha256'], <String>[spki]);
+        expect(tls.containsKey('insecure'), isFalse,
+            reason: 'insecure is what you emit when you cannot verify; here we can');
+      }
+    });
+
+    test('a link from before the server emitted spki still parses', () {
+      // Every profile already handed out lacks it. Refusing those would strand
+      // them, so it is optional and the old trust decision still applies.
+      final Hysteria2Outbound out = parseHysteria2Uri(
+        'hysteria2://pw@203.0.113.10:20443?sni=www.bing.com&pinSHA256=AA:BB#kate',
+        trust: Hysteria2Trust.anyCertificate,
+      );
+      expect(out.spkiSha256, isNull);
+      expect(out.acceptsAnyCertificate, isTrue);
     });
 
     test('a bracketed IPv6 authority still works', () {

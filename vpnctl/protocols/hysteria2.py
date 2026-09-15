@@ -8,7 +8,9 @@ the config loader while still being inside the one mount.
 
 from __future__ import annotations
 
+import base64
 import datetime
+import hashlib
 import json
 import secrets as pysecrets
 from urllib.parse import quote
@@ -72,6 +74,31 @@ def _fingerprint(cert_pem: bytes) -> str:
     return ":".join(f"{b:02X}" for b in digest)
 
 
+def _spki_sha256(cert_pem: bytes) -> str:
+    """base64(SHA-256(SubjectPublicKeyInfo)), which is what sing-box can check.
+
+    `pinSHA256` above is the hysteria2 convention and hashes the whole DER
+    certificate; sing-box's only pinning field is
+    `tls.certificate_public_key_sha256`, which hashes the public KEY and encodes
+    it base64. Different preimage, different encoding, not convertible from one
+    to the other -- so a client built on sing-box could do nothing with the pin
+    this server had been publishing for years, and its two options were to fail
+    the handshake or to accept any certificate at all.
+
+    Both are emitted. Other clients read `pinSHA256` and ignore what they do not
+    know; sing-box clients read this one. Neither is a secret: it is a hash of a
+    public key, and the certificate it belongs to is presented to anyone who
+    connects.
+    """
+    cert = load_pem_x509_certificate(cert_pem)
+    spki = cert.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    digest = hashlib.sha256(spki).digest()
+    return base64.b64encode(digest).decode()
+
+
 def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
     # Self-signed, so the client pins it by fingerprint -- recomputed here
     # rather than stored, for the same reason as the REALITY public key.
@@ -79,6 +106,7 @@ def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
         f"hysteria2://{user.hysteria2_password}@{host}:{PORT}"
         f"?obfs=salamander&obfs-password={secrets.text('hysteria2.obfs')}"
         f"&sni={MASQUERADE}&pinSHA256={_fingerprint(secrets.raw('hysteria2.crt'))}"
+        f"&spki={quote(_spki_sha256(secrets.raw('hysteria2.crt')))}"
         f"#{quote(user.name)}"
     )
     return [ShareItem(label="Hysteria2", filename=None, uri=uri)]

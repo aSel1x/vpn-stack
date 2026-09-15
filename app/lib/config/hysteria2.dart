@@ -5,8 +5,11 @@
 //   hysteria2://<password>@<host>:20443?obfs=salamander
 //     &obfs-password=<hex>&sni=<masquerade>&pinSHA256=<AA:BB:...>#<name>
 //
-// `pinSHA256` cannot be translated. See [Hysteria2Trust] for exactly why, and
-// for the choice this parser makes the caller state instead of guessing.
+// `pinSHA256` cannot be translated -- see [Hysteria2Trust] for exactly why.
+// `spki` can: it is base64(SHA-256(SubjectPublicKeyInfo)), which is what
+// sing-box's `tls.certificate_public_key_sha256` takes, and share() emits it
+// alongside the old pin for exactly that reason. A link that has it needs no
+// trust decision at all; one issued before the server emitted it still does.
 
 import 'outbound.dart';
 import 'share_uri.dart';
@@ -18,6 +21,7 @@ const Set<String> _known = <String>{
   'obfs-password',
   'sni',
   'pinSHA256',
+  'spki',
 };
 
 /// Parses one `hysteria2://` share link. Pure.
@@ -69,5 +73,6 @@ Hysteria2Outbound parseHysteria2Uri(
     obfsType: obfsType,
     obfsPassword: obfsPassword,
     pinSha256: parts.params['pinSHA256'],
+    spkiSha256: parts.params['spki'],
   );
 }

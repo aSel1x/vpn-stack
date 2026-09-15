@@ -117,6 +117,81 @@ def test_hysteria2_uri_pins_the_certificate_it_renders(secrets) -> None:
     assert len(pin.split(":")) == 32  # SHA-256, colon-separated hex
 
 
+def test_hysteria2_uri_also_pins_the_public_key_for_sing_box(secrets) -> None:
+    """The pin a sing-box client can actually check.
+
+    `pinSHA256` hashes the whole DER certificate, which is the hysteria2
+    convention; sing-box's only pinning field hashes the public KEY and encodes
+    it base64. Not convertible, so a client built on sing-box could do nothing
+    with the pin this server published and had to choose between failing the
+    handshake and trusting any certificate. Both are emitted now.
+    """
+    import base64
+    import hashlib
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.x509 import load_pem_x509_certificate
+
+    (item,) = hysteria2.share(secrets, make_user("alice"), HOST)
+    spki = parse_qs(urlparse(item.uri).query)["spki"][0]
+
+    cert = load_pem_x509_certificate(secrets.raw("hysteria2.crt"))
+    expected = base64.b64encode(
+        hashlib.sha256(
+            cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).digest()
+    ).decode()
+    assert spki == expected
+    assert len(base64.b64decode(spki)) == 32
+    # It is a hash of a public key. Asserting it is not the certificate hash
+    # guards the mistake that would make it useless: emitting the same bytes
+    # twice under two names.
+    assert spki != hysteria2._fingerprint(secrets.raw("hysteria2.crt"))
+
+
+# The app's parser REFUSES a parameter it does not know (app/lib/config/
+# hysteria2.dart and vless_reality.dart each keep a `_known` set), so adding one
+# here without adding it there makes every link unimportable -- and the app's
+# fixtures are transcribed by hand, so its tests stay green while the product
+# breaks. These two assertions are the cross-reference: change share() and they
+# fail, naming the file to change with it.
+def test_the_parameter_names_hysteria2_emits_are_the_ones_the_app_knows(
+    secrets,
+) -> None:
+    (item,) = hysteria2.share(secrets, make_user("alice"), HOST)
+    assert set(parse_qs(urlparse(item.uri).query)) == {
+        "obfs",
+        "obfs-password",
+        "sni",
+        "pinSHA256",
+        "spki",
+    }, (
+        "update `_known` in app/lib/config/hysteria2.dart and the fixture in app/test/config_fakes.dart"
+    )
+
+
+def test_the_parameter_names_vless_emits_are_the_ones_the_app_knows(
+    secrets,
+) -> None:
+    (item,) = vless_reality.share(secrets, make_user("alice"), HOST)
+    assert set(parse_qs(urlparse(item.uri).query)) == {
+        "encryption",
+        "flow",
+        "security",
+        "sni",
+        "fp",
+        "pbk",
+        "sid",
+        "type",
+        "headerType",
+    }, (
+        "update `_known` in app/lib/config/vless_reality.dart and the fixture in app/test/config_fakes.dart"
+    )
+
+
 def test_hysteria2_private_key_never_reaches_a_share_link(secrets) -> None:
     (item,) = hysteria2.share(secrets, make_user("alice"), HOST)
     assert "PRIVATE KEY" not in item.uri
