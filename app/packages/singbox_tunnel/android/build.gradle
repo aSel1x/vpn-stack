@@ -91,16 +91,28 @@ if (!libbox.exists()) {
     )
 }
 
-repositories {
-    // AGP refuses `implementation files('x.aar')` in a LIBRARY module outright:
-    // "Direct local .aar file dependencies are not supported when building an
-    // AAR", because the classes and the packaged libgojni.so would not make it
-    // into the resulting AAR. sing-box-for-android does exactly that and gets
-    // away with it only because its module is an application, not a library --
-    // and a Flutter plugin is a library by construction. A flatDir repository is
-    // the supported shape for the same file.
-    flatDir {
-        dirs "libs"
+// Declared on EVERY project, not just this one.
+//
+// Two separate constraints meet here. AGP refuses `implementation files('x.aar')`
+// in a LIBRARY module outright -- "Direct local .aar file dependencies are not
+// supported when building an AAR" -- because the classes and the packaged
+// libgojni.so would not end up in the resulting AAR. sing-box-for-android does
+// exactly that and gets away with it only because its module is an application,
+// and a Flutter plugin is a library by construction. So: a flatDir repository.
+//
+// But a repository declared only here is invisible to `:app`, which is the
+// project that actually resolves the runtime classpath. Declaring it on this
+// module alone configured cleanly, compiled the Kotlin, and then failed at
+// :app:mergeReleaseNativeLibs with `Could not find :libbox:, required by
+// project ':app' > project :singbox_tunnel` -- the .so had nowhere to come from.
+// Repositories are not inherited across projects, so it has to be injected into
+// all of them, with an absolute path because `dirs` resolves against whichever
+// project is being configured.
+rootProject.allprojects {
+    repositories {
+        flatDir {
+            dirs "${project(':singbox_tunnel').projectDir}/libs"
+        }
     }
 }
 
