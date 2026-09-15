@@ -8,6 +8,12 @@ analyzer:
     # An unawaited future in provisioning means a step reporting success before
     # it finished, which is the failure mode this whole layer exists to avoid.
     unawaited_futures: error
+  # Added by `flutter analyze` itself, which rewrites this file to exclude
+  # generated output. Committed rather than reverted: it is what the tool does
+  # on every run, so leaving it out means an unexplained diff appears in
+  # somebody's working tree every time they analyze.
+  exclude:
+    - build/**
 
 linter:
   rules:
