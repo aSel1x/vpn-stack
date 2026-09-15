@@ -236,12 +236,65 @@ jobs:
 
   android:
     name: Android APK
-    needs: check
+    # libbox as well as check. app/packages/singbox_tunnel's Gradle module
+    # refuses to configure without android/libs/libbox.aar, deliberately, and
+    # its build.gradle says why: with the library absent the module still
+    # compiles, still registers its channels and still produces an APK, which
+    # then dies at the first connect with a ClassNotFoundException thrown from
+    # inside a Go callback. The only place that .aar exists is the artifact the
+    # libbox job uploads -- sing-box publishes none, and it is gitignored here
+    # because it is 60 MB of built Go in a public repository.
+    #
+    # THE OTHER FOUR PLATFORM JOBS DELIBERATELY DO NOT LIST IT. None of them
+    # links a Go library: iOS wants Libbox.xcframework, which is a separate
+    # build nobody has written, and the desktops want a privileged helper. A
+    # Windows runner queued behind a nine-minute NDK build it never reads from
+    # is how a CI turns into something people skip.
+    needs: [check, libbox]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      # Straight into the directory the plugin reads -- `file("libs/libbox.aar")`
+      # in app/packages/singbox_tunnel/android/build.gradle, resolved against
+      # that module -- rather than into a staging directory and a copy, so there
+      # is one path to get wrong instead of two.
+      #
+      # `path:` is workspace-relative and therefore says app/:
+      # `defaults.run.working-directory` governs `run` steps and not an action's
+      # inputs, which is why every upload step in this file spells it the same
+      # way and the `run` steps below do not.
+      #
+      # Before the toolchain installs: a wrong artifact name is cheaper to
+      # discover ahead of two SDK downloads than behind them.
+      - name: Download libbox ${{ needs.libbox.outputs.version }}
+        uses: actions/download-artifact@v4
+        with:
+          name: libbox-${{ needs.libbox.outputs.version }}
+          path: app/packages/singbox_tunnel/android/libs
+
+      # The plugin's own missing-file message ends with "no job downloads it
+      # into this directory yet. Wire that up", which was true when it was
+      # written and is not this file's to edit. A download that lands half a
+      # directory off would therefore fail with an instruction to do the thing
+      # that has just been done -- so assert the exact path here, where the
+      # artifact name is still in scope.
+      #
+      # libbox-legacy.aar (the -androidapi 21 variant) rides along in the same
+      # artifact and is left where it lands: build.gradle names libbox.aar
+      # explicitly rather than globbing libs/, so nothing links the second file,
+      # and deleting it here would be one more thing to revisit the day the
+      # plugin's floor moves.
+      - name: Check the .aar landed where Gradle looks for it
+        run: |
+          set -euo pipefail
+          # find and not ls: if the artifact ever gains a directory level the
+          # listing still shows where the file really is, which is the only
+          # question worth answering when the test below fails.
+          find packages/singbox_tunnel/android/libs -type f -printf '%10s  %p\n'
+          test -s packages/singbox_tunnel/android/libs/libbox.aar
 
       # Gradle uses whatever JAVA_HOME the runner image happens to set, and that
       # moves with the image. Pin it: AGP in the current template needs 17+, and
@@ -274,6 +327,17 @@ jobs:
       - name: Generate android/
         run: flutter create --platforms=android --project-name vpn_stack_app --org io.github.asel1x .
 
+      # No minSdk edit here, and that was checked rather than assumed. The
+      # plugin declares minSdk 24 because libbox is built `-androidapi 24`, and
+      # the manifest merger refuses outright when a library's floor is above the
+      # app module's -- but Flutter raised its own Android minimum from 21 to 24
+      # in 3.35, and 3.47 lists "Supported: 24 to 37, Unsupported: 23 and
+      # earlier" (docs.flutter.dev/reference/supported-platforms), so the
+      # `minSdk = flutter.minSdkVersion` that `flutter create` writes above is
+      # already 24. Nothing patches a generated file. If this step ever fails
+      # with "uses-sdk:minSdkVersion N cannot be smaller than version 24
+      # declared in library", that is the number that moved, and the fix is one
+      # of the two floors, not a sed over scaffolding.
       - name: flutter build apk --release
         run: flutter build apk --release
 

@@ -1,0 +1,33 @@
+name: singbox_tunnel
+description: >-
+  sing-box on Android for the vpn-stack client: a VpnService that hands its TUN
+  file descriptor to libbox, behind the app's TunnelController interface.
+publish_to: none
+version: 0.1.0
+
+environment:
+  # Matches app/pubspec.yaml exactly. A package that admits an older SDK than
+  # the app it ships inside is a constraint nobody checks.
+  sdk: ^3.13.0
+  flutter: ">=3.47.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      # Android only, and deliberately not `ios:` or the desktops. Declaring a
+      # platform here makes Flutter look for an implementation and fail the
+      # build when there is none; an empty iOS stub would be worse than the
+      # absence, because it would register a channel that answers nothing. iOS
+      # is NEPacketTunnelProvider plus Libbox.xcframework and is a separate
+      # piece of work (app/README.md has the App Store gate on it too).
+      android:
+        package: io.github.asel1x.singbox_tunnel
+        pluginClass: SingboxTunnelPlugin

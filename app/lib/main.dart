@@ -1,8 +1,12 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:singbox_tunnel/singbox_tunnel.dart';
+
+import 'config/config.dart';
 import 'package:provider/provider.dart';
 
 import 'transport/dartssh2_transport.dart';
-import 'tunnel/tunnel.dart';
 import 'tunnel/unimplemented_tunnel.dart';
 import 'ui/app.dart';
 import 'ui/missing_backend.dart';
@@ -22,12 +26,38 @@ void main() {
 
   final ServerStore store = SecureServerStore();
 
-  // The only tunnel engine there is, and it connects to nothing. It reports
-  // failure with a sentence naming the platform and the missing artifact, and
-  // it never reports connected -- a stub that showed "Connected" would be
-  // indistinguishable from a working app, and somebody would route their
-  // traffic through it believing that.
-  final TunnelController tunnel = UnimplementedTunnel();
+  // The engine. Android only for now: singbox_tunnel implements VpnService and
+  // libbox, and there is no iOS or desktop half yet -- iOS needs
+  // Libbox.xcframework and each desktop needs a privileged helper, because a TUN
+  // device is not something an unprivileged process opens.
+  //
+  // Everywhere else this stays the stub, which reports failure naming the
+  // platform and the missing artifact and never reports connected. A stub that
+  // showed "Connected" would be indistinguishable from a working app, and
+  // somebody would route their traffic through it believing that.
+  //
+  // The builder is where the two halves meet: singbox_tunnel deliberately does
+  // not know the configuration format -- importing lib/config/ from the package
+  // would be the app -> package -> app cycle -- so the app supplies it, and
+  // lib/config/ stays the single definition of what a share URI becomes.
+  final TunnelController tunnel = Platform.isAndroid
+      ? SingboxTunnel((TunnelProfile profile) => encodeSingBoxConfig(
+            buildSingBoxConfig(
+              outbound: selectOutbound(
+                profile.importUris,
+                // Never silently accept any certificate. The config layer
+                // refuses to pick this for the caller, and the caller is here.
+                // Since share() started publishing `spki`, a current Hysteria2
+                // link is pinned by public key and this argument does not come
+                // into it; a link issued before that will fail the handshake,
+                // which is the honest outcome. The alternative -- anyCertificate
+                // -- turns "this certificate" into "some TLS", and an app that
+                // does that quietly is worse than one that fails loudly.
+                hysteria2Trust: Hysteria2Trust.systemRoots,
+              ),
+            ),
+          ))
+      : UnimplementedTunnel();
 
   runApp(
     MultiProvider(
