@@ -148,8 +148,11 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      # working-directory defaults to app/ for the whole workflow; compose.yml is
+      # at the repository root, which is why this one step overrides it.
       - name: Read the sing-box version the server runs
         id: pin
+        working-directory: .
         run: |
           set -euo pipefail
           version=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
@@ -174,6 +177,7 @@ jobs:
 
       - name: Install the Android NDK
         if: steps.cached.outputs.cache-hit != 'true'
+        working-directory: .
         run: |
           set -euo pipefail
           sdkmanager --install "ndk;27.2.12479018" >/dev/null
@@ -181,6 +185,7 @@ jobs:
 
       - name: Build libbox from sing-box ${{ steps.pin.outputs.version }}
         if: steps.cached.outputs.cache-hit != 'true'
+        working-directory: .
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "${{ steps.pin.outputs.version }}" \
@@ -196,6 +201,7 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/libbox-out/"
 
       - name: Fail if nothing was produced
+        working-directory: .
         run: |
           set -euo pipefail
           # A cache hit that restored an empty directory looks like success and
