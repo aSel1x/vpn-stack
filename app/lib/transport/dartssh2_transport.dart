@@ -196,6 +196,22 @@ class Dartssh2Connector implements SshConnector {
   }
 
   /// The private key, parsed, or null for a password credential.
+  /// Does the PEM text itself say it is encrypted?
+  ///
+  /// Guarded, because this is called from inside a catch block and
+  /// `isEncryptedPem` parses: on text that is not a PEM at all it throws, and
+  /// an exception raised while handling one replaces it -- which turned two
+  /// credential failures into whatever dartssh2 threw second. Unparseable is
+  /// not encrypted; claiming otherwise sends somebody hunting for a passphrase
+  /// that does not exist.
+  bool _declaresEncryption(String pem) {
+    try {
+      return SSHKeyPair.isEncryptedPem(pem);
+    } on Object {
+      return false;
+    }
+  }
+
   List<SSHIdentity>? _identities() {
     final SshCredential given = credential;
     if (given is! SshPrivateKey) {
@@ -218,7 +234,7 @@ class Dartssh2Connector implements SshConnector {
       // actually being asked.
       throw SshCredentialUnusable(
         target: target,
-        encrypted: SSHKeyPair.isEncryptedPem(given.pem),
+        encrypted: _declaresEncryption(given.pem),
         cause: error,
       );
     }
