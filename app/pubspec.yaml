@@ -36,13 +36,22 @@ dev_dependencies:
     sdk: flutter
   flutter_lints:
 
-# The rest are deliberately unpinned at this stage and resolved by CI, which is
-# the only place this builds. A pinned version written by somebody who could not
-# run `flutter pub get` is a guess wearing a number; pubspec.lock from the first
-# green CI run is the honest place to freeze them. dartssh2 is the one exception
-# and the comment above says why: 4.1.0 is not a guess, it is the version whose
-# source was read to establish that no credential is sent before the host key is
-# checked, and that claim does not transfer to a version nobody has looked at.
+# The rest carry no constraint here and are frozen by pubspec.lock, which IS
+# committed. That was the plan -- freeze from the first green run -- and then the
+# gap between plan and practice cost a red build on a tree nobody had touched:
+# objective_c 9.6.1, pulled in transitively by flutter_secure_storage and
+# published between two runs, has a build hook calling `Architecture.arm64e`,
+# which the Dart SDK in Flutter 3.47.4 does not define. No constraint written
+# here could have avoided it -- objective_c declares `sdk: >=3.10.0 <4.0.0`, so
+# pub is right to pick it and the package is wrong about what it needs. Only a
+# lock helps, and the one in the tree is the last green run's own artifact
+# rather than something generated on a machine with no Dart toolchain.
+#
+# dartssh2 is pinned in the file as well as in the lock, and the comment above
+# says why: 4.1.0 is the version whose source was read to establish that no
+# credential is sent before the host key is checked. That claim does not
+# transfer to a version nobody has looked at, so it belongs where a human
+# editing dependencies will see it.
 
 flutter:
   uses-material-design: true
