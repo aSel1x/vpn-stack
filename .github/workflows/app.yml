@@ -50,6 +50,12 @@ on:
     paths:
       - 'app/**'
       - '.github/workflows/app.yml'
+      # compose.yml pins the sing-box the SERVER runs, and the libbox job builds
+      # the client library from that same version. Without this line, bumping the
+      # server's engine leaves the client linked against the old one and nothing
+      # rebuilds -- the drift is invisible until a config parses on one side and
+      # not the other.
+      - 'compose.yml'
   workflow_dispatch:
 
 permissions:
@@ -120,6 +126,89 @@ jobs:
 
       - name: flutter test
         run: flutter test
+
+  # sing-box's Android library is not published anywhere: the v1.14.0 release
+  # carries 167 assets and not one .aar, so it has to be built from source with
+  # SagerNet's gomobile fork. That is a Go toolchain plus an NDK, which is why it
+  # is its own job and cached on the version rather than rebuilt for every commit
+  # to a Dart file.
+  #
+  # The version is the SERVER's. compose.yml pins ghcr.io/sagernet/sing-box, and
+  # a client built against a different minor parses a config the server's own
+  # `check.sh` validated and then fails on the device -- the same drift
+  # scripts/check.sh avoids by reading the tag out of compose.yml instead of
+  # restating it. This job reads it from there too.
+  libbox:
+    name: libbox.aar (sing-box for Android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Read the sing-box version the server runs
+        id: pin
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
+          [ -n "$version" ] || { echo "no sing-box image pin in compose.yml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "server runs sing-box $version"
+
+      - name: Restore a previously built libbox
+        id: cached
+        uses: actions/cache@v4
+        with:
+          path: libbox-out
+          key: libbox-${{ steps.pin.outputs.version }}-api24-gomobile0.1.13
+
+      - name: Install Go
+        if: steps.cached.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain refuses
+          # the module outright.
+          go-version: '1.25.5'
+
+      - name: Install the Android NDK
+        if: steps.cached.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;27.2.12479018" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Build libbox from sing-box ${{ steps.pin.outputs.version }}
+        if: steps.cached.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.pin.outputs.version }}" \
+            https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          cd /tmp/sing-box
+          # Their own pinned fork, from the Makefile's lib_install target. Plain
+          # golang.org/x/mobile does not build this.
+          make lib_install
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make lib_android
+          mkdir -p "$GITHUB_WORKSPACE/libbox-out"
+          find . -name 'libbox*.aar' -exec cp {} "$GITHUB_WORKSPACE/libbox-out/" \;
+          ls -la "$GITHUB_WORKSPACE/libbox-out/"
+
+      - name: Fail if nothing was produced
+        run: |
+          set -euo pipefail
+          # A cache hit that restored an empty directory looks like success and
+          # then the Android job has no library to link. Check the artifact, not
+          # the exit status of the build.
+          test -s libbox-out/libbox.aar
+
+      - name: Upload libbox.aar
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-${{ steps.pin.outputs.version }}
+          path: libbox-out/*.aar
+          if-no-files-found: error
 
   android:
     name: Android APK
