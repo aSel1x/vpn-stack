@@ -98,6 +98,8 @@ jobs:
       # it from the first green run, commit it, and the resolution is frozen
       # from then on. Uploaded before analyze so a red analysis still hands you
       # the lockfile.
+      # Kept after pubspec.lock was committed: this is the resolution CI
+      # actually used, so a lock that drifts from it is visible here.
       - name: Upload the resolved pubspec.lock
         uses: actions/upload-artifact@v4
         with:
