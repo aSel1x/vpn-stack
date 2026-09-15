@@ -174,14 +174,32 @@ jobs:
           # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain refuses
           # the module outright.
           go-version: '1.25.5'
+          # This repository has no go.sum -- the Go project is cloned into /tmp --
+          # and the default cache lookup warns about that on every run.
+          cache: false
 
-      - name: Install the Android NDK
+      # The runner image already ships an NDK. Installing a second one cost a
+      # failed job for nothing: sdkmanager is real but lives in
+      # $ANDROID_SDK_ROOT/cmdline-tools/latest/bin, which is not on PATH, so the
+      # step died with `sdkmanager: command not found`. Prefer what is there,
+      # and fall back to installing by absolute path rather than by hope.
+      - name: Point gomobile at an Android NDK
         if: steps.cached.outputs.cache-hit != 'true'
         working-directory: .
         run: |
           set -euo pipefail
-          sdkmanager --install "ndk;27.2.12479018" >/dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+            mgr="$sdk/cmdline-tools/latest/bin/sdkmanager"
+            [ -x "$mgr" ] || { echo "no NDK and no sdkmanager under $sdk" >&2; exit 1; }
+            yes | "$mgr" --licenses >/dev/null 2>&1 || true
+            "$mgr" --install "ndk;27.2.12479018" >/dev/null
+            ndk="$sdk/ndk/27.2.12479018"
+          fi
+          [ -d "$ndk" ] || { echo "NDK still missing at $ndk" >&2; exit 1; }
+          echo "using NDK at $ndk"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
 
       - name: Build libbox from sing-box ${{ steps.pin.outputs.version }}
         if: steps.cached.outputs.cache-hit != 'true'
