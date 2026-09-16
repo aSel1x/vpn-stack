@@ -634,6 +634,12 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					UIKit,
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.asel1x.vpnStackApp.SingboxTunnel;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -665,6 +671,12 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					UIKit,
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.asel1x.vpnStackApp.SingboxTunnel;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -695,6 +707,12 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					UIKit,
+					"-lresolv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.asel1x.vpnStackApp.SingboxTunnel;
 				PRODUCT_NAME = "$(TARGET_NAME)";

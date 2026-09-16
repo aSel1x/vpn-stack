@@ -258,7 +258,13 @@ ext.build_configurations.each do |config|
   # The app embeds the Swift runtime; a second copy inside the .appex is
   # rejected at validation.
   settings['ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES'] = 'NO'
-  settings['LD_RUNPATH_SEARCH_PATHS'] = [
+  settings['LD_RUNPATH_SEARCH_PATHS'] 
+
+  # libbox's Apple binding references UIApplication and UIBackgroundTaskInvalid,
+  # and an app extension does not link UIKit by default -- the first link of this
+  # target failed on exactly those two symbols. `-lresolv` for the same reason
+  # one step later: the Go resolver pulls res_9_* out of libresolv.
+  settings['OTHER_LDFLAGS'] = ['$(inherited)', '-framework', 'UIKit', '-lresolv']= [
     '$(inherited)', '@executable_path/Frameworks', '@executable_path/../../Frameworks'
   ]
   settings['FRAMEWORK_SEARCH_PATHS'] = ['$(inherited)', "$(SRCROOT)/#{PACKAGE_REL}/Frameworks"]
