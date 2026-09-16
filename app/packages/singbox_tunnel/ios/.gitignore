@@ -1,0 +1,5 @@
+# Libbox.xcframework is built from sing-box's own source by the `libbox_apple`
+# job in .github/workflows/app.yml, at the version compose.yml pins, and it is
+# five platforms of built Go. A build artifact, not a source file, and this
+# repository is public -- the same rule android/libs/*.aar is under.
+Frameworks/

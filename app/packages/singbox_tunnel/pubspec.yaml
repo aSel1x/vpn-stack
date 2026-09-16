@@ -1,7 +1,8 @@
 name: singbox_tunnel
 description: >-
-  sing-box on Android for the vpn-stack client: a VpnService that hands its TUN
-  file descriptor to libbox, behind the app's TunnelController interface.
+  sing-box for the vpn-stack client: a VpnService on Android and a
+  NEPacketTunnelProvider on iOS, each handing its TUN file descriptor to libbox,
+  behind the app's TunnelController interface.
 publish_to: none
 version: 0.1.0
 
@@ -22,12 +23,29 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
-      # Android only, and deliberately not `ios:` or the desktops. Declaring a
-      # platform here makes Flutter look for an implementation and fail the
-      # build when there is none; an empty iOS stub would be worse than the
-      # absence, because it would register a channel that answers nothing. iOS
-      # is NEPacketTunnelProvider plus Libbox.xcframework and is a separate
-      # piece of work (app/README.md has the App Store gate on it too).
       android:
         package: io.github.asel1x.singbox_tunnel
         pluginClass: SingboxTunnelPlugin
+      # Declared, and it is NOT the empty stub this block used to warn against.
+      # The warning was right and still is: registering a channel that answers
+      # nothing is worse than a platform saying it is unimplemented. ios/Classes
+      # answers for real -- it installs a NETunnelProviderManager, it raises the
+      # system's approval sheet, and every path it cannot complete fails with
+      # text naming what is missing.
+      #
+      # Declaring it is also the only way the Swift is ever COMPILED. There is
+      # no macOS in this tree, so CI's ios job is the sole judge of it, and
+      # until this line existed that job built an app with no plugin in it. The
+      # pod deliberately vendors no framework (see ios/singbox_tunnel.podspec),
+      # so this costs `flutter build ios` nothing but the two Swift directories.
+      #
+      # What it does NOT do is make an iOS build tunnel. That needs the
+      # NEPacketTunnelProvider EXTENSION TARGET, which lives in an Xcode project
+      # `flutter create` cannot produce -- see ios/README.md -- and until
+      # app/ios/ is committed with it, lib/main.dart keeps iOS on
+      # UnimplementedTunnel.
+      ios:
+        pluginClass: SingboxTunnelPlugin
+      # Still not macos/windows/linux: app/README.md's table puts each of them
+      # on the sing-box binary behind a privileged helper, which is a process,
+      # not a plugin, and there is nothing here to register.

@@ -57,6 +57,14 @@ on:
       # not the other.
       - 'compose.yml'
   workflow_dispatch:
+    inputs:
+      regenerate_ios_project:
+        description: >-
+          Rewrite app/ios/ from the Flutter template plus tool/ios_project.rb and
+          upload it. Off by default, and deliberately manual: app/ios/ is a
+          COMMITTED directory, so regenerating it is a change to what ships.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,6 +102,15 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+
+      # The only cheap judge of tool/ios_project.rb. That script runs on a macOS
+      # runner against a project that exists for the length of one job, so a
+      # typo in it costs a 45-minute round trip to discover; ubuntu-latest ships
+      # a Ruby and `-c` is a parse. It proves syntax and nothing else -- nothing
+      # outside a macOS runner has the xcodeproj gem, so an API that moved is
+      # still only visible in the ios_project job.
+      - name: ruby -c tool/ios_project.rb
+        run: ruby -c tool/ios_project.rb
 
       - name: flutter pub get
         run: flutter pub get
@@ -234,6 +251,161 @@ jobs:
           path: libbox-out/*.aar
           if-no-files-found: error
 
+  # The Apple half. It is NOT a mirror of the job above: what `-target apple`
+  # emits was read out of cmd/internal/build_libbox/main.go at v1.14.0 and out
+  # of the gomobile fork that Makefile pins, and four things differ.
+  #
+  # 1. The output is a DIRECTORY named Libbox.xcframework, and nothing on the
+  #    command line says so. buildApple() (main.go:191) passes no -o, so
+  #    gomobile falls back to strings.Title of the bound package's name --
+  #    `libbox` -- and writes Libbox.xcframework into the clone's root
+  #    (gomobile bind_iosapp.go:27). The -libname=box beside it names nothing
+  #    here: bind.go:157 says "valid only with -target=android". Do not grep for
+  #    a file.
+  # 2. It binds FIVE platforms, not iOS: `ios,iossimulator,tvos,tvossimulator,
+  #    macos` at -iosversion=15.0 -macosversion=13.0 -tvosversion=17.0
+  #    (main.go:198-209). tvOS is dead weight for this repository and is built
+  #    anyway, because `make lib_apple` is sing-box's single definition of this
+  #    build and a hand-written -platform list here would be a second one that
+  #    drifts from it -- the same reason the version is read out of compose.yml
+  #    rather than restated. The cost is runner minutes; the cost of the other
+  #    choice is a framework built differently from the one upstream tests.
+  #    All five SDKs (iphoneos, iphonesimulator, appletvos, appletvsimulator,
+  #    macosx) ship on the macos-latest image, so nothing is installed for it.
+  # 3. It needs FULL XCODE, not the command line tools. gomobile refuses the
+  #    target outright unless `xcrun xcodebuild -version` succeeds (bind.go:132
+  #    calling env.go:644), and it then shells out to `xcodebuild
+  #    -create-xcframework` (bind_iosapp.go:310) to combine the per-platform
+  #    frameworks. A runner image is what supplies that; a developer's machine
+  #    with only CLT installed fails at the first of those two checks with
+  #    `-target=... requires Xcode`, before compiling anything.
+  # 4. It needs no Android SDK, no NDK and no JDK. build_shared.FindSDK() and
+  #    checkJavaVersion() are called from buildAndroid() only (main.go:161-162),
+  #    so the NDK-hunting step the job above needs has no counterpart here.
+  #
+  # No `needs: check`, matching the libbox job above and unlike the five
+  # platform jobs. Nothing here reads a line of Dart -- it clones sing-box and
+  # builds Go -- so a red analyzer cannot make this output wrong, and gating it
+  # would push the iOS artifact out by the whole of `check` on a cache miss.
+  # The consequence is stated rather than hidden: a broken tree can still spend
+  # a macOS runner here. It cannot produce an .ipa, because the job that does
+  # `needs: check` as well.
+  libbox_apple:
+    name: Libbox.xcframework (sing-box for Apple)
+    runs-on: macos-latest
+    # The Android build takes about nine minutes for eight architecture slices.
+    # This produces eight as well (ios/arm64, both simulator pairs, tvos/arm64,
+    # macos/arm64+x86_64), then lipos and packs them, so the ceiling is set
+    # generously rather than tightly: a hung xcodebuild should be killed, and a
+    # merely slow one should not turn into a red build nobody trusts.
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Byte-identical to the libbox job's step, deliberately: one number
+      # governs the engine at both ends of a configuration, and it lives in
+      # compose.yml. The expression is plain BRE with POSIX classes, so BSD sed
+      # on this runner reads it the same way GNU sed does on the other.
+      - name: Read the sing-box version the server runs
+        id: pin
+        working-directory: .
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
+          [ -n "$version" ] || { echo "no sing-box image pin in compose.yml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "server runs sing-box $version"
+
+      # The cached thing is the TARBALL, not the bundle. actions/cache does
+      # round-trip symlinks, but caching the unpacked directory would mean the
+      # cache and the artifact hold different shapes and only one of them gets
+      # exercised on a cache hit -- so a packing bug would surface on the first
+      # cold run months later. Pack once, cache and upload the same bytes.
+      - name: Restore a previously built Libbox.xcframework
+        id: cached
+        uses: actions/cache@v4
+        with:
+          path: libbox-apple-out
+          key: libbox-apple-${{ steps.pin.outputs.version }}-gomobile0.1.13
+
+      - name: Install Go
+        if: steps.cached.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain
+          # refuses the module outright.
+          go-version: '1.25.5'
+          # This repository has no go.sum -- the Go project is cloned into /tmp
+          # -- and the default cache lookup warns about that on every run.
+          cache: false
+
+      - name: Build Libbox.xcframework from sing-box ${{ steps.pin.outputs.version }}
+        if: steps.cached.outputs.cache-hit != 'true'
+        working-directory: .
+        env:
+          # macOS ships bsdtar with Apple's copyfile patch, which archives
+          # extended attributes as AppleDouble `._name` members beside every
+          # real one. Those are not part of the bundle and xcodebuild has no
+          # idea what to do with an `._Info.plist` sitting next to Info.plist.
+          COPYFILE_DISABLE: '1'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.pin.outputs.version }}" \
+            https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          cd /tmp/sing-box
+          # Their own pinned fork, from the Makefile's lib_install target. Plain
+          # golang.org/x/mobile does not build this, and the Apple path needs
+          # both halves: gomobile shells out to `gobind` by PATH lookup
+          # (bind.go:101), not by absolute path.
+          make lib_install
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make lib_apple
+          # Located rather than restated. The clone's root is where it lands
+          # today -- buildApple()'s copy step only fires when a
+          # ../sing-box-for-apple checkout exists (main.go:240) and there is
+          # none here -- but the name is a gomobile default, so find it and say
+          # so if it moves. -print -quit and not a pipe to head: under pipefail
+          # a SIGPIPE'd find fails the step with find's exit code instead of
+          # the message below, which is the opposite of legible.
+          xcf=$(find . -maxdepth 2 -type d -name 'Libbox.xcframework' -print -quit)
+          [ -n "$xcf" ] || { echo "make lib_apple produced no Libbox.xcframework -- the output name moved" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/libbox-apple-out"
+          # tar, and not the directory handed straight to upload-artifact: see
+          # the iOS job's unpack step for the measurement that forces this.
+          tar -czf "$GITHUB_WORKSPACE/libbox-apple-out/Libbox.xcframework.tar.gz" \
+            -C "$(dirname "$xcf")" Libbox.xcframework
+          ls -la "$GITHUB_WORKSPACE/libbox-apple-out/"
+
+      - name: Fail if nothing was produced
+        working-directory: .
+        run: |
+          set -euo pipefail
+          # A cache hit that restored an empty directory looks like success and
+          # then the iOS job has no framework to link. Check the artifact, not
+          # the exit status of the build -- and check the bundle, not the file,
+          # because a truncated or half-written tarball passes `test -s` too.
+          # An .xcframework IS its root Info.plist: that file is what lists the
+          # available libraries, and a directory without one is not one.
+          test -s libbox-apple-out/Libbox.xcframework.tar.gz
+          tar -tzf libbox-apple-out/Libbox.xcframework.tar.gz > /tmp/xcframework-members
+          grep -qx 'Libbox.xcframework/Info.plist' /tmp/xcframework-members \
+            || { echo "no Info.plist at the bundle root -- this tarball is not an xcframework" >&2; exit 1; }
+          echo "$(wc -l < /tmp/xcframework-members) members packed"
+
+      - name: Upload Libbox.xcframework
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-apple-${{ steps.pin.outputs.version }}
+          path: libbox-apple-out/Libbox.xcframework.tar.gz
+          if-no-files-found: error
+          # The payload is already gzipped. upload-artifact zips whatever it is
+          # given at level 6 by default, which here is minutes of CPU spent
+          # re-compressing incompressible bytes for no gain.
+          compression-level: 0
+
   android:
     name: Android APK
     # libbox as well as check. app/packages/singbox_tunnel's Gradle module
@@ -245,11 +417,13 @@ jobs:
     # libbox job uploads -- sing-box publishes none, and it is gitignored here
     # because it is 60 MB of built Go in a public repository.
     #
-    # THE OTHER FOUR PLATFORM JOBS DELIBERATELY DO NOT LIST IT. None of them
-    # links a Go library: iOS wants Libbox.xcframework, which is a separate
-    # build nobody has written, and the desktops want a privileged helper. A
-    # Windows runner queued behind a nine-minute NDK build it never reads from
-    # is how a CI turns into something people skip.
+    # THE OTHER FOUR PLATFORM JOBS DELIBERATELY DO NOT LIST *THIS* ONE. iOS has
+    # its own Go build to wait for now -- libbox_apple, above -- and waits for
+    # that instead; an .aar is a JNI library and means nothing to it. The three
+    # desktops link no Go library at all: app/README.md's table puts them on the
+    # sing-box binary behind a privileged helper, which is a process, not a
+    # dependency. A Windows runner queued behind a nine-minute NDK build it
+    # never reads from is how a CI turns into something people skip.
     needs: [check, libbox]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -348,14 +522,96 @@ jobs:
           path: app/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
 
-  ios:
-    name: iOS .ipa (unsigned)
-    needs: check
+  # THIS JOB REGENERATES app/ios/. IT DOES NOT BUILD ON EVERY RUN, AND MUST NOT.
+  #
+  # app/ios/ is a COMMITTED directory -- the one platform directory that is, and
+  # not out of taste. iOS runs an NEPacketTunnelProvider in its own app-extension
+  # PROCESS, so the provider needs its own TARGET; a CocoaPods pod is linked into
+  # the targets the Podfile names, which is Runner and nothing else, which is why
+  # packages/singbox_tunnel/ios/singbox_tunnel.podspec:32 ships Classes/ and
+  # Shared/ and deliberately not Extension/. `flutter create` writes one target,
+  # no entitlements, no App Group and no extension, and preserves none of those
+  # if you add them. A colleague cannot sign a project that does not exist.
+  #
+  # So: a human dispatches this workflow with regenerate_ios_project=true,
+  # downloads the ios-project artifact, and commits app/ios/. The `ios` job below
+  # then builds THAT project on every push and never generates one. Regenerating
+  # on every run would mean the thing that ships is rewritten behind the
+  # operator's back, which is the failure committing it exists to prevent.
+  #
+  # It deletes app/ios/ before generating. `flutter create` over an existing
+  # project writes only absent files, so a second pass would merge a fresh
+  # template into an edited project -- the unreviewable state this whole
+  # arrangement avoids -- and tool/ios_project.rb refuses to run twice over one
+  # project for the same reason.
+  #
+  # It also BUILDS what it generated, which is what `needs: libbox_apple` is for.
+  # A project a human is about to commit should be known to compile the 827 lines
+  # under packages/singbox_tunnel/ios/Extension/ before it is committed, not
+  # after. The build steps are spelled out again rather than shared with the
+  # `ios` job on purpose: that job builds the COMMITTED project and this one
+  # builds the GENERATED one, and if they shared steps the difference -- which is
+  # the entire point of both -- would be invisible.
+  # Is the Xcode project in the tree?
+  #
+  # Added because the dispatch route the ios job used to print does not exist:
+  # GitHub only shows "Run workflow" for a workflow present on the DEFAULT
+  # branch, and app.yml lives only on `app`. So the recovery instruction was
+  # unfollowable, and every push was red on a job whose fix could not be run.
+  # Deciding here instead makes the workflow self-healing: with no project it
+  # generates one, with a project it builds it, and neither needs a human to
+  # remember which.
+  ios_state:
+    name: Is the Xcode project committed?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      committed: ${{ steps.look.outputs.committed }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Look for it
+        id: look
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if [ -f app/ios/Runner.xcodeproj/project.pbxproj ]; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            echo "app/ios/ is in the tree; the ios job will build it"
+          else
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "app/ios/ is absent; the ios_project job will generate one to commit"
+          fi
+
+  ios_project:
+    name: regenerate app/ios/ (manual)
+    # `inputs.` and NOT `github.event.inputs.`: the latter is a string, and the
+    # string "false" is truthy, so this would run on every dispatch of the
+    # workflow including the ones that just want a rebuild.
+    # Runs when there is no committed project, and on an explicit dispatch when
+    # somebody wants to regenerate one that exists.
+    if: >-
+      needs.ios_state.outputs.committed == 'false' ||
+      (github.event_name == 'workflow_dispatch' && inputs.regenerate_ios_project)
+    needs: [check, libbox_apple, ios_state]
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      # xcodeproj is not listed on the runner image by name; it arrives as a
+      # runtime dependency of CocoaPods, which is listed ("CocoaPods 1.17.0" in
+      # images/macos/macos-26-arm64-Readme.md), and cocoapods 1.17.0's gemspec
+      # declares `xcodeproj >= 1.28.1, < 2.0`. That is the whole provenance, and
+      # it is a property of an image that rolls, so it is asserted and printed
+      # here rather than assumed three steps later inside a Ruby backtrace.
+      - name: Check the xcodeproj gem is on this runner
+        run: |
+          set -euo pipefail
+          gem list -e xcodeproj || true
+          ruby -e 'require "xcodeproj"; puts "xcodeproj #{Xcodeproj::VERSION}"' \
+            || { echo "error: no xcodeproj gem. It ships as a dependency of CocoaPods; the runner image dropped one of them, and this job needs a gem install step." >&2; exit 1; }
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
         uses: subosito/flutter-action@v2
@@ -364,11 +620,165 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Generate ios/
-        run: flutter create --platforms=ios --project-name vpn_stack_app --org io.github.asel1x .
+      # --project-name and --org are the same pair the android job passes and
+      # are not decoration here: `flutter create` derives the app's bundle
+      # identifier from them (createUTIIdentifier, create_base.dart:595), and
+      # tool/ios_project.rb refuses to continue unless that identifier is
+      # io.github.asel1x.vpnStackApp -- the App Group and the extension's own
+      # identifier are built from it, and the App Group is registered against a
+      # real Apple team.
+      - name: Generate a stock ios/ from the Flutter template
+        run: |
+          set -euo pipefail
+          rm -rf ios
+          flutter create --platforms=ios --project-name vpn_stack_app --org io.github.asel1x .
+          test -f ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Add the packet-tunnel extension target
+        run: ruby tool/ios_project.rb
+
+      # Before the build, for the reason the pubspec.lock step gives: a failed
+      # build should still hand back the project that failed, or the next person
+      # debugs an Xcode project on a machine with no Xcode.
+      #
+      # include-hidden-files, and it is load-bearing rather than tidy:
+      # `flutter create` writes ios/.gitignore, and that file is what makes
+      # committing this directory safe at all -- it already ignores
+      # Flutter/Generated.xcconfig, Flutter/flutter_export_environment.sh,
+      # Flutter/ephemeral/, Pods/, .symlinks/, xcuserdata and
+      # Runner/GeneratedPluginRegistrant.*. upload-artifact drops dotfiles by
+      # default, so without this the artifact arrives missing the one file that
+      # keeps every derived path out of the commit.
+      #
+      # The two absolute-path files are excluded here as well, because an
+      # artifact a human unzips should not contain the runner's FLUTTER_ROOT in
+      # the first place; .gitignore:36 objects to exactly that, and every
+      # flutter build rewrites both. Nothing else under ios/ is derived:
+      # Runner.xcodeproj, the two entitlements files and the two Info.plists are
+      # the deliverable.
+      - name: Upload app/ios/ for a human to commit
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-project
+          path: |
+            app/ios
+            !app/ios/Flutter/Generated.xcconfig
+            !app/ios/Flutter/flutter_export_environment.sh
+            !app/ios/Flutter/ephemeral
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Download Libbox.xcframework ${{ needs.libbox_apple.outputs.version }}
+        uses: actions/download-artifact@v4
+        with:
+          name: libbox-apple-${{ needs.libbox_apple.outputs.version }}
+          path: app/packages/singbox_tunnel/ios/Frameworks
+
+      - name: Unpack Libbox.xcframework
+        run: bash tool/unpack_libbox.sh
 
       - name: flutter build ios --no-codesign
         run: flutter build ios --release --no-codesign
+
+      - name: Check the extension was built into the app
+        run: bash tool/check_extension.sh
+
+  ios:
+    name: iOS .ipa (unsigned)
+    # libbox_apple as well as check, and macos/windows/linux deliberately still
+    # do not. The xcframework carries a macos slice -- build_libbox binds one
+    # (main.go:198) whether anything wants it or not -- so the temptation is to
+    # hand it to the macOS job too. Nothing there would link it:
+    # app/README.md's table puts macOS, Windows and Linux on the sing-box
+    # *binary* behind a privileged helper, and there is no macOS Network
+    # Extension target in this tree to link a framework into. Adding the
+    # dependency would park a second macOS runner behind a Go build whose
+    # output it never opens. The day a macOS helper wants libbox
+    # instead of the binary, the slice is already in the artifact and this is
+    # one line.
+    # Only with a project to build. Without this the job failed on every push
+    # and the failure was not actionable, because the job that produces the
+    # project could not be dispatched.
+    if: needs.ios_state.outputs.committed == 'true'
+    needs: [check, libbox_apple, ios_state]
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # THIS JOB BUILDS THE COMMITTED PROJECT AND GENERATES NOTHING. There is no
+      # `flutter create` below, and its absence is the point: every way of
+      # getting this wrong ends in a build that SUCCEEDS. A stock one-target
+      # project compiles the Dart and the app-process Swift, links no libbox,
+      # contains no NEPacketTunnelProvider, and wraps into a perfectly valid
+      # .ipa that cannot tunnel -- indistinguishable from a real one until
+      # somebody signs and installs it. So the project is checked by hand, first,
+      # before the artifact download and the SDK install.
+      - name: Check the committed Xcode project is here and carries the extension
+        working-directory: .
+        run: |
+          set -euo pipefail
+          pbxproj=app/ios/Runner.xcodeproj/project.pbxproj
+          if [ ! -f "$pbxproj" ]; then
+            echo "error: no $pbxproj." >&2
+            echo "app/ios/ is a committed directory and nothing in this job generates one." >&2
+            echo "Produce it: run this workflow from the Actions tab with regenerate_ios_project=true," >&2
+            echo "download the ios-project artifact, drop the app/ios/ line from .gitignore, and commit it." >&2
+            echo "The why is in packages/singbox_tunnel/ios/README.md and in the ios_project job above." >&2
+            exit 1
+          fi
+          # A project that exists but predates the extension target is the same
+          # silent failure wearing a committed directory, so the contents are
+          # asserted too, by the three strings that cannot be there by accident.
+          for needle in \
+            'com.apple.product-type.app-extension' \
+            'io.github.asel1x.vpnStackApp.SingboxTunnel' \
+            'Libbox.xcframework'
+          do
+            grep -q "$needle" "$pbxproj" || {
+              echo "error: $pbxproj does not mention $needle -- this project predates the extension target." >&2
+              echo "Regenerate it with the ios_project job and commit the result." >&2
+              exit 1
+            }
+          done
+          test -f app/ios/SingboxTunnel/SingboxTunnel.entitlements
+          test -f app/ios/SingboxTunnel/Info.plist
+          test -f app/ios/Runner/Runner.entitlements
+
+      # Straight into the directory the extension target links from --
+      # FRAMEWORK_SEARCH_PATHS is $(SRCROOT)/../packages/singbox_tunnel/ios/Frameworks
+      # and the file reference in Runner.xcodeproj is the same path -- rather
+      # than into a staging directory and a copy, so there is one path to get
+      # wrong instead of two. This is the move ios/README.md:168 describes: the
+      # unpack destination used to be libbox-apple/ at the repository root,
+      # where nothing consumed it and the job proved only that the framework
+      # survived the round trip.
+      #
+      # Before the toolchain installs, for the reason the Android job gives: a
+      # wrong artifact name is cheaper to discover ahead of an SDK download than
+      # behind one.
+      - name: Download Libbox.xcframework ${{ needs.libbox_apple.outputs.version }}
+        uses: actions/download-artifact@v4
+        with:
+          name: libbox-apple-${{ needs.libbox_apple.outputs.version }}
+          path: app/packages/singbox_tunnel/ios/Frameworks
+
+      - name: Unpack Libbox.xcframework
+        run: bash tool/unpack_libbox.sh
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: flutter build ios --no-codesign
+        run: flutter build ios --release --no-codesign
+
+      - name: Check the extension was built into the app
+        run: bash tool/check_extension.sh
 
       # `flutter build ipa` cannot be used here: exporting an archive is an
       # Xcode signing operation and there is no identity on this runner. An .ipa
