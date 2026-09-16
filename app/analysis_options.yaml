@@ -14,6 +14,7 @@ analyzer:
   # somebody's working tree every time they analyze.
   exclude:
     - build/**
+    - ios/**
 
 linter:
   rules:

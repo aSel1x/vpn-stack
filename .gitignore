@@ -37,7 +37,12 @@ rendered-*/
 # `pub get` last, and Generated.xcconfig carries their FLUTTER_ROOT -- neither
 # belongs in a public repo.
 app/android/
-app/ios/
+# app/ios/ is COMMITTED, unlike the other four. An NEPacketTunnelProvider is a
+# separate app-extension target with its own bundle identifier, entitlements and
+# an App Group, and none of that survives `flutter create` -- so a regenerated
+# project has no tunnel in it and there is nothing to sign. app/tool/ios_project.rb
+# is how it is produced, and app/ios/.gitignore keeps the generated-per-machine
+# files (Generated.xcconfig, ephemeral/, Pods/) out.
 app/macos/
 app/windows/
 app/linux/

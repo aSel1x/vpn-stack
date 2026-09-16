@@ -7,7 +7,8 @@
 // the same Go package through the same gomobile fork. What differs is the
 // naming rules and four of the answers:
 //
-//   * `usePlatformAutoDetectInterfaceControl` is FALSE here and true there.
+//   * `usePlatformAutoDetectControl` is FALSE here and true there -- and the Apple
+//     binding spells it without `Interface`, unlike the Android one.
 //     Android needs it because every outbound socket has to go through
 //     `VpnService.protect` or it matches the default route the tunnel just
 //     installed and loops back into its own tun. iOS has no protect() and needs
@@ -48,7 +49,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
     private(set) var didOpenTun = false
 
     private var networkSettings: NEPacketTunnelNetworkSettings?
-    private var pathMonitor: NWPathMonitor?
+    private var pathMonitor: Network.NWPathMonitor?
 
     init(_ provider: PacketTunnelProvider) {
         self.provider = provider
@@ -281,14 +282,18 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
     /// outbound socket through `VpnService.protect`; iOS has no equivalent and
     /// needs none, because the system keeps the extension's own traffic out of
     /// the interface the extension installs.
-    func usePlatformAutoDetectInterfaceControl() -> Bool {
+    // Named `...AutoDetectControl`, not `...AutoDetectInterfaceControl`: the Apple
+    // binding of libbox renames both of these relative to the Android one, and
+    // the compiler said so the first time this file was ever compiled. The Go
+    // source is shared; gomobile's two bindings are not.
+    func usePlatformAutoDetectControl() -> Bool {
         false
     }
 
-    func autoDetectInterfaceControl(_ fd: Int32) throws {
+    func autoDetectControl(_ fd: Int32) throws {
         throw TunnelSetupError(
-            "ios: autoDetectInterfaceControl(\(fd)) was called although "
-                + "usePlatformAutoDetectInterfaceControl() is false. There is no protect() on "
+            "ios: autoDetectControl(\(fd)) was called although "
+                + "usePlatformAutoDetectControl() is false. There is no protect() on "
                 + "this platform, so this cannot be answered; the contract moved.")
     }
 
@@ -296,7 +301,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
         guard let listener else {
             return
         }
-        let monitor = NWPathMonitor()
+        let monitor = Network.NWPathMonitor()
         pathMonitor = monitor
         let firstPath = DispatchSemaphore(value: 0)
         monitor.pathUpdateHandler = { [weak self] path in
@@ -317,7 +322,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
     }
 
     private func publishDefaultInterface(
-        _ listener: LibboxInterfaceUpdateListenerProtocol, _ path: NWPath
+        _ listener: LibboxInterfaceUpdateListenerProtocol, _ path: Network.NWPath
     ) {
         guard path.status != .unsatisfied, let first = path.availableInterfaces.first else {
             // -1, not the last known interface: reporting a stale one makes

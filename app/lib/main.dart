@@ -55,7 +55,12 @@ void main() {
   // not know the configuration format -- importing lib/config/ from the package
   // would be the app -> package -> app cycle -- so the app supplies it, and
   // lib/config/ stays the single definition of what a share URI becomes.
-  final TunnelController tunnel = Platform.isAndroid
+  // Android and iOS. The two share the Dart contract and nothing else: Android
+  // runs sing-box in the app process behind a VpnService, iOS runs it in a
+  // separate packet-tunnel extension the app starts through
+  // NETunnelProviderManager. Both refuse to report connected without evidence a
+  // tun exists.
+  final TunnelController tunnel = Platform.isAndroid || Platform.isIOS
       ? SingboxTunnel((TunnelProfile profile) => encodeSingBoxConfig(
             buildSingBoxConfig(
               outbound: selectOutbound(
