@@ -348,6 +348,22 @@ embed.dst_path = ''
 embed_file = embed.add_file_reference(ext.product_reference, true)
 embed_file.settings = { 'ATTRIBUTES' => ['RemoveHeadersOnCopy'] }
 
+# Before Flutter's "Thin Binary", not after it. Appended last -- which is where
+# new_copy_files_build_phase puts it -- the build failed with "Cycle inside
+# Runner": the copy of SingboxTunnel.appex depended on Thin Binary, which
+# reached ExtractAppIntentsMetadata, which reached the [CP] Embed Pods
+# Frameworks phase CocoaPods appends after ours, which reached back to the copy.
+# Ordering the embed ahead of Thin Binary breaks the loop.
+thin = runner.build_phases.find do |phase|
+  phase.respond_to?(:name) && phase.name == 'Thin Binary'
+end
+if thin
+  runner.build_phases.delete(embed)
+  runner.build_phases.insert(runner.build_phases.index(thin), embed)
+else
+  warn 'note: no "Thin Binary" phase; leaving Embed App Extensions last'
+end
+
 project.save
 
 puts "target        #{EXT_TARGET} (com.apple.product-type.app-extension)"
