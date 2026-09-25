@@ -85,6 +85,47 @@ valid_net() {
     "$1" 2>/dev/null
 }
 
+# The smallest network covering a `first-last` pool, byte-identical to
+# vpnctl.ikev2ctl._covering_net and to the copy in scripts/diagnose-ikev2.sh.
+#
+# It has to be all three copies or none. This one used to take `${first%.*}.0/24`
+# -- the /24 containing the pool's FIRST address -- which is right for the image
+# default (192.168.43.10-192.168.43.250) and wrong for any pool that straddles a
+# boundary: 192.168.43.10-192.168.44.250 makes vpnctl install its FORWARD accepts
+# for 192.168.40.0/21 while this file went looking for a rule on 192.168.43.0/24,
+# found none, and called a healthy box broken. Three copies of a derivation that
+# silently disagree is the failure this repo already paid for once, when the
+# subnet was hardcoded as the L2TP pool and BOTH health checks asserted the same
+# wrong value and reported green.
+#
+# Wider than the pool is the safe direction: an address inside the covering
+# network but outside the pool is one pluto never assigns. A bare CIDR is
+# accepted too, because rightaddresspool takes one.
+covering_net() {
+  [[ -n "$1" ]] || return 1
+  python3 -c '
+import ipaddress, sys
+bounds = [b.strip() for b in sys.argv[1].split("-") if b.strip()]
+if not bounds:
+    raise SystemExit(1)
+try:
+    if len(bounds) == 1 and "/" in bounds[0]:
+        block = ipaddress.ip_network(bounds[0], strict=False)
+        first, last = block.network_address, block.broadcast_address
+    else:
+        first = ipaddress.ip_address(bounds[0])
+        last = ipaddress.ip_address(bounds[-1])
+except ValueError:
+    raise SystemExit(1)
+if first.version != 4 or last.version != 4 or last < first:
+    raise SystemExit(1)
+covering = next(ipaddress.summarize_address_range(first, last))
+while covering.broadcast_address < last:
+    covering = covering.supernet()
+print(covering)
+' "$1" 2>/dev/null
+}
+
 # Which containers each protocol needs, and the name docker knows them by.
 # Two authorities, and this file can read neither: protocols.compose_services
 # names the compose services, and compose.yml renames three of them with
@@ -145,13 +186,12 @@ check_container() {
 # indistinguishable from "the rule is missing". Emits "net|provenance", since
 # a value that came from the hardcoded default must not read as a real answer.
 ikev2_pool() {
-  local line entry first v net why="container unreadable"
+  local line entry v net why="container unreadable"
   line=$(docker exec ipsec-vpn-server \
            sed -n 's/^[[:space:]]*rightaddresspool=//p' /etc/ipsec.d/ikev2.conf 2>/dev/null | head -1)
   if [[ -n "$line" ]]; then
     entry=$(printf '%s' "$line" | tr ',' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}' || true)
-    first=${entry%%-*}
-    net=$(valid_net "${first%.*}.0/24") && {
+    net=$(covering_net "$entry") && {
       printf '%s|conn ikev2-cp rightaddresspool' "$net"; return; }
     why="conn ikev2-cp gave an unusable pool"
   fi
