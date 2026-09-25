@@ -10,9 +10,12 @@ import 'models.dart';
 /// Connect, and the four states it can be in.
 ///
 /// There is no fifth state and no optimistic one: what is drawn here comes from
-/// [TunnelController] and nothing else. Until an engine exists, pressing this
-/// shows the failure the engine's absence produces -- which is the correct
-/// behaviour, and the reason this app does not yet claim to connect.
+/// [TunnelController] and nothing else. On Android and iOS that is
+/// `SingboxTunnel`, which refuses to report connected without evidence a tun
+/// exists; on the three desktop targets it is `UnimplementedTunnel`, and
+/// pressing this shows the failure that platform's missing helper produces.
+/// Either way the button reports what the engine reported, which is why this
+/// file has no idea which engine it is talking to.
 class ConnectButton extends StatelessWidget {
   const ConnectButton({
     super.key,

@@ -14,8 +14,12 @@ import '../provision/ssh.dart';
 /// one.
 ///
 /// What is left is genuinely the UI's: which servers this device knows about,
-/// the credential used to reach one, and the two holes nothing has filled yet
-/// -- an SSH transport and somewhere to put a downloaded file.
+/// the credential used to reach one, where a bundle goes when somebody saves
+/// it, and the seam SSH is reached through. The last two are interfaces rather
+/// than concrete classes not because nothing implements them -- `transport/`
+/// and `ui/file_saver.dart` both do -- but because neither belongs above this
+/// line: one imports dartssh2 and the other a share sheet, and a screen that
+/// named either could not be reasoned about without them.
 
 /// Flattens whatever a layer threw into something a person can read.
 ///
@@ -232,12 +236,13 @@ final class SshPrivateKey extends SshCredential {
 
 /// Opens SSH connections to a server, given a credential.
 ///
-/// The one hole neither `control/` nor `provision/` fills: both of them take
-/// their transport injected, on purpose, and nothing in this repository yet
-/// implements it. It is one interface with one method so that whoever writes
-/// the dartssh2 implementation has a single small file to write and this app
-/// has a single small file to fix if a signature there turns out to be
-/// different from what somebody guessed.
+/// The seam `control/` and `provision/` both take injected, on purpose:
+/// neither of them may import an SSH library, which is what makes every
+/// command line and every parse in those layers testable with no server and no
+/// network. `transport/dartssh2_transport.dart` is the implementation, and it
+/// is one small file because this is one interface with one method --
+/// `MissingSshTransport` in `missing_backend.dart` is the other, for a platform
+/// where dartssh2 cannot run.
 ///
 /// Returning a [SshConnector] rather than a connection is not a detail: the
 /// firewall step proves the rules it installed did not lock us out by opening a
@@ -264,12 +269,23 @@ abstract class ServerStore {
   Future<void> save(List<ServerProfile> servers);
 }
 
-/// Writes a client bundle somewhere the person can get at it, returning a
-/// location to show them.
+/// Gets a client bundle off this device and into somebody's hands.
 ///
-/// Its own port because the packages that do this -- file_selector, share_plus,
-/// path_provider -- are not in pubspec.yaml, and this layer does not get to add
-/// one.
+/// `ShareSheetFileSaver` in `file_saver.dart` is the implementation, and it is
+/// behind a port because what "getting it off the device" means is entirely
+/// platform: a share sheet on Android, iOS, macOS and Windows, and nothing at
+/// all on Linux, where share_plus refuses a file outright. That last case is
+/// why the screens read this as a NULLABLE provider: a platform with no saver
+/// registers none, and `ShareItemView` draws no Share button rather than
+/// offering an action that cannot succeed.
 abstract class FileSaver {
+  /// Returns one sentence describing what became of [bytes], already fit to put
+  /// in front of a human.
+  ///
+  /// Not a path: a share sheet has no destination to report back -- the person
+  /// chose one and this app is not told which -- and a return value shaped like
+  /// a file location would force every implementation to invent one. The
+  /// implementation owns the wording because it is the only thing that knows
+  /// whether delivery was observed, dismissed, or merely handed over.
   Future<String> save(String filename, Uint8List bytes);
 }

@@ -2,10 +2,11 @@ import 'package:flutter/foundation.dart';
 
 import 'tunnel.dart';
 
-/// The only [TunnelController] that exists today, and it does nothing.
+/// The [TunnelController] for a platform that has no engine, and it does
+/// nothing.
 ///
 /// It reports [TunnelStage.failed] with the text below and throws an
-/// [UnimplementedError] naming the platform and the artifact that is missing.
+/// [UnimplementedError] naming the platform and what that platform would need.
 /// It never reports [TunnelStage.connected].
 ///
 /// That restraint is the whole point. A stub that shows "Connected" is
@@ -13,9 +14,11 @@ import 'tunnel.dart';
 /// traffic through nothing, and finds out later. A build that says exactly what
 /// is missing costs an afternoon; one that lies costs trust in the whole thing.
 ///
-/// Replacing it means writing a sibling here -- `LibboxTunnel` over a method
-/// channel for Android and iOS, `HelperTunnel` over a local socket for desktop
-/// -- and one line in `main.dart`. No screen changes.
+/// `SingboxTunnel` in `packages/singbox_tunnel/` is the engine, and `main.dart`
+/// wires it on Android and iOS. What is left here is the three desktop targets,
+/// where the tunnel needs a privileged process to open a TUN device rather than
+/// a plugin -- so the sibling that replaces this one is a client of a helper
+/// service, not another method channel.
 class UnimplementedTunnel extends BaseTunnelController {
   UnimplementedTunnel({TargetPlatform? platform})
       : platform = platform ?? defaultTargetPlatform;
@@ -24,19 +27,34 @@ class UnimplementedTunnel extends BaseTunnelController {
   /// running on; `dart:io` would pin this to the host.
   final TargetPlatform platform;
 
-  /// What this platform needs before [connect] can do anything. Kept as prose
-  /// because it is read by a person staring at a Connect button that failed.
+  /// Why this platform has no tunnel, in prose, because it is read by a person
+  /// staring at a Connect button that failed.
+  ///
+  /// Every branch names its own platform, and [_refusal] leads with this rather
+  /// than with a sentence of its own. A wrapper such as "no tunnel engine on
+  /// `<platform>`" would be a flat contradiction on the two platforms where an
+  /// engine does exist and this controller is merely unwired -- and a message
+  /// that contradicts itself is one nobody reads to the end of.
   String get requirement {
     switch (platform) {
+      // The two platforms that DO have an engine. Reaching either means the
+      // composition root handed the screens the stub, because `main.dart` puts
+      // both on `SingboxTunnel` -- so the requirement is not an artifact, it is
+      // one line of wiring, and saying anything about libbox here would send
+      // somebody looking for a file that is present.
       case TargetPlatform.android:
-        return 'Android needs libbox -- the gomobile .aar built from sing-box -- '
-            'bound through a VpnService, plus the method channel that hands it '
-            'this profile. Neither is in this repository yet.';
+        return 'Android has an engine -- libbox behind a VpnService, in '
+            'packages/singbox_tunnel -- and this is not it. Whatever built this '
+            'app did not wire it; lib/main.dart is the only file that chooses.';
       case TargetPlatform.iOS:
-        return 'iOS needs Libbox.xcframework inside a NEPacketTunnelProvider '
-            'extension. Neither is in this repository yet, and the extension '
-            'entitlement needs a paid Apple membership enrolled as an '
-            'organization (App Store Review Guideline 5.4); see app/README.md.';
+        return 'iOS has an engine -- a NEPacketTunnelProvider extension started '
+            'through NETunnelProviderManager, with the target committed in '
+            'app/ios/ -- and this is not it. What an iOS BUILD needs beyond '
+            'that is a signature: the Network Extension entitlement requires a '
+            'paid Apple membership, and App Store Review Guideline 5.4 admits '
+            'VPN apps only from a developer enrolled as an organization, so CI '
+            'can only produce an unsigned .ipa. Connecting here would not '
+            'change either; see app/README.md.';
       case TargetPlatform.macOS:
         return 'macOS needs a privileged helper to open the TUN device: '
             'sing-box cannot create one from a sandboxed app. The helper is not '
@@ -49,12 +67,12 @@ class UnimplementedTunnel extends BaseTunnelController {
             'systemd unit) to create the TUN device. It is not in this '
             'repository yet.';
       case TargetPlatform.fuchsia:
-        return 'There is no tunnel engine for this platform.';
+        return 'There is no tunnel engine for Fuchsia, and none is planned.';
     }
   }
 
   String _refusal(TunnelProfile profile) =>
-      'No tunnel engine on ${platform.name}. $requirement\n'
+      '$requirement\n'
       'Nothing was connected: ${profile.label} (${profile.host}) is configured '
       'and its ${profile.importUris.length} share URI(s) were not used.';
 

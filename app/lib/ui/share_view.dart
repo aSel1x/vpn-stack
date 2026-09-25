@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -8,10 +10,10 @@ import 'ports.dart';
 /// Rendering one [ShareItem], by its shape and only by its shape.
 ///
 /// This is the file that has to be right. A [ShareUri] gets a QR code and a
-/// copy action, a [ShareFile] gets a save action, [ShareFields] get a labelled
-/// table to type in. The server decided which of the three an item is and
-/// `control/` refuses a payload that is more than one of them; this widget does
-/// not second-guess either, and has no "show it as a URI" fallback.
+/// copy action, a [ShareFile] gets a hand-off to another app, [ShareFields] get
+/// a labelled table to type in. The server decided which of the three an item
+/// is and `control/` refuses a payload that is more than one of them; this
+/// widget does not second-guess either, and has no "show it as a URI" fallback.
 ///
 /// That rule has a scar behind it. DNSTT-over-SSH has no import format at all
 /// -- no scheme, nothing to scan -- and its settings were once crammed into a
@@ -130,24 +132,24 @@ class _FileItem extends StatefulWidget {
 }
 
 class _FileItemState extends State<_FileItem> {
-  String? _saved;
+  /// What the saver said became of the bundle. Not a path: see [FileSaver.save].
+  String? _outcome;
   String? _error;
   bool _saving = false;
 
-  Future<void> _save() async {
+  Future<void> _save(FileSaver saver) async {
     final ShareFile item = widget.item;
-    final FileSaver saver = context.read<FileSaver>();
     setState(() {
       _saving = true;
       _error = null;
-      _saved = null;
+      _outcome = null;
     });
     try {
-      final String where = await saver.save(item.filename, item.content);
+      final String outcome = await saver.save(item.filename, item.content);
       if (!mounted) {
         return;
       }
-      setState(() => _saved = where);
+      setState(() => _outcome = outcome);
     } catch (e) {
       if (!mounted) {
         return;
@@ -163,6 +165,12 @@ class _FileItemState extends State<_FileItem> {
   @override
   Widget build(BuildContext context) {
     final ShareFile item = widget.item;
+    // Nullable, and the null case is not an oversight. A platform that cannot
+    // hand a file to another app at all -- share_plus refuses a file share on
+    // Linux outright -- registers no saver in lib/main.dart, and this draws no
+    // button. The alternative is a saver that throws, which puts a button on
+    // this card and fails on press, and an action offered is a promise.
+    final FileSaver? saver = context.read<FileSaver?>();
     return SectionCard(
       title: item.label,
       subtitle: 'A file to import. There is no link and no QR code for it.',
@@ -183,19 +191,36 @@ class _FileItemState extends State<_FileItem> {
           'who gets a copy can connect as this user.',
         ),
         const SizedBox(height: 10),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: FilledButton.tonalIcon(
-            onPressed: _saving ? null : _save,
-            icon: _saving
-                ? const InlineSpinner()
-                : const Icon(Icons.save_alt, size: 18),
-            label: const Text('Save'),
+        if (saver == null)
+          const Text(
+            'This build cannot hand a file to another app, so there is nothing '
+            'to save it with here. Export it from a machine with the CLI '
+            'instead: `./vpn user export <name> --protocol ikev2`.',
+          )
+        else
+          Align(
+            alignment: Alignment.centerLeft,
+            // "Share", not "Save". What happens is a hand-off to another app --
+            // strongSwan, Files, whatever the person picks -- and this app is
+            // never told where it landed. A button labelled Save would promise a
+            // file at a location nothing here can name, and on the platform that
+            // matters most for these three bundles the share sheet IS the
+            // install mechanism: a .mobileconfig reaches iOS Settings that way
+            // and no other way an app can invoke.
+            child: FilledButton.tonalIcon(
+              onPressed: _saving ? null : () => unawaited(_save(saver)),
+              icon: _saving
+                  ? const InlineSpinner()
+                  : const Icon(Icons.share_outlined, size: 18),
+              label: const Text('Share'),
+            ),
           ),
-        ),
-        if (_saved != null) ...<Widget>[
+        if (_outcome != null) ...<Widget>[
           const SizedBox(height: 10),
-          Text('Saved to $_saved'),
+          // Verbatim, and with no prefix of its own: the saver is the only
+          // thing that knows whether the file was taken, declined, or merely
+          // handed over, so the wording is its to write.
+          Text(_outcome!),
         ],
         if (_error != null) ...<Widget>[
           const SizedBox(height: 10),

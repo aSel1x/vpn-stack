@@ -53,6 +53,37 @@ dependencies:
   # artifact of the run that resolved it, for the reason the block below gives.
   singbox_tunnel:
     path: packages/singbox_tunnel
+  # The share sheet, and the only way an IKEv2 bundle gets off this device.
+  #
+  # `vpnctl user export` hands back three files for ikev2 -- `.p12`, `.sswan`,
+  # `.mobileconfig` -- and those three are the entire reason IKEv2 is in this
+  # stack: a device that should not need an app at all imports one and is done.
+  # An app that can display them and not deliver them has removed the only
+  # thing they were for.
+  #
+  # A share sheet rather than a file picker, and that is a security decision
+  # before it is a UX one. CLAUDE.md records it as verified: the `.p12` the
+  # image's `--exportclient` writes has an EMPTY password, so the file IS the
+  # credential and whoever holds a copy has VPN access as that user. The sheet
+  # is one explicit hand-off to one destination somebody chose; a Downloads
+  # directory is readable by every app on the phone that asked for storage.
+  # It is also the only mechanism that reaches iOS Settings: there is no API a
+  # non-MDM app can call to install a configuration profile, so handing the
+  # `.mobileconfig` to the sheet is not a lesser version of installing it, it
+  # is how installing it is done.
+  #
+  # Files are shareable on Android, iOS, macOS and Windows 10 1803+. On Linux
+  # `SharePlusLinuxPlugin.share` throws outright for a file, so lib/main.dart
+  # registers no FileSaver there and the Save button is not drawn -- see
+  # ui/file_saver.dart.
+  share_plus:
+  # For `getTemporaryDirectory()`. share_plus pulls this in anyway, and it is
+  # declared here because ui/file_saver.dart imports it: the bundle is written
+  # into the app's own private cache before the sheet is raised, which is what
+  # makes the path known and therefore sweepable. Left to share_plus's own
+  # `XFile.fromData` path the temp file is written by the plugin and never
+  # deleted by anybody.
+  path_provider:
 
 dev_dependencies:
   flutter_test:

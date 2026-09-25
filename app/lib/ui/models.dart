@@ -271,12 +271,18 @@ class ServerSession extends ChangeNotifier {
       // this app invented is one every profile would then carry.
       _bundles[user] = await control.exportUser(user);
     } catch (e) {
-      _bundleErrors[user] = describeError(e);
+      _bundleErrors[user] = _reportable(e);
     }
     _bundlesLoading.remove(user);
     notifyListeners();
   }
 
+  /// The connection every command on this screen runs over, opened once.
+  ///
+  /// Caching it is right: a detail screen is a dozen vpnctl calls and each one
+  /// is a TCP handshake, a key exchange and an authentication if it opens its
+  /// own. What it must not do is keep a DEAD one, which is what
+  /// [_dropConnection] is for.
   Future<Vpnctl> _open() async {
     final Vpnctl? existing = _vpnctl;
     if (existing != null) {
@@ -295,6 +301,57 @@ class ServerSession extends ChangeNotifier {
     final Vpnctl control = Vpnctl(opened.session);
     _vpnctl = control;
     return control;
+  }
+
+  /// Throws away the cached connection, so the next command opens a new one.
+  ///
+  /// The trigger is a transport-level failure and only that. A phone that
+  /// changed network, an sshd that timed the session out, a box that rebooted:
+  /// the socket will never answer again, and a cached [Vpnctl] over it turns one
+  /// lost connection into a screen where every later action fails with no way
+  /// back but killing the app. A refusal from vpnctl itself arrived over a
+  /// connection that plainly works, and tearing that down would make one
+  /// rejected user name cost a reconnect.
+  void _dropConnection() {
+    final SshConnection? dead = _connection;
+    _connection = null;
+    _vpnctl = null;
+    if (dead != null) {
+      // Not awaited, and its failure swallowed. This runs on the failure path
+      // of whatever the caller was doing; the socket is already suspect, and a
+      // close that also fails changes nothing about what has to be said.
+      unawaited(dead.close().catchError((Object _) {}));
+    }
+  }
+
+  /// The sentence to show for [error], dropping the connection first when the
+  /// failure was the connection.
+  ///
+  /// Both the action guard and the share loader go through here, because a
+  /// transport failure can arrive on either: `loadShare` is the one path that
+  /// does not use [_guard], and a share export that loses the connection would
+  /// otherwise leave the session dead while every button still looked live.
+  ///
+  /// One exception type covers it, and that is a property of the layer below
+  /// rather than an assumption: `Vpnctl._run` catches everything `session.run`
+  /// throws -- deliberately catch-all, so a closed session's own failure is
+  /// included -- and rethrows it as [VpnctlTransportError]. The failures that
+  /// are NOT that (a refused host key, a credential the server would not take)
+  /// come out of `access.open()`, which only runs when nothing is cached, so
+  /// there is no dead connection to drop.
+  String _reportable(Object error) {
+    final String described = describeError(error);
+    if (error is! VpnctlTransportError) {
+      return described;
+    }
+    _dropConnection();
+    // No reassurance about what did or did not happen on the server. The
+    // sentence above already says that a command with no exit status leaves
+    // "whether it ran at all" unknown, and a soothing clause here would
+    // contradict it -- `user add` writes users.json before it converges.
+    return '$described\n\n'
+        'The connection to ${server.label} has been closed; the next action '
+        'opens a new one.';
   }
 
   void _noteApply(ApplyResult? apply) {
@@ -355,7 +412,7 @@ class ServerSession extends ChangeNotifier {
     try {
       await body();
     } catch (e) {
-      _error = describeError(e);
+      _error = _reportable(e);
     }
     _busy = false;
     notifyListeners();
@@ -365,12 +422,7 @@ class ServerSession extends ChangeNotifier {
   @override
   void dispose() {
     _closed = true;
-    final SshConnection? connection = _connection;
-    _connection = null;
-    _vpnctl = null;
-    if (connection != null) {
-      unawaited(connection.close());
-    }
+    _dropConnection();
     super.dispose();
   }
 }
