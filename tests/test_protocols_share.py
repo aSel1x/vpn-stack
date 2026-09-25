@@ -197,6 +197,65 @@ def test_hysteria2_private_key_never_reaches_a_share_link(secrets) -> None:
     assert "PRIVATE KEY" not in item.uri
 
 
+def test_hysteria2_share_needs_no_private_key_at_all(secrets) -> None:
+    """Why neither pin is stored, which is the opposite of reality.pub's reason.
+
+    reality.pub exists because deriving it meant reading the private X25519 key,
+    and a pure seam that needs a private key is a seam that ships one to a phone.
+    A fingerprint and an SPKI hash are functions of the certificate, which is
+    public and already in the keyring -- so a caller holding a keyring with the
+    private half removed builds the identical link, and there is nothing to
+    store that could drift out of step with the certificate it describes.
+    """
+    public_only = _drop(secrets, "hysteria2.key")
+    user = make_user("alice")
+    assert hysteria2.share(public_only, user, HOST) == hysteria2.share(
+        secrets, user, HOST
+    )
+
+
+# --------------------------------------------------------- ShareItem's shapes
+
+
+def test_an_item_in_two_shapes_is_refused_where_it_is_built(secrets) -> None:
+    """Every layer above branches on which field is set, and in a fixed order.
+
+    cli.cmd_user_export tests `uri` first, so a two-shaped item is not ambiguous
+    in practice -- it is silently the wrong one of the two, and the file half
+    goes nowhere. Refused at construction so the traceback names the protocol
+    module rather than the renderer.
+    """
+    with pytest.raises(RenderError, match="exactly one"):
+        protocols.ShareItem(
+            label="both", filename="a.mobileconfig", uri="hysteria2://x", content=b"x"
+        )
+
+
+def test_an_item_in_no_shape_is_refused(secrets) -> None:
+    # A labelled empty row on somebody's share page, otherwise.
+    with pytest.raises(RenderError, match="exactly one"):
+        protocols.ShareItem(label="nothing", filename=None, uri=None)
+
+
+def test_a_named_file_must_carry_its_content(secrets) -> None:
+    # The shape is filename *plus* content: a name with nothing behind it is a
+    # download of zero bytes, which reads as a successful export.
+    with pytest.raises(RenderError, match="no content"):
+        protocols.ShareItem(label="file", filename="client.p12", uri=None)
+
+
+def test_the_filename_shape_is_documented_as_having_no_consumer() -> None:
+    """Kept deliberately, and the docstring is the only record of the catch.
+
+    cli.cmd_user_export prints `uri`, then `fields`, and drops anything else
+    without a word -- so a protocol that starts returning a filename-shaped item
+    has to add that branch in the same change, or `user export` reports ok with
+    the one file the recipient asked for missing from the payload.
+    """
+    doc = protocols.ShareItem.__doc__
+    assert "cli.cmd_user_export" in doc
+
+
 # ----------------------------------------------------------------------- dnstt
 
 

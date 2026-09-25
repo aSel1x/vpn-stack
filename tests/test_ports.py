@@ -65,6 +65,18 @@ def test_the_transport_is_part_of_the_key() -> None:
     # legitimate combination.
     pair = [_proto("a", Port(53, "udp")), _proto("b", Port(53, "tcp"))]
     protocols.assert_ports_disjoint(pair)
+    # The same case against the real registry rather than two fixtures, because
+    # the one number this is ever going to matter for is dnstt's 53: a future
+    # DNS-over-TCP sibling must not be refused on the strength of the digits.
+    protocols.assert_ports_disjoint(
+        [*protocols.ordered(), _proto("t", Port(53, "tcp"))]
+    )
+    # And the mirror image, so the pair above is proof of the transport mattering
+    # rather than of the check being asleep.
+    with pytest.raises(RenderError, match="53/udp"):
+        protocols.assert_ports_disjoint(
+            [*protocols.ordered(), _proto("u", Port(53, "udp"))]
+        )
 
 
 def test_a_protocol_colliding_with_itself_is_refused() -> None:

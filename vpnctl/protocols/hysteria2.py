@@ -100,8 +100,14 @@ def _spki_sha256(cert_pem: bytes) -> str:
 
 
 def share(secrets: Secrets, user: User, host: str) -> list[ShareItem]:
-    # Self-signed, so the client pins it by fingerprint -- recomputed here
-    # rather than stored, for the same reason as the REALITY public key.
+    # Self-signed, so the client pins it. Both pins are computed here rather
+    # than stored, and that is the *opposite* of why reality.pub is stored: that
+    # one exists because deriving the REALITY public key meant reading the
+    # private X25519 key, and a pure seam that needs a private key is a seam
+    # that ships one to a phone. A fingerprint and an SPKI hash are functions of
+    # the certificate, which is public, already in the keyring, and handed to
+    # anyone who opens a connection -- no private half enters this computation,
+    # so there is nothing to store and nothing that could drift out of step.
     uri = (
         f"hysteria2://{user.hysteria2_password}@{host}:{PORT}"
         f"?obfs=salamander&obfs-password={secrets.text('hysteria2.obfs')}"
@@ -124,6 +130,22 @@ def bootstrap() -> dict[str, bytes]:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=3650))
+        # A verifier has to be able to *check* this, even though every client
+        # here pins it. With no extensions at all -- which is how this
+        # certificate was issued -- there is no subjectAltName for RFC 6125 name
+        # matching to match (the CN has not been a name source for a decade) and
+        # nothing saying the leaf is not a CA, so every client's only two
+        # options were to pin or to switch verification off entirely, and "off
+        # entirely" is the one people reach for first.
+        #
+        # Forward-only by construction: bootstrap_keyring does not re-mint a set
+        # that is already present, so an existing server keeps the exact
+        # certificate its clients pin and no profile has to be re-exported.
+        # Only servers bootstrapped from here on get the extensions.
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(MASQUERADE)]), critical=False
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
     return {

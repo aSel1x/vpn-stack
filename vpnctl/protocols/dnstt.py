@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import sys
 
-from vpnctl.paths import ENV_FILE
+from vpnctl.paths import ENV_FILE, USERS_JSON
 from vpnctl.protocols import Kind, Port, Protocol, RenderError, ShareItem
 from vpnctl.secrets_store import Secrets
-from vpnctl.users_store import User
+from vpnctl.users_store import User, validate_name
 
 NAME = "dnstt"
 
@@ -112,11 +112,61 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
             "users.json, or re-add the user",
             file=sys.stderr,
         )
-    logins = "".join(
-        f"{u.name}:{u.dnstt_password}\n"
-        for u in users
-        if u.enabled and u.dnstt_password
-    )
+    issued = [u for u in users if u.enabled and u.dnstt_password]
+
+    # The file's own format is `name:password`, one per line, read by
+    # dnstt-sshd/entrypoint.sh with `while IFS=: read -r name password` and fed
+    # straight to adduser and chpasswd. A name carrying a colon or a newline
+    # therefore does not fail -- it silently becomes a *different* account, or
+    # two, with the password cut at the colon. The shared validator in
+    # users_store already excludes both (and every shell metacharacter with
+    # them), so this is the same one check ikev2.render makes, for a different
+    # file format and the same reason: `user add` validates what it creates, and
+    # render() is handed whatever a hand edit, an old backup or a rolled-back
+    # tree left in the file.
+    for user in issued:
+        error = validate_name(user.name)
+        if error:
+            raise RenderError(
+                f"{USERS_JSON} names a user this cannot render into the dnstt "
+                f"login list. {error} Remove and re-add that user: `user rm` "
+                "writes users.json before it applies, so the command that fixes "
+                "this is not blocked by it."
+            )
+        # A newline in the password is the same corruption from the other side:
+        # it ends the record and turns the rest into a login line of its own.
+        # Named without its value, because the value is a live credential and
+        # this message is printed.
+        if "\n" in user.dnstt_password or "\r" in user.dnstt_password:
+            raise RenderError(
+                f"{USERS_JSON}: the dnstt password for {user.name!r} contains a "
+                "newline, which would split one login line into two. Re-add the "
+                "user."
+            )
+
+    logins = "".join(f"{u.name}:{u.dnstt_password}\n" for u in issued)
+    # An empty list is not a degraded dnstt, it is a crash-loop nothing reports.
+    # entrypoint.sh exits 1 on a list with no logins -- deliberately, because an
+    # sshd with zero accounts looks healthy and answers nobody -- and compose
+    # restarts that container forever. Neither composectl's readiness wait nor
+    # scripts/smoke.sh can see it: that sshd binds loopback only, so there is no
+    # non-loopback port to watch, and dnstt itself keeps answering udp/53 into a
+    # tunnel whose far end refuses every login. So the refusal belongs here,
+    # before the candidate tree is promoted, where it costs the operator one
+    # sentence instead of an evening.
+    #
+    # Unlike the missing zone this is safe to raise on: every route out of it
+    # writes users.json before it applies -- `user add`, `user enable`, setting
+    # dnstt_password by hand -- and `protocol off dnstt` does not render dnstt at
+    # all. Refusing here cannot lock the operator out of the fix.
+    if not logins:
+        raise RenderError(
+            "dnstt is enabled but no enabled user has a dnstt login, so the "
+            "rendered login list would be empty -- dnstt-sshd exits 1 on that and "
+            "compose restarts it forever, unseen, because it binds loopback only. "
+            f"Add or enable a user, set dnstt_password in {USERS_JSON} for one who "
+            "predates the field, or turn dnstt off."
+        )
     env = (
         f"SSH_PORT={EXIT.rsplit(':', 1)[1]}\n"
         f"SOCKS_EXIT={SOCKS_ADDR}\n"

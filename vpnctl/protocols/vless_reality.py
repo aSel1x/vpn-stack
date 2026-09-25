@@ -100,4 +100,14 @@ PROTOCOL = Protocol(
     render=render,
     share=share,
     bootstrap=bootstrap,
+    # An X25519 public key is a deterministic function of its private half, so
+    # a keyring that has reality.key and no reality.pub is repairable rather
+    # than damaged. That matters because `share()` prefers the stored public
+    # half precisely so it never has to read the private one, and before this
+    # existed no command could add the file to a server bootstrapped earlier:
+    # the only route was `--force`, which re-mints the whole set and
+    # invalidates every profile ever issued.
+    derivable={
+        "reality.pub": lambda have: derive_public_key(have.text("reality.key")).encode()
+    },
 )

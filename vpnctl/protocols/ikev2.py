@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import secrets as pysecrets
 
-from vpnctl.protocols import Kind, Port, Protocol, ShareItem
+from vpnctl.paths import USERS_JSON
+from vpnctl.protocols import Kind, Port, Protocol, RenderError, ShareItem
 from vpnctl.secrets_store import Secrets
-from vpnctl.users_store import User
+from vpnctl.users_store import User, validate_name
 
 NAME = "ikev2"
 
@@ -28,6 +29,54 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
     # first: the image's primary VPN_USER slot stays random junk nobody uses,
     # so add/remove behaves uniformly regardless of who happens to be first.
     enabled = [u for u in users if u.enabled]
+
+    # users.json is validated at `user add`, and render() is handed whatever the
+    # file actually holds -- a hand edit, a restore from an older backup, or a
+    # stale checkout rsynced over a newer database. The two lists below are one
+    # space-separated string each, zipped back together by position inside the
+    # container, so a single name containing whitespace makes them different
+    # lengths and hands every user after it somebody else's password, on a config
+    # that renders, validates and serves. Refusing here is the last moment at
+    # which nothing has been promoted and nobody has been given the wrong
+    # credential; the same check at `user add` cannot see a record it did not
+    # create.
+    #
+    # Deliberately the whole shared validator and not just "the characters that
+    # break this file": one definition of a renderable name, in users_store,
+    # beside the regex's own explanation. A name that reaches here having failed
+    # any part of it is a database `user add` would not have written.
+    for user in enabled:
+        error = validate_name(user.name)
+        if error:
+            raise RenderError(
+                f"{USERS_JSON} names a user this cannot render. {error} "
+                "Remove and re-add that user: `user rm` writes users.json before "
+                "it applies, so the command that fixes this is not blocked by it."
+            )
+
+    # The password half of the pairing is space-separated too, and a password is
+    # not validated anywhere: `user add` generates token_hex, but a hand-edited
+    # record or an import can carry anything. One space in a password misaligns
+    # the lists exactly as a space in a name does. The message names the user and
+    # never the value -- a RenderError is printed, and this one is a live
+    # credential.
+    for user in enabled:
+        if len(user.l2tp_password.split()) != 1:
+            raise RenderError(
+                f"{USERS_JSON}: the L2TP password for {user.name!r} contains "
+                "whitespace (or is empty). VPN_ADDL_USERS and VPN_ADDL_PASSWORDS "
+                "are two space-separated lists paired by position, so this would "
+                "hand every later user somebody else's password. Re-add the user."
+            )
+
+    # Both of these end up in the container's environment, which means every
+    # user's L2TP/Cisco password and the shared PSK are readable with a single
+    # `docker inspect ikev2` by anything that can reach the docker socket. There
+    # is no way around it -- the hwdsl2 image is configured by environment and
+    # nothing else -- so "nothing else on this host gets the docker socket" is a
+    # written invariant of this deployment rather than an accident of it: no
+    # container mounts /var/run/docker.sock, and adding one that does hands it
+    # every IPsec credential on the box.
     lines = [
         f"VPN_IPSEC_PSK={secrets.text('ipsec.psk')}",
         f"VPN_USER={secrets.text('ipsec.primary_user')}",

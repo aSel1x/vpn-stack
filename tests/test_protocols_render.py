@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 from conftest import make_user
+from cryptography import x509
+from cryptography.x509 import load_pem_x509_certificate
 
-from vpnctl import protocols, secrets_store
+from vpnctl import paths, protocols, secrets_store
 from vpnctl.protocols import dnstt, hysteria2, ikev2, vless_reality
 
 
@@ -99,7 +101,11 @@ def test_dnstt_without_a_zone_warns_and_renders_anyway(secrets, users, capsys) -
 
 
 def test_no_users_still_renders_a_valid_shape(secrets) -> None:
+    # dnstt is the exception and has its own tests below: an empty login list is
+    # a crash-loop, not an empty file.
     for proto in protocols.ordered():
+        if proto.name == dnstt.NAME:
+            continue
         out = proto.render(secrets, [])
         assert isinstance(out, dict)
     assert (
@@ -107,7 +113,131 @@ def test_no_users_still_renders_a_valid_shape(secrets) -> None:
         .decode()
         .endswith("VPN_ADDL_USERS=\nVPN_ADDL_PASSWORDS=\n")
     )
-    assert dnstt.render(secrets, [])["dnstt-sshd/logins"] == b""
+
+
+# ------------------------------------------------- what render refuses to emit
+
+
+@pytest.mark.parametrize(
+    "users_in",
+    [
+        [],
+        [make_user("bob", enabled=False)],
+        [make_user("carol", dnstt_password="")],
+    ],
+    ids=["no users at all", "everybody disabled", "everybody predating the field"],
+)
+def test_dnstt_refuses_to_render_an_empty_login_list(secrets, users_in) -> None:
+    """The one failure in this stack that nothing downstream can observe.
+
+    dnstt-sshd/entrypoint.sh exits 1 on a list with no logins, on purpose -- an
+    sshd with zero accounts looks healthy and answers nobody -- and compose
+    restarts it forever. That crash-loop is invisible to both health checks:
+    composectl's readiness wait and scripts/smoke.sh watch non-loopback ports,
+    and this sshd binds 127.0.0.1 only, while dnstt itself goes on answering
+    udp/53 into a tunnel whose far end refuses every login.
+    """
+    with pytest.raises(protocols.RenderError) as excinfo:
+        dnstt.render(secrets, users_in)
+    message = str(excinfo.value)
+    assert "empty" in message
+    # The three ways out, because the operator is holding a failed apply: the
+    # candidate tree was never promoted, so nothing is broken yet.
+    assert "enable a user" in message and "dnstt off" in message
+
+
+def test_dnstt_still_renders_when_only_some_users_lack_a_login(
+    secrets, users, capsys
+) -> None:
+    # The partial case stays a warning and must never become fatal: the file it
+    # renders is usable by everybody who does have a password, and the refusal
+    # above would otherwise turn one stale record into a failed apply.
+    assert dnstt.render(secrets, users)["dnstt-sshd/logins"] == b"alice:dnsttalice\n"
+    assert "carol" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name", ["alice smith", "al:ice", "alice\nbob", "al ice", "root"]
+)
+def test_dnstt_refuses_a_name_the_login_file_cannot_hold(secrets, name) -> None:
+    """`name:password` per line, read by `while IFS=: read -r name password`.
+
+    A colon or a newline in a name does not fail there -- it silently becomes a
+    different account, or two, with the password cut short. The shared validator
+    already excludes both, so this asserts that render() consults it rather than
+    trusting whatever users.json holds.
+    """
+    with pytest.raises(protocols.RenderError, match="users.json"):
+        dnstt.render(secrets, [make_user(name)])
+
+
+def test_dnstt_refuses_a_password_that_would_split_the_line(secrets) -> None:
+    # The same corruption from the other side: the newline ends the record and
+    # the remainder becomes a login line of its own.
+    bad = make_user("alice", dnstt_password="first\nmallory:second")
+    with pytest.raises(protocols.RenderError) as excinfo:
+        dnstt.render(secrets, [bad])
+    assert "newline" in str(excinfo.value)
+    # A live credential, so the message names the user and not the value.
+    assert "mallory:second" not in str(excinfo.value)
+
+
+def test_a_disabled_user_with_an_unrenderable_name_blocks_nothing(secrets) -> None:
+    # Nothing of a disabled user is rendered, by either protocol, so refusing on
+    # one would make a name that predates the validator brick every apply with
+    # no way to reach the record.
+    bad = make_user("alice smith", enabled=False)
+    good = make_user("carol")
+    assert ikev2.render(secrets, [bad, good])
+    assert dnstt.render(secrets, [bad, good])["dnstt-sshd/logins"] == (
+        b"carol:dnsttcarol\n"
+    )
+
+
+def test_the_hysteria2_certificate_is_one_a_verifier_can_reason_about(
+    secrets, users
+) -> None:
+    """It carried no extensions at all, which left clients only two choices.
+
+    With no subjectAltName there is nothing for RFC 6125 name matching to match
+    -- the CN has not been a name source for a decade -- and with no
+    basicConstraints nothing says the leaf is not a CA. So a client could pin the
+    certificate or switch verification off entirely, and "off entirely" is what
+    people reach for. Pinning still carries this deployment; this is about what
+    happens when a client does not.
+    """
+    cert = load_pem_x509_certificate(secrets.raw("hysteria2.crt"))
+    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    # The same name three times over: the SAN, the SNI the share link tells
+    # clients to send, and the server_name the inbound is rendered with. A SAN
+    # naming anything else would verify for nobody.
+    assert san.value.get_values_for_type(x509.DNSName) == [hysteria2.MASQUERADE]
+    inbound = json.loads(
+        hysteria2.render(secrets, users)["sing-box/20_hysteria2.json"]
+    )["inbounds"][0]
+    assert inbound["tls"]["server_name"] == hysteria2.MASQUERADE
+    basic = cert.extensions.get_extension_for_class(x509.BasicConstraints)
+    assert (basic.value.ca, basic.value.path_length) == (False, None)
+    assert basic.critical is True
+
+
+def test_sing_box_logs_at_warn(secrets) -> None:
+    """A privacy property of this stack decided by a default, until it wasn't.
+
+    At `info` sing-box logs every connection with the authenticated user name
+    beside the client's source address and the destination host, so the rolling
+    json-file log compose gives that container correlates person <-> residential
+    IP <-> site visited -- the record this whole stack exists so that nobody else
+    can build. Asserted here because 00_base.json is JSON and cannot say why
+    itself; the reasoning is in vpnctl/protocols/__init__.py's docstring, and
+    what `warn` gives up is a thin `./vpn logs sing-box` when a client cannot
+    connect.
+    """
+    base = json.loads((paths.SING_BOX_COMMON / "00_base.json").read_bytes())
+    assert base["log"]["level"] == "warn"
+    # Nothing in vpnctl or scripts/smoke.sh parses these lines -- both assert on
+    # bound ports -- so the level is free to be chosen for privacy alone.
+    assert base["log"]["disabled"] is False
 
 
 def test_render_output_is_bytes_with_relative_paths(secrets, users) -> None:
@@ -126,11 +256,39 @@ _BANNED = {"open", "eval", "exec", "compile", "input"}
 _BANNED_MODULES = {"subprocess", "shutil", "socket", "os", "pathlib", "requests"}
 
 
-def _function(module, name: str) -> ast.FunctionDef:
+def _module_functions(module) -> dict[str, ast.FunctionDef]:
     tree = ast.parse(Path(module.__file__).read_text())
-    (found,) = [
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
-    ]
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _reachable(module, name: str) -> list[ast.FunctionDef]:
+    """`name` plus every module-local function it calls, transitively.
+
+    Inspecting only the top-level body left a hole the size of the helpers:
+    hysteria2 computes both of its pins in _fingerprint/_spki_sha256 and dnstt
+    reads the zone through _zone, so an open() moved one call deep passed. One
+    level of resolution covers every helper this tree has today; the walk is
+    transitive regardless, because a worklist costs three lines and guessing
+    wrong costs the invariant being silently unchecked.
+
+    Imported callables are deliberately out of scope -- validate_name belongs to
+    users_store, and this test cannot own another module's purity.
+    """
+    functions = _module_functions(module)
+    seen: set[str] = set()
+    queue = [name]
+    found: list[ast.FunctionDef] = []
+    while queue:
+        current = queue.pop()
+        if current in seen or current not in functions:
+            continue
+        seen.add(current)
+        node = functions[current]
+        found.append(node)
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+                queue.append(inner.func.id)
+    assert found, f"{module.NAME} has no top-level {name}()"
     return found
 
 
@@ -145,14 +303,27 @@ def test_render_and_share_do_no_io(module, func: str) -> None:
     call did not happen for one input. dnstt.render's print() to stderr is the
     one deliberate exception and is not I/O on the returned value.
     """
-    for node in ast.walk(_function(module, func)):
-        if isinstance(node, ast.Name):
-            assert node.id not in _BANNED, f"{module.NAME}.{func} calls {node.id}()"
-            assert node.id not in _BANNED_MODULES, (
-                f"{module.NAME}.{func} uses {node.id}"
-            )
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            assert node.value.id not in _BANNED_MODULES
+    for checked in _reachable(module, func):
+        where = f"{module.NAME}.{checked.name} (reached from {func})"
+        for node in ast.walk(checked):
+            if isinstance(node, ast.Name):
+                assert node.id not in _BANNED, f"{where} calls {node.id}()"
+                assert node.id not in _BANNED_MODULES, f"{where} uses {node.id}"
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                assert node.value.id not in _BANNED_MODULES, (
+                    f"{where} uses {node.value.id}"
+                )
+
+
+def test_the_purity_walk_reaches_the_helpers_and_not_the_whole_import_graph() -> None:
+    # The hole this closed, asserted rather than assumed: hysteria2.share does
+    # nothing itself, its two pins are computed one call deeper, and dnstt.render
+    # reads the zone through _zone.
+    reached = {node.name for node in _reachable(hysteria2, "share")}
+    assert {"share", "_fingerprint", "_spki_sha256"} <= reached
+    assert "_zone" in {node.name for node in _reachable(dnstt, "render")}
+    # And it stops at the module edge: nothing here can vouch for users_store.
+    assert "validate_name" not in {node.name for node in _reachable(ikev2, "render")}
 
 
 def test_render_and_share_ignore_the_process_environment(
@@ -167,26 +338,34 @@ def test_render_and_share_ignore_the_process_environment(
     assert before == after
 
 
-def test_a_user_with_a_space_in_its_name_misaligns_the_ikev2_lists(secrets) -> None:
-    """Why validate_name rejects spaces, demonstrated rather than asserted.
+def test_ikev2_refuses_a_name_that_would_misalign_the_lists(secrets) -> None:
+    """The damage this replaces, and why the check cannot live at `user add`.
 
-    VPN_ADDL_USERS and VPN_ADDL_PASSWORDS are two space-separated lists the
-    hwdsl2 image zips back together by position. One name with a space in it
-    makes the lists different lengths, and every user after it is handed
-    somebody else's password.
+    VPN_ADDL_USERS and VPN_ADDL_PASSWORDS are two space-separated strings the
+    hwdsl2 image zips back together by position. Rendered rather than refused,
+    `alice smith` made the lists three names against two passwords: "smith" was
+    handed carol's password and carol -- the only real second user -- was handed
+    none, on an env file that renders, validates and serves. `user add` rejects
+    the name, but render() is given whatever users.json holds, and a hand edit,
+    an older backup or a rolled-back checkout can all put it there.
     """
-    # The password deliberately has no space of its own: one bad *name* is
+    # The password deliberately has no space of its own: one bad *name* was
     # enough to break the pairing for everyone after it.
     bad = [make_user("alice smith", l2tp_password="l2tp-alice"), make_user("carol")]
-    env = ikev2.render(secrets, bad)["ikev2.env"].decode()
-    lines = dict(line.split("=", 1) for line in env.strip().splitlines())
-    names = lines["VPN_ADDL_USERS"].split()
-    passwords = lines["VPN_ADDL_PASSWORDS"].split()
-    assert names == ["alice", "smith", "carol"]
-    assert passwords == ["l2tp-alice", "l2tp-carol"]
-    assert len(names) != len(passwords)
-    # The concrete damage: "smith" is handed carol's password, and carol -- the
-    # only real second user -- is handed none at all.
-    paired = dict(zip(names, passwords))
-    assert paired["smith"] == "l2tp-carol"
-    assert "carol" not in paired
+    with pytest.raises(protocols.RenderError) as excinfo:
+        ikev2.render(secrets, bad)
+    message = str(excinfo.value)
+    assert "alice smith" in message  # which record to go and fix
+    assert "user rm" in message  # and how, given apply just failed
+
+
+def test_ikev2_refuses_a_password_that_would_misalign_the_lists(secrets) -> None:
+    # The same misalignment from the password side. `user add` generates
+    # token_hex, so only a hand-edited or imported record can do this -- which is
+    # exactly the input render() is not allowed to trust.
+    bad = [make_user("alice", l2tp_password="two words"), make_user("carol")]
+    with pytest.raises(protocols.RenderError) as excinfo:
+        ikev2.render(secrets, bad)
+    assert "alice" in str(excinfo.value)
+    # Never the value: this message is printed and that is a live credential.
+    assert "two words" not in str(excinfo.value)
