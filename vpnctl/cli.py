@@ -584,9 +584,12 @@ def reconcile_ikev2() -> dict:
 
 def cmd_bootstrap(args) -> None:
     guard.require_server("bootstrap")
-    ok, message = bootstrap.bootstrap_keyring(force=args.force)
+    minted, message = bootstrap.bootstrap_keyring(force=args.force)
     say(message)
-    if ok and users_store.load():
+    # `minted`, not "did anything change": a gap REBUILT from surviving material
+    # is the same key's other face, nothing rendered reads it, and announcing it
+    # as new sends the operator off to re-export every profile on the box.
+    if minted and users_store.load():
         say("existing users found -- re-rendering them into the new keyring")
         apply(restart=False, quiet=True)
         say("credentials are NEW: re-export every profile for every user.")

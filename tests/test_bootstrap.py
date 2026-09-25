@@ -169,8 +169,14 @@ def test_a_keyring_without_reality_pub_heals_from_the_private_half() -> None:
     private, short_id = before.raw("reality.key"), before.raw("reality.short_id")
     (SECRETS_DIR / "reality.pub").unlink()
 
-    changed, message = bootstrap.bootstrap_keyring()
-    assert changed
+    minted, message = bootstrap.bootstrap_keyring()
+    # NOT "minted": the flag answers whether a new credential was created, and a
+    # derived half is the same key's other face. cmd_bootstrap re-renders on this
+    # flag and then tells the operator that credentials are new and every profile
+    # must be re-exported -- which here would be false twice over, since nothing
+    # rendered even reads reality.pub (render takes reality.key; only share()
+    # prefers the stored public half).
+    assert not minted
     assert names() == FULL
     after = secrets_store.load()
     assert after.text("reality.pub") == derive_public_key(after.text("reality.key"))

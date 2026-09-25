@@ -241,6 +241,45 @@ def test_the_other_two_bootstrap_outcomes_exit_zero(
     assert as_json(capsys)["ok"] is True
 
 
+def test_a_rebuilt_half_does_not_send_the_operator_to_reissue_everything(
+    monkeypatch, capsys
+) -> None:
+    """A derived secret is not a new credential, and must not be announced as one.
+
+    cmd_bootstrap re-renders and then says "credentials are NEW: re-export every
+    profile for every user" -- correct after a mint, and false after a rebuild.
+    It was reached by the same flag, so a server whose only gap was reality.pub
+    (the shape every box bootstrapped before that field existed is in) told its
+    operator to reissue every profile on it. Nothing rendered even reads
+    reality.pub: render takes reality.key, and only share() prefers the stored
+    public half.
+    """
+    # Users must EXIST, or the branch is skipped for the wrong reason and this
+    # test proves nothing: `if minted and users_store.load()` has two gates.
+    users_store.save([make_user("alice"), make_user("bob")])
+    monkeypatch.setattr(
+        cli.bootstrap,
+        "bootstrap_keyring",
+        lambda force: (
+            False,
+            "rebuilt 1 secret(s) from surviving material: reality.pub "
+            "-- no client credential changed",
+        ),
+    )
+    # An apply here would be the giveaway on its own: there is nothing to render.
+    monkeypatch.setattr(
+        cli, "apply", lambda **kw: pytest.fail("a rebuild must not re-render")
+    )
+
+    cli.cmd_bootstrap(parse(["bootstrap"]))
+
+    out = capsys.readouterr()
+    said = out.out + out.err
+    assert "no client credential changed" in said
+    assert "credentials are NEW" not in said
+    assert "re-export" not in said
+
+
 # ------------------------------------------------- the share shape nothing emitted
 
 

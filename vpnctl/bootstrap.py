@@ -75,6 +75,10 @@ def _heal(
 def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
     """Generate any missing secrets, a whole protocol at a time.
 
+    Returns (a new credential was minted, what happened). A gap REBUILT from
+    surviving material is not a new credential and does not set the flag: see
+    the return below.
+
     Never overwrites without force. force=True regenerates every key: the
     REALITY keypair, the Hysteria2 cert and obfs password, and the IPsec PSK.
     Every already-exported client profile stops working. There is no undo.
@@ -155,7 +159,15 @@ def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
     msg = "; ".join(parts)
     if kept:
         msg += f" (kept {len(kept)} existing)"
-    return True, msg
+    # The bool answers "was a NEW credential minted", not "did anything get
+    # written", and the difference is the whole point of the derivable carve-out.
+    # cmd_bootstrap re-renders on it and then tells the operator that credentials
+    # are new and every profile must be re-exported -- which for a derived half
+    # is false twice over: reality.pub is not a new key, and nothing rendered
+    # reads it (render takes reality.key; only share() prefers the stored public
+    # half). Returning True here sent an operator whose only gap was reality.pub
+    # off to reissue every profile on the box.
+    return bool(written), msg
 
 
 def missing_secrets(enabled: list[protocols.Protocol]) -> dict[str, list[str]]:
