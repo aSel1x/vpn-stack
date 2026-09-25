@@ -369,6 +369,79 @@ if [[ " $ENABLED " == *" dnstt "* ]]; then
 2222 tcp dnstt-sshd every dnstt login lands here
 7300 tcp dnstt-socks the SOCKS exit those logins forward into
 LOOPBACK
+
+  # Is dnstt-server answering for a zone that exists?
+  #
+  # Every other check here can be green while this one is wrong, and that is not
+  # hypothetical -- it was found on this stack's own server. The zone used to be
+  # a literal in compose.yml and is now ${VPN_DNSTT_ZONE}, interpolated bare
+  # rather than as ${VPN_DNSTT_ZONE:?} for a measured reason (Compose v5.3.1
+  # fails project LOAD on the :? form even with dnstt's profile inactive, which
+  # would break every compose command the moment the protocol was turned off).
+  # Bare means an unset variable becomes the EMPTY STRING, so a container
+  # recreated on a box whose .env never gained the variable starts
+  # dnstt-server with no zone argument at all: it binds 53/udp, `docker ps`
+  # says running, the loopback checks above pass, and it answers for nothing any
+  # client can resolve. render() only warns about this -- deliberately, because
+  # raising bricked a server once, taking apply, `user add`, `deploy` and the
+  # boot unit down with it -- so a warning on stderr during one apply is the
+  # whole of the existing signal, and the boot unit has no stderr anybody reads.
+  #
+  # Read from the RUNNING container rather than from .env, because that is the
+  # question: not "is the variable set now" but "what is this process serving".
+  # A container created before the variable existed carries the old literal and
+  # is fine until something recreates it.
+  # argv is parsed, not indexed. `cmd[-2]` looks right and is the trap: an unset
+  # ${VPN_DNSTT_ZONE} DROPS OUT of argv rather than arriving as an empty string,
+  # so the list is one shorter and cmd[-2] silently becomes the -privkey-file
+  # VALUE -- /keys/server.key, which has a dot in it and passes a domain-shaped
+  # test. Measured on the real argv from this stack's own server. So: consume the
+  # flags that take a value, then require exactly the two positionals
+  # dnstt-server's usage defines (`dnstt-server [flags] DOMAIN UPSTREAMADDR`).
+  zone=$(docker inspect dnstt-server --format '{{json .Config.Cmd}}' 2>/dev/null \
+         | tr -d '\r' \
+         | python3 -c '
+import json, sys
+try:
+    argv = json.load(sys.stdin)
+    if not isinstance(argv, list):
+        raise ValueError
+except Exception:
+    print("UNREADABLE")
+    raise SystemExit(0)
+VALUED = {"-udp", "-listen", "-privkey-file", "-pubkey-file", "-mtu"}
+positional, skip = [], False
+for arg in (str(a) for a in argv):
+    if skip:
+        skip = False
+        continue
+    if arg in VALUED:
+        skip = True
+        continue
+    if arg.startswith("-"):
+        continue
+    positional.append(arg)
+# DOMAIN UPSTREAMADDR, in that order. Anything else -- and an empty first
+# positional, which is what an explicitly-empty VPN_DNSTT_ZONE would leave --
+# means the zone is not there.
+print(positional[0] if len(positional) == 2 and positional[0] else "MISSING")' 2>/dev/null)
+  case "$zone" in
+    UNREADABLE|'')
+      bad dnstt_zone \
+        "could not read dnstt-server's command line, so the zone it serves is unknown" \
+        '"zone":null' ;;
+    MISSING)
+      bad dnstt_zone \
+        "dnstt-server is running with NO zone argument -- it binds 53/udp, looks healthy to every other check here, and answers for nothing a client can resolve. An unset VPN_DNSTT_ZONE interpolates to nothing and drops out of the command; set it in $STATE/.env and apply" \
+        '"zone":null' ;;
+    *.*)
+      ok dnstt_zone "dnstt-server serving zone $zone" \
+        "$(printf '"zone":%s' "$(json_str "$zone")")" ;;
+    *)
+      bad dnstt_zone \
+        "dnstt-server's zone '$zone' is not a domain name -- a delegated zone needs at least one dot" \
+        "$(printf '"zone":%s' "$(json_str "$zone")")" ;;
+  esac
 fi
 
 echo "== firewall =="

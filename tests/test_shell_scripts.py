@@ -284,3 +284,88 @@ def test_no_commit_hash_in_prose() -> None:
     dep = prose("deploy")
     assert not re.search(r"\bcommit [0-9a-f]{7,40}\b", dep)
     assert "Drop CI: deploy-on-push cost more than it bought" in dep
+
+
+def _embedded_python(rel: str, first_line: str, last_prefix: str) -> str:
+    """One of the python3 -c programs these scripts embed, lifted out to be run.
+
+    Reading the text is enough for most invariants here, but not for a parser:
+    the whole point of the two below is which argv shapes they accept, and that
+    is a behaviour, not a spelling. So this pulls the program out and the tests
+    execute it -- still touching no server and starting no container.
+    """
+    lines = read(rel).splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == first_line)
+    end = next(
+        i for i, line in enumerate(lines[start:], start) if line.startswith(last_prefix)
+    )
+    return "\n".join(lines[start : end + 1])
+
+
+def _dnstt_zone_of(argv_json: str) -> str:
+    import subprocess
+
+    program = _embedded_python(
+        "scripts/smoke.sh", "import json, sys", "print(positional[0]"
+    )
+    # The last line ends with the shell's own `' 2>/dev/null)`; drop it.
+    program = program.rsplit("'", 1)[0]
+    done = subprocess.run(
+        ["python3", "-c", program], input=argv_json, capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+def test_smoke_reads_the_dnstt_zone_by_parsing_argv_not_by_indexing_it() -> None:
+    """A dropped zone must not be mistaken for the -privkey-file value.
+
+    An unset ${VPN_DNSTT_ZONE} does not arrive as an empty argument: it drops out
+    of the command entirely, so argv is one shorter and the second-to-last
+    element silently becomes /keys/server.key -- which has a dot in it and passes
+    any domain-shaped test. That is the bug this check exists to catch, so a
+    check that indexes argv reports the broken server as healthy.
+
+    The zone-present case is the real command line off this stack's own server.
+    """
+    present = (
+        '["-udp","62.60.152.48:53","-privkey-file","/keys/server.key",'
+        '"tun.example.net","127.0.0.1:2222"]'
+    )
+    assert _dnstt_zone_of(present) == "tun.example.net"
+
+    dropped = (
+        '["-udp","62.60.152.48:53","-privkey-file","/keys/server.key","127.0.0.1:2222"]'
+    )
+    assert _dnstt_zone_of(dropped) == "MISSING"
+
+    # An explicitly empty value, which is what an operator writing
+    # `VPN_DNSTT_ZONE=` rather than leaving it unset would produce.
+    empty = '["-udp","1.2.3.4:53","-privkey-file","/k","","127.0.0.1:2222"]'
+    assert _dnstt_zone_of(empty) == "MISSING"
+
+    # A flag added later must not shift the positionals.
+    extra_flag = (
+        '["-udp","1.2.3.4:53","-mtu","1200","-privkey-file","/k",'
+        '"tun.example.net","127.0.0.1:2222"]'
+    )
+    assert _dnstt_zone_of(extra_flag) == "tun.example.net"
+
+    assert _dnstt_zone_of("[]") == "MISSING"
+    assert _dnstt_zone_of("not json at all") == "UNREADABLE"
+
+
+def test_smoke_fails_rather_than_warns_on_a_zoneless_dnstt() -> None:
+    """Because every other check in the file passes on that server.
+
+    dnstt-server binds 53/udp with or without a zone, `docker ps` says running,
+    and both loopback back-ends are up -- so the only thing separating "serving"
+    from "answering for a zone nobody can resolve" is this assertion.
+    """
+    smoke = code("scripts/smoke.sh")
+    assert "dnstt_zone" in smoke
+    # The MISSING and UNREADABLE branches must both be failures, not notices.
+    missing_branch = smoke.split("MISSING)", 1)[1].split(";;", 1)[0]
+    assert "bad dnstt_zone" in missing_branch
+    unreadable_branch = smoke.split("UNREADABLE|''", 1)[1].split(";;", 1)[0]
+    assert "bad dnstt_zone" in unreadable_branch
