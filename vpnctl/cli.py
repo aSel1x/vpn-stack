@@ -12,10 +12,12 @@ rather than free to drift.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
 import sys
+from pathlib import Path
 
 from vpnctl import (
     bootstrap,
@@ -38,6 +40,7 @@ from vpnctl.paths import (
     RENDERED_LINK,
     REPO_ENV_LINK,
     STATE_DIR,
+    STATE_JSON,
 )
 
 SCHEMA = 1
@@ -62,7 +65,13 @@ def emit(ok: bool = True, **data) -> None:
         print(json.dumps({"schema": SCHEMA, "ok": ok, **data}, indent=2))
 
 
-def die(message: str, **data) -> None:
+def die(message: str, code: int = 1, **data) -> None:
+    """Report a refusal and stop. `code` is 1 unless the caller can use better.
+
+    The one other value in use is 75 (EX_TEMPFAIL), for the lock: it is what
+    `flock -E 75` in the app's wrapper already reserves for "somebody else is
+    mid-apply", so a client can tell busy from broken without reading English.
+    """
     if _JSON:
         print(
             json.dumps(
@@ -71,7 +80,76 @@ def die(message: str, **data) -> None:
         )
     else:
         warn(message)
-    raise SystemExit(1)
+    raise SystemExit(code)
+
+
+# ------------------------------------------------------------------- the lock
+
+# The one serialisation on the server. CLAUDE.md calls it "the entire
+# multi-operator story", and every caller wraps vpnctl in it already -- ./vpn,
+# scripts/deploy.sh, scripts/install.sh, the boot unit, the app. This is the
+# same lock taken from inside, so that correctness stops being a property of
+# each caller.
+LOCK_FILE = Path("/run/vpn-stack.lock")
+
+# Held for the life of the process; the kernel drops it when we exit. Kept in a
+# global so it is visibly never closed: closing the descriptor releases the lock,
+# and releasing it halfway through an apply is the same as never taking it.
+_LOCK_FD: int | None = None
+
+
+def _acquire_lock(path: Path) -> int | None:
+    """Take `path` exclusively, without blocking, or refuse with EX_TEMPFAIL.
+
+    Non-blocking is not a nicety. A plain blocking lock here deadlocks against
+    every caller that already holds this file through flock(1), because flock(1)
+    opens its own file description and the kernel treats that as a different
+    holder: `timeout 3 flock LK bash -c 'timeout 2 flock LK echo INNER'` prints
+    nothing and the inner command dies at its own timeout. Measured, not
+    assumed. VPN_STACK_LOCK_HELD is the handshake those callers export and the
+    first line of defence; LOCK_NB is the second, so a caller that forgets the
+    handshake gets a refusal rather than a process that never returns.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        # /run is root-only, and everything a mutating command does needs root
+        # anyway (docker, iptables, ufw), so this is a test directory or a dev
+        # box -- where there is no live state to serialise against and the
+        # documented VPN_STATE_DIR escape hatch has to keep working. Loud, not
+        # fatal; on the real server the wrappers hold the real lock too.
+        warn(f"warning: cannot take {path} ({exc}); running unserialised")
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        die(
+            f"another vpn-stack command holds {path}. Two writers that "
+            "read-modify-write users.json or state.json lose one of the two "
+            "writes, and two `apply` runs promote each other's candidate tree. "
+            "Nothing was changed; try again when the other one finishes.",
+            code=75,
+        )
+    return fd
+
+
+def _lock_if_mutating(args) -> int | None:
+    """Serialise the commands that write; leave the readers alone.
+
+    `status`, `user list`, `user export` and `protocol list` take no lock at
+    all. users.json and state.json are written through a temp file and
+    os.replace, so a reader never sees half of one, and a reader that could fail
+    during an apply would leave nobody able to observe the apply -- the app
+    polls `status` in exactly that window. `user export` is a reader for this
+    purpose even though it shells into the ikev2 container: it hands out
+    credentials that already exist, and the app's wrapper locks it regardless.
+    """
+    if not getattr(args, "mutates", False):
+        return None
+    if os.environ.get("VPN_STACK_LOCK_HELD"):
+        return None
+    return _acquire_lock(LOCK_FILE)
 
 
 # ----------------------------------------------------------------- the engine
@@ -99,6 +177,28 @@ def _ensure_env_link() -> None:
     REPO_ENV_LINK.symlink_to(ENV_FILE)
 
 
+def _warn_if_defaulted(defaulted: bool) -> None:
+    """Say it out loud when the protocol set was invented rather than read.
+
+    A missing state.json cannot be an error -- a freshly provisioned box has
+    none -- but the default set is not the empty set and not necessarily the set
+    this server was running. dnstt is default_enabled=False, so the first
+    converging apply after the file disappears removes its three containers and
+    deletes 53/udp from ufw exactly as if the operator had asked for it. dnstt
+    is also the last-resort protocol people fall back to when nothing else gets
+    through, which makes it the worst possible thing to turn off silently.
+    """
+    if not defaulted:
+        return
+    warn(
+        f"warning: {STATE_JSON} does not exist, so the DEFAULT protocol set is "
+        "in force -- which is not necessarily the set this server was running. "
+        "dnstt in particular is OFF by default: if it was on, converging now "
+        "removes its three containers and deletes 53/udp from ufw. Check "
+        "`vpnctl protocol list` first, or restore state.json from a backup."
+    )
+
+
 def apply(restart: bool = True, quiet: bool = False) -> dict:
     """Render -> validate -> promote -> converge containers, firewall, certs.
 
@@ -124,7 +224,10 @@ def apply(restart: bool = True, quiet: bool = False) -> dict:
 
     _ensure_env_link()
 
-    enabled = state.enabled_protocols()
+    st, defaulted = state.load_or_default()
+    _warn_if_defaulted(defaulted)
+
+    enabled = state.enabled_protocols(st)
     gaps = bootstrap.missing_secrets(enabled)
     if gaps:
         die(
@@ -136,104 +239,220 @@ def apply(restart: bool = True, quiet: bool = False) -> dict:
 
     tree, enabled = render.render_all()
     candidate = render.write_candidate(tree)
+    promoted = False
+    try:
+        try:
+            ok, output = sbctl.check_config(candidate / "sing-box")
+            if not ok:
+                die(f"sing-box rejected the new config; nothing changed.\n{output}")
 
-    ok, output = sbctl.check_config(candidate / "sing-box")
-    if not ok:
-        shutil.rmtree(candidate, ignore_errors=True)
-        die(f"sing-box rejected the new config; nothing changed.\n{output}")
+            # Read before the swap: afterwards `rendered` points at the candidate
+            # and there is nothing left to compare it against. This is what
+            # decides which containers get bounced -- a `user add` used to
+            # recreate every one of them, including the protocols whose rendered
+            # output was byte-identical.
+            previous = RENDERED_LINK.resolve() if RENDERED_LINK.exists() else None
 
-    # Read before the swap: afterwards `rendered` points at the candidate and
-    # there is nothing left to compare it against. This is what decides which
-    # containers get bounced -- a `user add` used to recreate every one of them,
-    # including the protocols whose rendered output was byte-identical.
-    previous = RENDERED_LINK.resolve() if RENDERED_LINK.exists() else None
-    render.promote(candidate)
-    changed = composectl.changed_services(previous, candidate)
+            # The mark this apply inherited, read before it lays down its own. A
+            # tree promoted by an earlier --no-restart is live on disk and in
+            # nothing else: the containers still run the tree from before it, and
+            # the diff cannot see that -- it compares two directories, never a
+            # directory against a running container. So `bootstrap --force`
+            # followed by a plain `apply` found the two trees identical, bounced
+            # nothing, and left sing-box serving the OLD REALITY key and the OLD
+            # Hysteria2 certificate for good, every port bound and smoke green,
+            # while every re-exported profile failed.
+            st = state.load()
+            inherited_pending = st.converge_pending
 
-    # A tree promoted by an earlier --no-restart is live on disk and in nothing
-    # else: the containers still run the tree from before it. The diff cannot
-    # see that -- it compares two directories, never a directory against a
-    # running container -- so `bootstrap --force` (which promotes without
-    # restarting, on purpose) followed by a plain `apply` found the two trees
-    # identical, bounced nothing, and left sing-box serving the OLD REALITY key
-    # and the OLD Hysteria2 certificate for good, every port bound and smoke
-    # green, while every re-exported profile failed.
-    #
-    # state.converge_pending carries that fact forward; see its comment in
-    # state.py for why it is its own field and not an empty last_applied.
-    st = state.load()
-    if st.converge_pending:
-        changed = None
+            render.promote(candidate)
+            promoted = True
 
-    result = {
-        "rendered": candidate.name,
-        "enabled_protocols": [p.name for p in enabled],
-        "restarted": restart,
-        "config_changed": None if changed is None else sorted(changed),
-        "converge_pending": not restart or st.converge_pending,
-    }
-    if not quiet:
-        say(
-            f"rendered {candidate.name}: {', '.join(p.name for p in enabled) or 'nothing'}"
-        )
+            # The mark goes down HERE, immediately after the swap, and exactly
+            # one place clears it: the end of a converge that reported every
+            # step. It used to be set only in the --no-restart branch, so every
+            # failure BETWEEN the promote and the clear left no mark at all --
+            # and composectl.up fails part-way by design, with sing-box last in
+            # the service order and so the usual stale victim. The operator's
+            # retry then rendered a byte-identical tree, diffed it to {},
+            # bounced nothing, passed the readiness wait because the OLD
+            # containers still held the ports, and printed "config unchanged;
+            # nothing restarted" and "OK." with exit 0. smoke.sh was green. Any
+            # exit from here on -- a die(), a Ctrl-C, an SSH drop during a long
+            # --build -- now forces the next apply to recreate everything.
+            st.converge_pending = True
+            state.save(st)
+        finally:
+            if not promoted:
+                # A candidate that never became live is a directory nothing
+                # points at, holding every user's credentials at 0600 until
+                # prune eventually walks past it. One disposal site for both
+                # reasons it can happen: sing-box rejected it, or the promote
+                # itself failed. (A candidate abandoned *inside* write_candidate
+                # has no name to delete here; prune bounds that one.)
+                shutil.rmtree(candidate, ignore_errors=True)
 
-    if not restart:
-        st.converge_pending = True
-        state.save(st)
-        say(
-            "note: NOT applied (--no-restart). Containers still run the previous config,\n"
-            "      so a convergence is now PENDING: the next `vpnctl apply` recreates\n"
-            "      every service, whether or not the rendered tree changes again."
-        )
-        return result
+        changed = composectl.changed_services(previous, candidate)
+        if inherited_pending:
+            changed = None
 
-    ok, output = composectl.up(enabled, changed)
-    if not ok:
-        die(f"could not converge the containers:\n{output}")
-    if not quiet:
-        say(
-            "  "
-            + (
-                "no live config to compare against; converged everything"
-                if changed is None
-                else f"config changed: {', '.join(sorted(changed))}"
-                if changed
-                else "config unchanged; nothing restarted"
+        result = {
+            "rendered": candidate.name,
+            "enabled_protocols": [p.name for p in enabled],
+            "restarted": restart,
+            "config_changed": None if changed is None else sorted(changed),
+            # True until a converge earns the right to clear it, and the value
+            # in the payload says which of those two happened.
+            "converge_pending": True,
+        }
+        if not quiet:
+            say(
+                f"rendered {candidate.name}: "
+                f"{', '.join(p.name for p in enabled) or 'nothing'}"
             )
-        )
-    ok, output = composectl.down_disabled(enabled)
+
+        if not restart:
+            say(
+                "note: NOT applied (--no-restart). Containers still run the previous config,\n"
+                "      so a convergence is now PENDING: the next `vpnctl apply` recreates\n"
+                "      every service, whether or not the rendered tree changes again."
+            )
+            return result
+
+        try:
+            ok, output = composectl.up(enabled, changed)
+            if not ok:
+                die(f"could not converge the containers:\n{output}")
+            if not quiet:
+                say(
+                    "  "
+                    + (
+                        "no live config to compare against; converged everything"
+                        if changed is None
+                        else f"config changed: {', '.join(sorted(changed))}"
+                        if changed
+                        else "config unchanged; nothing restarted"
+                    )
+                )
+
+            ok, output = composectl.down_disabled(enabled)
+            # Every step past `up` warns and falls through rather than dying:
+            # the boot unit needs exit 0, and the payload carries each failure
+            # in full. What makes that safe is that the failures are also
+            # MACHINE-readable -- one boolean per step, beside the prose -- so a
+            # caller does not have to pattern-match English to find out whether
+            # the server is serving.
+            result["teardown"] = output
+            result["teardown_ok"] = ok
+            if not ok:
+                warn(f"warning: could not tear down disabled services:\n{output}")
+
+            ready, notes = composectl.wait_ready(enabled)
+            result["ready"] = notes
+            result["ports_ready"] = ready
+            if not ready:
+                warn("warning: some ports never came up:\n  " + "\n  ".join(notes))
+            elif not quiet:
+                say(f"  {notes[0]}")
+
+            # A bound port is not health. dnstt-sshd listens on loopback only, so
+            # it contributes no port to the wait at all, and dnstt-server goes on
+            # holding 53/udp while the sshd behind it crash-loops -- every dnstt
+            # client then completes a tunnel to a closed door while `apply`
+            # reports success. None is "docker could not tell", which is not a
+            # clean bill of health and must not be read as one.
+            stopped = composectl.not_running(enabled)
+            result["not_running"] = stopped
+            if stopped is None:
+                warn(
+                    "warning: could not ask docker which services are running; "
+                    "a port being bound is not proof the service behind it is up"
+                )
+            elif stopped:
+                warn(
+                    "warning: expected services are not running: " + ", ".join(stopped)
+                )
+
+            ok, actions = firewall.reconcile(enabled)
+            result["firewall"] = actions
+            result["firewall_ok"] = ok
+            if not ok:
+                warn(
+                    "warning: firewall reconciliation failed:\n  "
+                    + "\n  ".join(actions)
+                )
+            elif not quiet:
+                for line in actions:
+                    say(f"  ufw: {line}")
+
+            if any(p.name == "ikev2" for p in enabled) and ikev2ctl.is_running():
+                result["ikev2_reconcile"] = reconcile_ikev2()
+        finally:
+            _reconcile_ikev2_forwarding(enabled, result)
+
+        st = state.load()
+        st.last_applied = [p.name for p in enabled]
+        # The readiness wait is the one warn-only step that still holds the mark
+        # down: a port that never bound means this convergence did not complete,
+        # so the next apply has to re-converge instead of diffing an unchanged
+        # tree and bouncing nothing. A teardown or firewall failure is not a
+        # claim that the containers are running the wrong tree, so neither keeps
+        # it set.
+        if result["ports_ready"]:
+            st.converge_pending = False
+            result["converge_pending"] = False
+        state.save(st)
+        return result
+    finally:
+        # On the way out whatever happened: the runs that leave a generation
+        # behind are exactly the ones that used to skip this, because it sat on
+        # the fully successful path. Its own failure must not turn a successful
+        # apply into a failed one -- nor print a second JSON object after die()
+        # has already printed one, which would leave --json unparseable.
+        try:
+            render.prune()
+        except Exception as exc:  # noqa: BLE001 - tidying up is never the verdict
+            warn(f"warning: could not prune old rendered generations: {exc}")
+
+
+def _reconcile_ikev2_forwarding(
+    enabled: list[protocols.Protocol], result: dict
+) -> None:
+    """Make FORWARD match the enabled set, and always record what happened.
+
+    Called from `apply`'s finally, for two reasons. It used to sit at the end,
+    after every step that can die(), so a converge failure skipped it entirely
+    -- and these are raw `iptables -I` inserts with no persistence of their own,
+    which are the difference between an IKEv2 SA that forwards traffic and one
+    that establishes and silently carries none. And when the container was not
+    running the key was simply absent from the payload, where "not applicable"
+    and "succeeded" read identically.
+
+    After firewall.reconcile, which the finally guarantees: `ufw allow` reloads
+    ufw's own rules, so the raw inserts have to come last.
+
+    Nothing else removes the pair, so `protocol off ikev2` left it behind for
+    ever. The removal is here rather than beside down_disabled so that one
+    function owns the whole question "do the FORWARD rules match the enabled
+    set", and so a converge failure cannot skip that direction either.
+    """
+    try:
+        if not any(p.name == "ikev2" for p in enabled):
+            ok, output = ikev2ctl.remove_ipv4_forwarding()
+        elif not ikev2ctl.is_running():
+            ok, output = False, "skipped, container not running"
+        else:
+            ok, output = ikev2ctl.ensure_ipv4_forwarding()
+    except OSError as exc:
+        # A missing docker or iptables binary raises out of subprocess, and this
+        # runs in a finally: letting it out would replace the converge failure
+        # that got us here with a traceback -- and, under --json, print a second
+        # payload after die() has already printed one.
+        ok, output = False, f"could not reconcile the FORWARD rules: {exc}"
+    result["ikev2_forwarding"] = output
+    result["forwarding_ok"] = ok
     if not ok:
-        warn(f"warning: could not tear down disabled services:\n{output}")
-    result["teardown"] = output
-
-    ready, notes = composectl.wait_ready(enabled)
-    result["ready"] = notes
-    if not ready:
-        warn("warning: some ports never came up:\n  " + "\n  ".join(notes))
-    elif not quiet:
-        say(f"  {notes[0]}")
-
-    ok, actions = firewall.reconcile(enabled)
-    result["firewall"] = actions
-    if not ok:
-        warn("warning: firewall reconciliation failed:\n  " + "\n  ".join(actions))
-    elif not quiet:
-        for line in actions:
-            say(f"  ufw: {line}")
-
-    if any(p.name == "ikev2" for p in enabled) and ikev2ctl.is_running():
-        fw_ok, fw_out = ikev2ctl.ensure_ipv4_forwarding()
-        result["ikev2_forwarding"] = fw_out
-        if not fw_ok:
-            warn(f"warning: IKEv2 FORWARD rules not applied: {fw_out}")
-        result["ikev2_reconcile"] = reconcile_ikev2()
-
-    st = state.load()
-    st.last_applied = [p.name for p in enabled]
-    st.converge_pending = False
-    state.save(st)
-    render.prune()
-    return result
+        warn(f"warning: IKEv2 IPv4 FORWARD rules not reconciled: {output}")
 
 
 def reconcile_ikev2() -> dict:
@@ -244,12 +463,37 @@ def reconcile_ikev2() -> dict:
     asked for, because the container was down. Without that queue, a `user rm`
     with ikev2 stopped leaves a certificate that still grants access and no
     record that it should not.
+
+    Three states a name can be in, kept apart because collapsing any two of them
+    hands somebody a credential:
+
+    A queued name that is WANTED again is revoked and then re-issued, never
+    skipped. `user rm alice` with ikev2 down queues the intent and deletes the
+    record, certificate untouched; `user add alice` afterwards is a different
+    person under a reused name. Skipping the revocation left `alice` in
+    --listclients, so the add direction issued nothing, and the new holder
+    imported the PREVIOUS holder's key pair -- and --exportclient's .p12 has a
+    verified EMPTY password, so that file is the access. The removed holder's own
+    exported profile went on working too, and the queue was emptied on the way.
+
+    A name that is only REVOKED is not present: it has no working certificate.
+    Counting it as present meant a user who was revoked and is wanted again was
+    never re-issued, and was recorded ikev2_provisioned=True -- a profile that
+    cannot connect, written down as provisioned.
+
+    A queued name the container does not hold at all (a lost volume, a restore
+    from a backup older than the certificate) has nothing to revoke and leaves
+    the queue. Retrying it for ever would put a permanent failure in every
+    apply's payload for a name that exists nowhere.
+
+    A name therefore leaves revoke_pending only when its own removal succeeded,
+    or when there was nothing left to remove -- never because it became wanted.
     """
     if not ikev2ctl.is_running():
         return {"skipped": "ikev2 container not running"}
 
-    users = users_store.load()
     st = state.load()
+    users = users_store.load()
     wanted = {u.name for u in users if u.enabled}
 
     ok, listing = ikev2ctl.list_clients()
@@ -258,49 +502,93 @@ def reconcile_ikev2() -> dict:
         # it would try to re-add every user, fail on "already exists", and then
         # rewrite ikev2_provisioned to False for everyone -- turning a
         # transient docker error into a database that says nobody has a
-        # certificate while the certificates keep working.
+        # certificate while the certificates keep working. Nothing is written.
         warn(f"warning: could not list IKEv2 clients, skipping reconcile:\n{listing}")
         return {"skipped": "listclients failed", "error": listing}
 
-    present = set()
-    if ok:
-        for line in listing.splitlines():
-            parts = line.split()
-            if (
-                len(parts) >= 2
-                and parts[1] in ("valid", "revoked")
-                and parts[0] != "Client"
-            ):
-                present.add(parts[0])
+    # `valid` is what a client can actually connect with; `reserved` is a name
+    # the IPsec database still holds for a certificate that cannot. Both are
+    # updated as this function acts, so what is written down at the end is what
+    # the container was observed to hold plus what we just did to it.
+    valid, reserved = ikev2ctl.parse_clients(listing)
+    added: list[str] = []
+    withdrawn: list[str] = []
+    revoke_failed: list[str] = []
+    add_failed: list[str] = []
 
-    added, removed, failed = [], [], []
-
-    for name in sorted(set(st.revoke_pending) | (present - wanted)):
-        if name in wanted:
+    # Every queued intent, plus every working certificate nobody wants any more.
+    # An already-revoked certificate that nobody wants is deliberately left
+    # alone: there is nothing to withdraw, and --revokeclient on it fails, which
+    # would plant a permanent failure in every apply from then on.
+    for name in sorted(set(st.revoke_pending) | (valid - wanted)):
+        if name in valid:
+            rok, output = ikev2ctl.remove_client(name)
+        elif name in reserved:
+            # Already revoked; what is left is the reservation, and that is the
+            # thing --addclient trips over if the name ever comes back.
+            rok, output = ikev2ctl.delete_client(name)
+        else:
+            warn(
+                f"note: dropping the pending IKEv2 revocation for {name!r} -- the "
+                "container holds no certificate by that name (a lost volume, or a "
+                "restore from a backup older than the certificate). There is "
+                "nothing left to revoke."
+            )
             continue
-        rok, out = ikev2ctl.remove_client(name)
-        (removed if rok else failed).append(name)
         if not rok:
-            warn(f"warning: could not revoke IKEv2 client {name!r}: {out}")
+            revoke_failed.append(name)
+            warn(f"warning: could not revoke IKEv2 client {name!r}: {output}")
+            continue
+        withdrawn.append(name)
+        valid.discard(name)
+        reserved.discard(name)
 
-    for name in sorted(wanted - present):
-        aok, out = ikev2ctl.add_client(name)
-        (added if aok else failed).append(name)
+    for name in sorted(wanted - valid):
+        if name in reserved:
+            # Revoked, so the certificate is dead but the name is still taken:
+            # --addclient answers "already exists" until it is deleted. The same
+            # ordering remove_client documents, one step of it.
+            dok, output = ikev2ctl.delete_client(name)
+            if not dok:
+                add_failed.append(name)
+                warn(
+                    f"warning: could not free the reserved IKEv2 name {name!r}, "
+                    f"so no certificate could be issued: {output}"
+                )
+                continue
+            reserved.discard(name)
+        aok, output = ikev2ctl.add_client(name)
         if not aok:
-            warn(f"warning: could not issue IKEv2 client {name!r}: {out}")
+            add_failed.append(name)
+            warn(f"warning: could not issue IKEv2 client {name!r}: {output}")
+            continue
+        added.append(name)
+        valid.add(name)
 
-    st.revoke_pending = [n for n in st.revoke_pending if n in failed]
+    st.revoke_pending = [n for n in st.revoke_pending if n in revoke_failed]
     state.save(st)
 
-    users = users_store.load()
     for user in users:
-        user.ikev2_provisioned = user.name in ((present | set(added)) - set(removed))
+        user.ikev2_provisioned = user.name in valid
     users_store.save(users)
 
-    return {"added": added, "revoked": removed, "failed": failed}
+    return {
+        "added": added,
+        "revoked": withdrawn,
+        "failed": sorted(set(revoke_failed) | set(add_failed)),
+    }
 
 
 # -------------------------------------------------------------------- commands
+
+
+# The one thing bootstrap_keyring cannot say in its return type. A half-present
+# set it REFUSED to top up is reported inside the message and nowhere else, and
+# it still returns True whenever some other protocol's keys were written -- so
+# the bool answers "did anything get written", which is not the verdict. Matched
+# on the literal prefix it emits, a coupling worth having in one visible place
+# instead of discovering it the day `bootstrap` exits 0 on a keyring it refused.
+_BOOTSTRAP_REFUSED = "NOT refilled:"
 
 
 def cmd_bootstrap(args) -> None:
@@ -316,12 +604,50 @@ def cmd_bootstrap(args) -> None:
             "until it converges, the containers still serve the old keys and every "
             "freshly exported profile fails to connect."
         )
+    # Three outcomes, and only one of them is a failure. "Nothing to generate"
+    # is success: a complete keyring is what this command is for. A half-present
+    # set that was refused is not -- it needs the missing file restored from a
+    # backup or the whole set regenerated, and reporting ok=true and exit 0 for
+    # it meant the one outcome demanding a decision was the one that looked
+    # fine. A gap that was HEALED from surviving material (reality.pub from
+    # reality.key) is success too: nothing a client holds changed.
+    if _BOOTSTRAP_REFUSED in message:
+        die(message)
     emit(ok=True, message=message)
+
+
+# The converge steps whose verdict a human is entitled to see in the last line.
+_VERDICTS = ("teardown_ok", "ports_ready", "firewall_ok", "forwarding_ok")
+
+
+def _say_verdict(result: dict, done: str) -> None:
+    """Say what happened, and refuse to say "OK." over a step that failed.
+
+    Everything after `up` warns and falls through on purpose -- the boot unit
+    needs exit 0 -- so the exit code cannot carry this, and the booleans in the
+    payload are for callers. Printing "OK." underneath a warning that a port
+    never bound is the human half of the same lie.
+    """
+    trouble = [key for key in _VERDICTS if result.get(key) is False]
+    # None is "docker could not tell", and that is not a clean bill of health
+    # either -- reading it as one is how `protocol off` once reported success
+    # while the protocol kept serving traffic.
+    stopped = result.get("not_running", [])
+    if stopped is None or stopped:
+        trouble.append("not_running")
+    if not trouble:
+        say(f"{done} OK.")
+        return
+    say(
+        f"{done} NOT OK: {', '.join(trouble)}. Read the warnings above -- this "
+        "server may not be serving. Nothing here exits non-zero because the boot "
+        "unit depends on that; the payload carries each failure in full."
+    )
 
 
 def cmd_apply(args) -> None:
     result = apply(restart=not args.no_restart)
-    say("OK.")
+    _say_verdict(result, "Applied.")
     emit(ok=True, **result)
 
 
@@ -412,7 +738,7 @@ def _set_protocol(name: str, on: bool) -> None:
         _prepare_secrets(proto, st)
 
     result = apply()
-    say("OK.")
+    _say_verdict(result, "Applied.")
     emit(ok=True, changed=True, **result)
 
 
@@ -436,7 +762,7 @@ def cmd_user_add(args) -> None:
     users.append(user)
     users_store.save(users)
     result = apply()
-    say(f"Added user {args.name!r}.")
+    _say_verdict(result, f"Added user {args.name!r}.")
     emit(ok=True, user=args.name, **result)
 
 
@@ -455,7 +781,7 @@ def cmd_user_rm(args) -> None:
             state.save(st)
     users_store.save([u for u in users if u.name.lower() != args.name.lower()])
     result = apply()
-    say(f"Removed user {args.name!r}.")
+    _say_verdict(result, f"Removed user {args.name!r}.")
     emit(ok=True, user=args.name, **result)
 
 
@@ -478,7 +804,7 @@ def _set_enabled(args, enabled: bool) -> None:
             "any previously imported IKEv2 profile stops working and needs re-exporting."
         )
     result = apply()
-    say(f"{'Enabled' if enabled else 'Disabled'} user {args.name!r}.")
+    _say_verdict(result, f"{'Enabled' if enabled else 'Disabled'} user {args.name!r}.")
     emit(ok=True, user=args.name, enabled=enabled, **result)
 
 
@@ -540,6 +866,7 @@ def cmd_user_export(args) -> None:
     keyring = render.snapshot()
     payload: dict[str, list[dict]] = {}
     failures: list[str] = []
+    notes: list[str] = []
     for name in names:
         proto = protocols.get(name)
         if proto.share_via_container:
@@ -547,6 +874,7 @@ def cmd_user_export(args) -> None:
                 warn(
                     f"[{name}] no certificate provisioned for {user.name!r}; skipping."
                 )
+                notes.append(f"{name}: no certificate provisioned")
                 continue
             ok, message, bundles = ikev2ctl.export_client(user.name)
             say(f"\n[{name}]\n{message}")
@@ -555,6 +883,7 @@ def cmd_user_export(args) -> None:
                 # ends up missing the one profile the recipient asked for.
                 warn(f"[{name}] export failed: {message}")
                 failures.append(name)
+                notes.append(f"{name}: export failed")
                 continue
             payload[name] = [
                 {"filename": fn, "label": ikev2ctl.bundle_label(fn), "b64": _b64(blob)}
@@ -587,6 +916,42 @@ def cmd_user_export(args) -> None:
                 payload[name].append(
                     {"label": item.label, "fields": [list(f) for f in item.fields]}
                 )
+            elif item.filename:
+                # The same {filename, label, b64} the ikev2 branch above emits,
+                # because to the app both are one ShareFile. The branch was
+                # missing: the loop printed `uri`, then `fields`, and dropped
+                # anything else without a word -- so the first protocol whose
+                # pure share() returns a file would have reported ok with the one
+                # deliverable the recipient needed simply absent from the
+                # payload. ShareItem.__post_init__ guarantees the content.
+                say(f"  {item.filename} ({len(item.content or b'')} bytes)")
+                payload[name].append(
+                    {
+                        "filename": item.filename,
+                        "label": item.label,
+                        "b64": _b64(item.content or b""),
+                    }
+                )
+            else:
+                # Unreachable from the registry -- ShareItem.__post_init__ admits
+                # exactly one shape and refuses a file with no content. It raises
+                # here anyway because reaching it SILENTLY is the failure the
+                # branch above exists to fix, and a fourth shape would arrive the
+                # same way the third did.
+                raise protocols.RenderError(
+                    f"[{name}] share item {item.label!r} is in no shape this "
+                    "command knows how to emit"
+                )
+
+    if not any(payload.values()):
+        # ok:true with an empty payload is the same lie the ikev2 branch already
+        # refuses to tell: this command exists to hand somebody a credential, and
+        # a receipt with no credential in it exits 0 and reads as "done". Every
+        # reason is collected above rather than inferred here, because "no
+        # certificate provisioned" and "the export failed" need different fixes.
+        detail = "; ".join(notes) if notes else "no protocol is enabled"
+        die(f"nothing to export for {user.name!r}: {detail}")
+
     emit(ok=not failures, user=user.name, host=host, protocols=payload, failed=failures)
 
 
@@ -600,19 +965,41 @@ def cmd_ikev2_list(args) -> None:
     if not ikev2ctl.is_running():
         die("ikev2 container isn't running.")
     ok, output = ikev2ctl.list_clients()
+    if not ok:
+        # ok:false with exit 0 was the shape here, and the listing IS the whole
+        # answer: a caller that trusts the exit code reads a failed query as an
+        # empty client list, which is precisely the misreading reconcile_ikev2
+        # aborts rather than make.
+        die(f"could not list IKEv2 clients:\n{output}")
     say(output)
-    emit(ok=ok, output=output)
+    emit(ok=True, output=output)
 
 
 def cmd_ikev2_reconcile(args) -> None:
     guard.require_server("ikev2 reconcile")
     result = reconcile_ikev2()
     say(json.dumps(result, indent=2))
+    # A name in `failed` is one of two things, and both are the operator's
+    # problem right now: a revocation that did not run, so somebody's
+    # certificate still grants access, or a certificate that was not issued, so
+    # somebody has no profile. Exiting 0 on that is the same lie `list-clients`
+    # told. A `skipped` reconcile is deliberately NOT a failure -- it could not
+    # observe the truth and so refused to guess, which is the documented
+    # contract the app reads.
+    if result.get("failed"):
+        die(
+            "IKEv2 reconciliation is incomplete for: "
+            + ", ".join(result["failed"])
+            + ". A failed revocation means that certificate still works; it "
+            "stays in revoke_pending and is retried on the next apply.",
+            **result,
+        )
     emit(ok=True, **result)
 
 
 def cmd_status(args) -> None:
-    st = state.load()
+    st, defaulted = state.load_or_default()
+    _warn_if_defaulted(defaulted)
     users = users_store.load()
     info = {
         "state_dir": str(STATE_DIR),
@@ -638,6 +1025,10 @@ def build_parser() -> argparse.ArgumentParser:
     # programmatically should not have to know where argparse wants the flag.
     # SUPPRESS is what makes this work -- without it the subparser's own
     # default would overwrite a value already set at the top level.
+    # `mutates` is declared per subcommand rather than matched against a list of
+    # names in main(): the list and the parser are edited at different times, and
+    # a new mutating subcommand that nobody remembered to add to the list takes
+    # no lock while looking exactly like one that does.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--json",
@@ -664,13 +1055,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="regenerate EVERY key -- invalidates every exported profile, no undo",
     )
-    c.set_defaults(func=cmd_bootstrap)
+    c.set_defaults(func=cmd_bootstrap, mutates=True)
 
     c = sub.add_parser(
         "apply", help="render, validate and converge the server", parents=[common]
     )
     c.add_argument("--no-restart", action="store_true", help="render and validate only")
-    c.set_defaults(func=cmd_apply)
+    c.set_defaults(func=cmd_apply, mutates=True)
 
     pr = sub.add_parser("protocol", help="turn protocols on and off", parents=[common])
     pr_sub = pr.add_subparsers(dest="protocol_command", required=True)
@@ -678,10 +1069,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=cmd_protocol_list)
     c = pr_sub.add_parser("on", parents=[common])
     c.add_argument("name")
-    c.set_defaults(func=cmd_protocol_on)
+    c.set_defaults(func=cmd_protocol_on, mutates=True)
     c = pr_sub.add_parser("off", parents=[common])
     c.add_argument("name")
-    c.set_defaults(func=cmd_protocol_off)
+    c.set_defaults(func=cmd_protocol_off, mutates=True)
 
     u = sub.add_parser("user", help="manage users", parents=[common])
     u_sub = u.add_subparsers(dest="user_command", required=True)
@@ -693,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         c = u_sub.add_parser(name, help=helptext, parents=[common])
         c.add_argument("name")
-        c.set_defaults(func=fn)
+        c.set_defaults(func=fn, mutates=True)
     c = u_sub.add_parser("list", parents=[common])
     c.add_argument("--show-secrets", action="store_true")
     c.set_defaults(func=cmd_user_list)
@@ -713,15 +1104,16 @@ def build_parser() -> argparse.ArgumentParser:
     c = ik_sub.add_parser(
         "reconcile", help="make certificates match the enabled users", parents=[common]
     )
-    c.set_defaults(func=cmd_ikev2_reconcile)
+    c.set_defaults(func=cmd_ikev2_reconcile, mutates=True)
 
     return p
 
 
 def main() -> None:
-    global _JSON
+    global _JSON, _LOCK_FD
     args = build_parser().parse_args()
     _JSON = getattr(args, "json", False)
+    _LOCK_FD = _lock_if_mutating(args)
     try:
         args.func(args)
     except protocols.RenderError as e:
@@ -732,6 +1124,13 @@ def main() -> None:
         # The database being unreadable is an operator problem with a stated
         # remedy, not a bug. A traceback here buries the one sentence that
         # says what to do.
+        die(str(e))
+    except state.StateError as e:
+        # Beside users_store for the same reason, and with a wider blast radius:
+        # every command reads state.json, `status` included, so an unhandled
+        # decode error here is not one broken command but a server with no
+        # working command surface, answering a traceback that names neither the
+        # file nor the remedy.
         die(str(e))
 
 

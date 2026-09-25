@@ -1,8 +1,7 @@
 import ipaddress
-import os
 import subprocess
 
-from vpnctl.paths import IKEV2_CONTAINER_NAME, ROOT, STATE_DIR
+from vpnctl.paths import IKEV2_CONTAINER_NAME
 
 
 def _docker_exec(*args: str) -> tuple[bool, str]:
@@ -27,42 +26,6 @@ def is_running() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def apply_env() -> tuple[bool, str]:
-    """Recreate the ikev2 container so it picks up new .env values.
-
-    The hwdsl2 image only reads VPN_ADDL_USERS/VPN_ADDL_PASSWORDS at startup,
-    so unlike sing-box this briefly drops *every* active session this container
-    serves -- L2TP, Cisco IPsec and IKEv2 alike, not just the user being added
-    or removed. IKEv2 *certificates* survive (they live in the ikev2-vpn-data
-    volume, not in the container); live IKEv2 *tunnels* do not.
-
-    A failure to (re)install the FORWARD rules fails this call rather than
-    being appended to a string the caller discards on success: without those
-    rules IKEv2 IPv4 clients still connect but carry no traffic, which is
-    silent and expensive to diagnose.
-    """
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "--force-recreate", "--no-deps", "ikev2"],
-        cwd=ROOT,
-        env={**os.environ, "VPN_STATE": str(STATE_DIR)},
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode != 0:
-        return False, output
-
-    fw_ok, fw_output = ensure_ipv4_forwarding()
-    if not fw_ok:
-        return False, (
-            f"{output}\nthe ikev2 container restarted, but the IKEv2 IPv4 FORWARD "
-            f"rules could NOT be applied: {fw_output}\nIKEv2 clients will connect "
-            "and carry no traffic until this is fixed (needs root)."
-        )
-    return True, output
-
-
 # The pool IKEv2 clients are actually assigned addresses from.
 #
 # This said 192.168.42.0/24 until 2026-09-08, and that was the wrong subnet.
@@ -84,41 +47,110 @@ def apply_env() -> tuple[bool, str]:
 _IKEV2_IPV4_NET_DEFAULT = "192.168.43.0/24"
 
 
-def _ikev2_ipv4_net() -> tuple[str, str]:
-    """Return (network, how we know it) for the pool IKEv2 clients draw from.
+def _covering_net(entry: str) -> str | None:
+    """The smallest network holding one `first-last` pool entry, or None.
 
-    `conn ikev2-cp`'s own `rightaddresspool` is authoritative, because it is
-    literally the range pluto hands out -- checked first for that reason.
-    VPN_XAUTH_NET is only a fallback: run.sh uses it for its *firewall* rules
-    while ikev2.sh builds the pool from VPN_XAUTH_POOL, so the two can be set
-    apart and trusting the net would reproduce exactly the bug this replaced
-    (rules for addresses no client is given). The pool branch assumes a /24,
-    which is what every stock deployment uses.
+    Derived from BOTH ends rather than assuming a /24 on the first. A pool of
+    192.168.43.10-192.168.44.250 is a straddling range, and calling it
+    192.168.43.0/24 leaves half of it outside every rule and outside both
+    health checks -- green, while the clients holding those addresses forward
+    nothing. The covering network can be wider than the pool
+    (summarize_address_range splits a straddling range into several networks;
+    what one rule can name is the supernet holding all of them), and wider is
+    the safe direction: these accepts gate forwarding for addresses this server
+    hands out, and an address inside the covering network but outside the pool
+    is one pluto never assigns to anybody.
+
+    IPv6 entries return None -- see ensure_ipv4_forwarding on why that half of a
+    dual-stack pool is out of scope rather than silently handed to iptables.
     """
-    ok, conf = _docker_exec("cat", "/etc/ipsec.d/ikev2.conf")
-    if ok:
-        for line in conf.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("rightaddresspool="):
-                continue
-            for entry in stripped.split("=", 1)[1].split(","):
-                first = entry.split("-")[0].strip()
-                try:
-                    addr = ipaddress.ip_address(first)
-                except ValueError:
-                    continue
-                if addr.version == 4:
-                    net = ipaddress.ip_network(f"{first}/24", strict=False)
-                    return str(net), "conn ikev2-cp rightaddresspool"
+    bounds = [b.strip() for b in entry.strip().split("-") if b.strip()]
+    if not bounds:
+        return None
+    try:
+        if len(bounds) == 1 and "/" in bounds[0]:
+            # rightaddresspool takes a CIDR as happily as a range.
+            block = ipaddress.ip_network(bounds[0], strict=False)
+            first, last = block.network_address, block.broadcast_address
+        else:
+            first = ipaddress.ip_address(bounds[0])
+            last = ipaddress.ip_address(bounds[-1])
+    except ValueError:
+        return None
+    if first.version != 4 or last.version != 4 or last < first:
+        return None
+    covering = next(ipaddress.summarize_address_range(first, last))
+    while covering.broadcast_address < last:
+        covering = covering.supernet()
+    return str(covering)
 
-    ok, value = _docker_exec("printenv", "VPN_XAUTH_NET")
-    if ok and value:
+
+def pool_network(conf: str | None, xauth_net: str | None) -> tuple[str, str]:
+    """(network, how we know it) from what the container was able to tell us.
+
+    Pure, and deliberately separate from the two `docker exec`s that fetch its
+    arguments: what it returns goes straight to `iptables`, and the last time it
+    was wrong -- a plausible constant, 192.168.42.0/24 -- every rule vpnctl
+    installed protected addresses no IKEv2 client is ever given, while both
+    health checks asserted that same constant and reported green. A parse with
+    no test is how that survives a year; this one is exercised against real
+    ikev2.conf text with no container anywhere.
+
+    `conn ikev2-cp`'s own rightaddresspool is authoritative because it is
+    literally the range pluto hands out. VPN_XAUTH_NET is only a fallback:
+    run.sh uses it for its *firewall* rules while ikev2.sh builds the pool from
+    VPN_XAUTH_POOL, so the two can be set apart, and preferring the net would
+    reproduce exactly the bug above for anyone who set only one of them. It is
+    validated before use, because an unparseable address makes `iptables -C`
+    fail in a way indistinguishable from "the rule is missing" -- reporting a
+    healthy box as broken.
+
+    Either source failing falls through to the image default, and the provenance
+    then says which one failed: a default that reads like an answer is the shape
+    of the original mistake, so the caller has to be able to see that nothing
+    ever answered.
+    """
+    why = "container config unreadable"
+    if conf:
+        pool = next(
+            (
+                line.strip().split("=", 1)[1]
+                for line in conf.splitlines()
+                if line.strip().startswith("rightaddresspool=")
+            ),
+            None,
+        )
+        # The first match, which is what scripts/smoke.sh and
+        # scripts/diagnose-ikev2.sh also take: ikev2.sh writes exactly one
+        # rightaddresspool, in `conn ikev2-cp`.
+        if pool is None:
+            why = "ikev2.conf names no rightaddresspool"
+        else:
+            for entry in pool.split(","):
+                net = _covering_net(entry)
+                if net:
+                    return net, "conn ikev2-cp rightaddresspool"
+            why = "conn ikev2-cp offers no IPv4 pool"
+
+    if xauth_net:
         try:
-            return str(ipaddress.ip_network(value, strict=False)), "VPN_XAUTH_NET"
+            block = ipaddress.ip_network(xauth_net.strip(), strict=False)
         except ValueError:
-            pass
+            why = f"VPN_XAUTH_NET={xauth_net.strip()!r} does not parse as a network"
+        else:
+            if block.version == 4:
+                return str(block), "VPN_XAUTH_NET"
+            why = f"VPN_XAUTH_NET={xauth_net.strip()!r} is not IPv4"
 
-    return _IKEV2_IPV4_NET_DEFAULT, "image default -- container config unreadable"
+    return _IKEV2_IPV4_NET_DEFAULT, f"image default -- {why}"
+
+
+def _ikev2_ipv4_net() -> tuple[str, str]:
+    """Ask the container the two questions pool_network decides between."""
+    ok, conf = _docker_exec("cat", "/etc/ipsec.d/ikev2.conf")
+    got_conf = conf if ok else None
+    ok, value = _docker_exec("printenv", "VPN_XAUTH_NET")
+    return pool_network(got_conf, value if ok else None)
 
 
 def _default_iface() -> str | None:
@@ -129,6 +161,30 @@ def _default_iface() -> str | None:
         return None
     parts = result.stdout.split()
     return parts[parts.index("dev") + 1] if "dev" in parts else None
+
+
+def _forward_rules(iface: str, net: str) -> list[list[str]]:
+    """The accept pair, written once so ensure and remove cannot disagree.
+
+    Both directions, because one accept without the other still means no
+    traffic -- and checking only the outbound one is how a missing pair hid
+    before.
+    """
+    return [
+        [
+            "-i",
+            iface,
+            "-d",
+            net,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ],
+        ["-s", net, "-o", iface, "-j", "ACCEPT"],
+    ]
 
 
 def ensure_ipv4_forwarding() -> tuple[bool, str]:
@@ -147,6 +203,13 @@ def ensure_ipv4_forwarding() -> tuple[bool, str]:
     someone notices IKEv2 carries no traffic. Re-ensuring them here costs two
     iptables -C calls and closes that hole.
 
+    IKEv2 over IPv6 is deliberately out of scope: the pool's IPv6 half
+    (fddd:500:500:500::1000-... on a stock image) gets no ip6tables pair here,
+    so an IPv6 IKEv2 client depends entirely on the image's own rules. Scoping
+    it out is stated rather than implied because the alternative -- a parse that
+    quietly drops the half it cannot handle -- is the shape of the bug this
+    whole area already had once.
+
     Idempotent (checks before inserting); safe to call anytime, including after
     every ikev2 container restart.
     """
@@ -155,22 +218,7 @@ def ensure_ipv4_forwarding() -> tuple[bool, str]:
         return False, "could not determine default network interface"
 
     net, provenance = _ikev2_ipv4_net()
-    rules = [
-        [
-            "-i",
-            iface,
-            "-d",
-            net,
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ],
-        ["-s", net, "-o", iface, "-j", "ACCEPT"],
-    ]
-    for rule in rules:
+    for rule in _forward_rules(iface, net):
         check = subprocess.run(
             ["iptables", "-C", "FORWARD", *rule], capture_output=True, text=True
         )
@@ -184,8 +232,72 @@ def ensure_ipv4_forwarding() -> tuple[bool, str]:
     return True, f"IKEv2 IPv4 FORWARD rules ensured on {iface} for {net} ({provenance})"
 
 
+def remove_ipv4_forwarding() -> tuple[bool, str]:
+    """Take that pair back out, for a server that no longer serves IKEv2.
+
+    Nothing used to remove them, so `protocol off ikev2` left two raw inserts in
+    FORWARD with no owner, no persistence and no protocol behind them -- and the
+    next person to read the chain had no way to tell them from a rule somebody
+    meant. An ensure with no mirror is a rule that accumulates.
+
+    Deleted while `-C` still matches, up to a bound, because the image's own
+    run.sh installs the identical pair and identical rules are indistinguishable
+    to iptables: there is no owner to compare against. Removing the image's copy
+    too is acceptable exactly here -- the container it belongs to is going away,
+    and it reinstalls its own pair the next time it starts.
+
+    The pool can only be asked of a *running* container, so by the time this
+    runs the answer is usually the image default. A server with a custom
+    VPN_XAUTH_POOL therefore keeps its rules, and `-C` says so by not matching:
+    the provenance in the message is what distinguishes "nothing to remove"
+    from "nothing was answering".
+    """
+    iface = _default_iface()
+    if not iface:
+        return False, "could not determine default network interface"
+
+    net, provenance = _ikev2_ipv4_net()
+    removed = 0
+    for rule in _forward_rules(iface, net):
+        # A bound rather than `while True`: an iptables that goes on reporting a
+        # match it will not delete would otherwise spin for ever inside `apply`.
+        for _ in range(8):
+            check = subprocess.run(
+                ["iptables", "-C", "FORWARD", *rule], capture_output=True, text=True
+            )
+            if check.returncode != 0:
+                break
+            delete = subprocess.run(
+                ["iptables", "-D", "FORWARD", *rule], capture_output=True, text=True
+            )
+            if delete.returncode != 0:
+                return False, (delete.stdout + delete.stderr).strip()
+            removed += 1
+    if not removed:
+        return True, (f"no IKEv2 IPv4 FORWARD rules to remove for {net} ({provenance})")
+    return True, (
+        f"removed {removed} IKEv2 IPv4 FORWARD rule(s) on {iface} for {net} "
+        f"({provenance})"
+    )
+
+
 def add_client(name: str) -> tuple[bool, str]:
     return _docker_exec("ikev2.sh", "--addclient", name)
+
+
+def delete_client(name: str) -> tuple[bool, str]:
+    """Free a reserved client name, without pretending to revoke anything.
+
+    `--deleteclient` on its own does NOT stop that certificate being accepted --
+    the image's own warning says so -- so this is never the way to withdraw
+    access; remove_client is. What it does is release the name from the IPsec
+    database, which is the only thing standing between a revoked client and a
+    fresh certificate under the same name: `--addclient` for a name that is
+    merely revoked fails with "already exists", confirmed live.
+
+    `-y` or it blocks on an interactive confirmation prompt.
+    """
+    return _docker_exec("ikev2.sh", "--deleteclient", name, "-y")
 
 
 def remove_client(name: str) -> tuple[bool, str]:
@@ -211,6 +323,37 @@ def remove_client(name: str) -> tuple[bool, str]:
 
 def list_clients() -> tuple[bool, str]:
     return _docker_exec("ikev2.sh", "--listclients")
+
+
+def parse_clients(listing: str) -> tuple[set[str], set[str]]:
+    """(valid, revoked) from `ikev2.sh --listclients`. Pure.
+
+    Two sets and not one, because a revoked certificate is not a certificate:
+    everything upstream treated a single `present` set as "has a working
+    profile", so a user who was revoked and is wanted again was never re-issued
+    and was then recorded ikev2_provisioned=True -- a profile that cannot
+    connect, written down as provisioned. The two states also need different
+    repairs (delete then add for a revoked name; nothing but add for an absent
+    one), which is exactly the distinction a single set cannot carry.
+
+    The format belongs to an image this repo does not own and hard-codes the CLI
+    contract of, which is why it is parsed in one tested place instead of inline:
+    a header row whose first field is `Client`, then one row per client with the
+    status in the second field. A row in neither status is ignored rather than
+    guessed at -- an unknown status must not become a working certificate this
+    code believes in.
+    """
+    valid: set[str] = set()
+    revoked: set[str] = set()
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] == "Client":
+            continue
+        if parts[1] == "valid":
+            valid.add(parts[0])
+        elif parts[1] == "revoked":
+            revoked.add(parts[0])
+    return valid, revoked
 
 
 # (container filename suffix, exports/ filename suffix, human label).
