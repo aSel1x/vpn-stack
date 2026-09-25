@@ -1,7 +1,7 @@
 name: vpn_stack_app
 description: Provision a server and connect to it. Client for the vpn-stack CLI.
 publish_to: none
-version: 0.1.0
+version: 0.2.0
 
 environment:
   # Flutter 3.47.4 stable ships Dart 3.13.3; taken from the release manifest,
