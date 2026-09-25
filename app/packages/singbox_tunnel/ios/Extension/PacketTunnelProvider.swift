@@ -35,13 +35,22 @@ import NetworkExtension
 import os
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
-    private let log = OSLog(subsystem: "io.github.asel1x.singbox_tunnel", category: "tunnel")
+    private let log = OSLog(subsystem: TunnelWire.logSubsystem, category: "tunnel")
 
     /// One queue, and everything that touches libbox runs on it.
     /// `startOrReloadService` brings the entire box up inside the call, which is
     /// seconds; interleaving it with a stop is a use-after-close of the command
     /// server.
-    private let worker = DispatchQueue(label: "io.github.asel1x.singbox_tunnel.worker")
+    ///
+    /// IT ALSO OWNS EVERY PROPERTY BELOW -- `commandServer`, `startId`,
+    /// `reportedFailure` and the one-shot initialisation of `platform` -- and the
+    /// entry points iOS calls on its own thread, startTunnel, stopTunnel, sleep
+    /// and wake, hop onto it before touching one. `sleep` reading `commandServer`
+    /// while a start is still building it is the same race as a stop interleaved
+    /// with a start, and it ends the same way: a pause() or a wake() on a server
+    /// that is being replaced underneath it. A `lazy var` is not thread-safe
+    /// either, and `platform` is the object holding the tun evidence.
+    private let worker = DispatchQueue(label: "\(TunnelWire.logSubsystem).worker")
 
     private var commandServer: LibboxCommandServer?
     private lazy var platform = LibboxPlatform(self)
@@ -50,18 +59,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// account of itself from the last one's.
     private var startId = ""
 
+    /// Whether this run has already written a `failed` status.
+    ///
+    /// iOS calls stopTunnel after a start that failed as well as after a healthy
+    /// run, and the second write would replace the only account of what broke --
+    /// "libbox setup failed: ..." -- with a bland "the tunnel was stopped". The
+    /// app has no other channel for that sentence: a provider's start failure
+    /// reaches nobody through NEVPNStatus.
+    private var reportedFailure = false
+
     override func startTunnel(
         options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void
     ) {
-        // Before anything that can fail, so that even a failure to find the
-        // configuration is attributable to a run the app is waiting on. A status
-        // written under an empty id is one the app is right to ignore, and
-        // ignoring it would cost the only account of what went wrong.
-        startId =
-            (options?[StartOptions.startIdKey] as? String)
-            ?? ((try? SharedState.readStartOptions())?.startId ?? "")
-
         worker.async { [self] in
+            // Before anything that can fail, so that even a failure to find the
+            // configuration is attributable to a run the app is waiting on. A
+            // status written under an empty id is one the app is right to
+            // ignore, and ignoring it would cost the only account of what went
+            // wrong.
+            //
+            // Taken from `options` alone, and deliberately NOT by reading the
+            // file here as well: that record carries the whole sing-box
+            // configuration, and decoding all of it for one field -- twice,
+            // because resolveStartOptions reads it again below -- is exactly the
+            // kind of transient copy that gets a network extension killed at
+            // Apple's ceiling, which DTS puts at 50 MiB for iOS 15 and later. A
+            // start with no options is one iOS issued by itself, from the switch
+            // in Settings or by relaunching a provider it killed, so there is no
+            // app waiting on an id for it; resolveStartOptions reuses the
+            // persisted one a moment later, which is what re-attributes a
+            // relaunch to the run the app is still watching.
+            startId = (options?[StartOptions.startIdKey] as? String) ?? ""
             do {
                 try startBox(options: options)
                 writeStatus(.connected, nil)
@@ -187,19 +215,50 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         with reason: NEProviderStopReason, completionHandler: @escaping () -> Void
     ) {
         worker.async { [self] in
-            writeStatus(.disconnected, "The tunnel was stopped: \(Self.describe(reason)).")
+            // A failure this run already named is left exactly as it stands:
+            // see reportedFailure, the specific cause is the whole diagnostic
+            // and this is the call that would bury it.
+            if !reportedFailure {
+                if let failure = Self.failure(for: reason) {
+                    writeStatus(.failed, failure)
+                } else {
+                    writeStatus(.disconnected, "The tunnel was stopped: \(Self.describe(reason)).")
+                }
+            }
+            // The persisted configuration carries the credential -- the VLESS
+            // UUID, or the Hysteria2 password and its obfs password -- and it is
+            // kept for exactly one reason: so that a provider iOS starts with no
+            // options can find what to run. A stop the person asked for and a
+            // profile that has been removed both retire that reason, and after
+            // either one the file is only a credential sitting in a container
+            // that anything holding the switch in Settings could spend. Every
+            // other reason leaves it: a run the system killed at its memory
+            // ceiling is relaunched with no options and has to find it.
+            if reason == .userInitiated || reason == .configurationRemoved {
+                do {
+                    try SharedState.clearStartOptions()
+                } catch {
+                    os_log(
+                        "could not delete the persisted configuration: %{public}@", log: log,
+                        type: .error, error.localizedDescription)
+                }
+            }
             releaseEngine()
             completionHandler()
         }
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
-        commandServer?.pause()
-        completionHandler()
+        worker.async { [self] in
+            commandServer?.pause()
+            completionHandler()
+        }
     }
 
     override func wake() {
-        commandServer?.wake()
+        worker.async { [self] in
+            commandServer?.wake()
+        }
     }
 
     /// Called by LibboxPlatform.serviceStop(), which is how libbox asks the host
@@ -210,6 +269,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     func writeStatus(_ stage: TunnelStage, _ message: String?) {
+        if stage == .failed {
+            reportedFailure = true
+        }
         do {
             try SharedState.writeStatus(
                 SharedTunnelStatus(
@@ -245,21 +307,68 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         platform.reset()
     }
 
+    /// The text for a stop that is a FAILURE, or nil when it is an ending.
+    ///
+    /// The four here are the ones where the tunnel went away, the person did not
+    /// ask for that, and it is not coming back on its own -- which is the rule
+    /// SingboxVpnService.onRevoke follows on the other platform. Reported as a
+    /// clean disconnect they arrive in the UI as a tunnel that simply stopped,
+    /// and the next thing anybody does is look for a bug in the configuration.
+    ///
+    /// `.noNetworkAvailable` is deliberately NOT here. It is the one stop with an
+    /// obvious external cause and an obvious next move, the tunnel is expected
+    /// back with the network, and calling that a failure would put a red screen
+    /// in front of somebody walking into a lift.
+    private static func failure(for reason: NEProviderStopReason) -> String? {
+        switch reason {
+        case .providerFailed:
+            return
+                "iOS stopped the tunnel because this extension failed. Nothing is being tunnelled. "
+                + "The usual cause is the system terminating it at its memory ceiling; sing-box's "
+                + "own OOM killer leaves a crash report in the App Group container when it gets "
+                + "there first."
+        case .configurationFailed:
+            return
+                "iOS stopped the tunnel because the VPN configuration it was started from is not "
+                + "usable. Nothing is being tunnelled. That is the profile this app installs, not "
+                + "the sing-box configuration inside it: reinstall it by connecting again."
+        case .connectionFailed:
+            return
+                "iOS stopped the tunnel because the connection failed. Nothing is being tunnelled."
+        case .unrecoverableNetworkChange:
+            return
+                "iOS stopped the tunnel after a network change it could not carry the session "
+                + "across. Nothing is being tunnelled; connecting again establishes a new session "
+                + "on the network the device is on now."
+        default:
+            return nil
+        }
+    }
+
     private static func describe(_ reason: NEProviderStopReason) -> String {
-        // Five named and the rest by number, on purpose: NEProviderStopReason
-        // gains cases between SDKs, and a switch that enumerates all of them is
-        // a build error on the first runner image that ships a newer one.
+        // Named where the text is worth having and the rest by number, on
+        // purpose: NEProviderStopReason gains cases between SDKs, and a switch
+        // that enumerates all of them is a build error on the first runner image
+        // that ships a newer one.
         switch reason {
         case .userInitiated:
             return "the user turned it off"
         case .providerDisabled:
             return "the configuration was disabled"
+        case .configurationDisabled:
+            return "the configuration was switched off"
         case .configurationRemoved:
             return "the configuration was removed"
         case .superceded:
             return "another VPN took over"
         case .noNetworkAvailable:
             return "there was no network"
+        case .idleTimeout:
+            return "it was idle"
+        case .sleep:
+            return "the device went to sleep"
+        case .appUpdate:
+            return "the app was updated"
         default:
             return "NEProviderStopReason \(reason.rawValue)"
         }

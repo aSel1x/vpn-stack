@@ -43,12 +43,28 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
 {
     private unowned let provider: PacketTunnelProvider
 
-    /// Set by [openTun] and read by PacketTunnelProvider once
-    /// `startOrReloadService` has returned. It is the difference between a
-    /// tunnel and a process.
-    private(set) var didOpenTun = false
-
-    private var networkSettings: NEPacketTunnelNetworkSettings?
+    /// Guards the three properties below, every one of which is written in one
+    /// context and read in another.
+    ///
+    /// libbox calls this object from its own goroutines and gomobile promises
+    /// nothing about which thread any of them lands on: `openTun` writes
+    /// `openedTun` and `appliedSettings` from the goroutine inside
+    /// `startOrReloadService`, `startDefaultInterfaceMonitor` writes `pathMonitor`
+    /// from another, and `getInterfaces` and `clearDNSCache` read them from
+    /// whichever one asks. Meanwhile `didOpenTun` -- the single fact that
+    /// separates a tunnel from a running process -- is read by
+    /// PacketTunnelProvider on its worker queue, and `reset()` clears all three
+    /// from there. A Bool written on one thread and read on another is not
+    /// merely stale: without the lock's release/acquire pair nothing orders the
+    /// write against the read at all, and the answer this build reports
+    /// connected on would be a guess.
+    ///
+    /// A plain lock and not the provider's worker queue, because `openTun` is
+    /// called from INSIDE the `startOrReloadService` that the worker queue is
+    /// blocked on: dispatching there would deadlock the start it is part of.
+    private let state = NSLock()
+    private var openedTun = false
+    private var appliedSettings: NEPacketTunnelNetworkSettings?
     private var pathMonitor: Network.NWPathMonitor?
 
     init(_ provider: PacketTunnelProvider) {
@@ -56,11 +72,33 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
         super.init()
     }
 
+    /// Set by [openTun] and read by PacketTunnelProvider once
+    /// `startOrReloadService` has returned. It is the difference between a
+    /// tunnel and a process.
+    var didOpenTun: Bool {
+        withState { openedTun }
+    }
+
     func reset() {
-        pathMonitor?.cancel()
-        pathMonitor = nil
-        networkSettings = nil
-        didOpenTun = false
+        let previous = withState { () -> Network.NWPathMonitor? in
+            let monitor = pathMonitor
+            pathMonitor = nil
+            appliedSettings = nil
+            openedTun = false
+            return monitor
+        }
+        // Cancelled outside the lock. cancel() tears down a monitor whose own
+        // handler calls back into this class, and the less of that runs with the
+        // lock held the fewer ways there are to re-enter it -- taking a lock
+        // across a callback is how a deadlock gets written without anybody
+        // deciding to write one.
+        previous?.cancel()
+    }
+
+    private func withState<T>(_ body: () -> T) -> T {
+        state.lock()
+        defer { state.unlock() }
+        return body()
     }
 
     // ---- the two only a packet-tunnel provider can answer ----
@@ -154,7 +192,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
                         NEIPv4Route(destinationAddress: prefix.address(), subnetMask: prefix.mask()))
                 }
             }
-            if inet4Routes.isEmpty {
+            if inet4Routes.isEmpty, !inet4Addresses.isEmpty {
                 inet4Routes.append(NEIPv4Route.default())
             }
             var inet4Excluded: [NEIPv4Route] = []
@@ -216,8 +254,23 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
             ipv4.includedRoutes = []
             ipv6.includedRoutes = []
         }
-        settings.ipv4Settings = ipv4
-        settings.ipv6Settings = ipv6
+        // Each family is attached only when the tun actually has an address in
+        // it. An NEIPv4Settings or NEIPv6Settings carrying zero addresses is not
+        // "this family is unconfigured" -- it is a family declared and then left
+        // empty, and Apple documents no behaviour for that, which means iOS may
+        // accept it and route the family into an interface with nowhere to send
+        // it. app/lib/config/ emits an IPv4 address and an IPv6 one today, so
+        // this branch is a boundary check and not a feature: a v4-only
+        // configuration from anywhere else must produce a v4-only tun, not a tun
+        // with an empty second half. The guard above is what makes it impossible
+        // for both to be skipped, which is the state iOS accepts and carries
+        // nothing on.
+        if !inet4Addresses.isEmpty {
+            settings.ipv4Settings = ipv4
+        }
+        if !inet6Addresses.isEmpty {
+            settings.ipv6Settings = ipv6
+        }
 
         try applyNetworkSettings(settings)
 
@@ -236,13 +289,13 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
         //    day Apple closes route 1.
         if let fd = provider.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32 {
             ret0_.pointee = fd
-            didOpenTun = true
+            withState { openedTun = true }
             return
         }
         let scanned = LibboxGetTunnelFileDescriptor()
         if scanned != -1 {
             ret0_.pointee = scanned
-            didOpenTun = true
+            withState { openedTun = true }
             return
         }
         throw TunnelSetupError(
@@ -273,7 +326,10 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
                 "iOS refused the tunnel network settings: \(failure.localizedDescription). No "
                     + "interface was installed.")
         }
-        networkSettings = settings
+        // After the wait and only on success: this is what clearDNSCache
+        // re-applies, and re-applying settings iOS refused would tear down the
+        // interface that is actually carrying packets.
+        withState { appliedSettings = settings }
     }
 
     // ---- what sing-box uses on this platform ----
@@ -302,7 +358,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
             return
         }
         let monitor = Network.NWPathMonitor()
-        pathMonitor = monitor
+        withState { pathMonitor = monitor }
         let firstPath = DispatchSemaphore(value: 0)
         monitor.pathUpdateHandler = { [weak self] path in
             self?.publishDefaultInterface(listener, path)
@@ -338,8 +394,12 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
     }
 
     func closeDefaultInterfaceMonitor(_: LibboxInterfaceUpdateListenerProtocol?) throws {
-        pathMonitor?.cancel()
-        pathMonitor = nil
+        let previous = withState { () -> Network.NWPathMonitor? in
+            let monitor = pathMonitor
+            pathMonitor = nil
+            return monitor
+        }
+        previous?.cancel()
     }
 
     /// Every interface the current path offers, with the link flags and the
@@ -379,13 +439,13 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
     /// `Gateways` back at all; adapter/network.go:82 declares it and
     /// service.go:147 fills it.
     func getInterfaces() throws -> LibboxNetworkInterfaceIteratorProtocol {
-        guard let pathMonitor else {
+        guard let monitor = withState({ pathMonitor }) else {
             throw TunnelSetupError(
                 "ios: getInterfaces() was called before startDefaultInterfaceMonitor(), so there "
                     + "is no network path to read. Reporting no interfaces would be read as a "
                     + "device with no network, which is a different thing.")
         }
-        let path = pathMonitor.currentPath
+        let path = monitor.currentPath
         if path.status == .unsatisfied {
             return NetworkInterfaceList([])
         }
@@ -626,7 +686,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
     /// been applied yet: setting nil settings before there is a tunnel tears
     /// down an interface that does not exist.
     func clearDNSCache() {
-        guard let settings = networkSettings else {
+        guard let settings = withState({ appliedSettings }) else {
             return
         }
         let tunnel = provider
@@ -793,7 +853,7 @@ final class LibboxPlatform: NSObject, LibboxPlatformInterfaceProtocol,
 
     private static func unavailable(_ message: String) -> NSError {
         NSError(
-            domain: "io.github.asel1x.singbox_tunnel", code: 1,
+            domain: TunnelWire.logSubsystem, code: 1,
             userInfo: [NSLocalizedDescriptionKey: message])
     }
 }

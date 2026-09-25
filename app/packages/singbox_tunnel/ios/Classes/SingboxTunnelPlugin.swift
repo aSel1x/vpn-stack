@@ -23,6 +23,16 @@
 // everything it reports comes from the system's view of the connection plus the
 // status file the extension writes, so a screen rebuilt after the engine was
 // detached sees what the tunnel knows and not what this object remembers.
+//
+// THE MAIN QUEUE OWNS EVERY PROPERTY BELOW. On iOS the Flutter platform thread
+// IS the main thread, so `handle` and the two stream methods already arrive on
+// it; NetworkExtension is the other caller and it answers on queues of its own
+// choosing, so every completion handler in this file hops through `onMain`
+// before it reads or writes a property -- and so does the status notification.
+// That is one rule instead of a lock per field, and it is the same hop the
+// FlutterEventSink needs anyway: Flutter requires a result and a sink to be
+// invoked on the platform thread, and calling one from an NE queue is a crash
+// that looks like the failure it was reporting.
 
 import Flutter
 import Foundation
@@ -55,7 +65,35 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
     /// live right now and its id is adopted from the file that run is writing.
     private var expectedStartId: String?
 
-    private var lastPublished = TunnelStatus(.disconnected)
+    /// Whether iOS has reported a session for `expectedStartId` as live -- any
+    /// status other than disconnected or invalid -- since that id was issued.
+    ///
+    /// It is what separates "the extension has not answered yet" from "the
+    /// extension never answered", and there is a real window between them:
+    /// `startVPNTunnel` returns before the connection object flips to
+    /// `connecting`, so a `status` call landing in that window reads
+    /// `disconnected` for a start that is seconds old. Reporting a failure there
+    /// would be a spurious one, which is the alarm people learn to ignore.
+    private var sessionSeenLive = false
+
+    /// Set when this process removed the VPN profile itself.
+    ///
+    /// iOS reports `.invalid` for a configuration that is gone, and that is
+    /// normally a failure worth naming -- somebody deleted the profile in
+    /// Settings under a running app. After `removeProfile` it is the expected
+    /// end of a removal the app performed, so it must not be dressed up as one.
+    private var profileRemovedByApp = false
+
+    /// Runs `body` on the queue that owns this object's state, immediately when
+    /// already there. See the header: the main queue is the Flutter platform
+    /// thread, and NetworkExtension's completion handlers are not on it.
+    private func onMain(_ body: @escaping () -> Void) {
+        if Thread.isMainThread {
+            body()
+        } else {
+            DispatchQueue.main.async(execute: body)
+        }
+    }
 
     // ---- status ----
 
@@ -71,9 +109,7 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         // load has usually returned by now: a screen built while the tunnel is
         // already up must not render as disconnected until something happens to
         // change it, which for a healthy tunnel is never.
-        let known = currentStatus()
-        lastPublished = known
-        events(known.toEvent())
+        events(currentStatus().toEvent())
         resolveManager { _, _ in
             self.publish(self.currentStatus())
         }
@@ -90,30 +126,32 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         guard let connection = notification.object as? NEVPNConnection else {
             return
         }
-        // Matched on the provider identifier rather than on object identity:
-        // loadAllFromPreferences hands back every configuration this app has
-        // ever created, and a status change belonging to some other provider
-        // must not be reported as this tunnel's.
-        guard let expected = providerBundleIdentifier,
-              let proto = connection.manager.protocolConfiguration as? NETunnelProviderProtocol,
-              proto.providerBundleIdentifier == expected
-        else {
-            return
+        // Hopped before anything is read, not just before the sink is fed:
+        // NEVPNStatusDidChange is posted on a queue of NE's choosing, and
+        // `translate` both reads `providerBundleIdentifier` and writes
+        // `expectedStartId` and `sessionSeenLive`.
+        onMain {
+            // Matched on the provider identifier rather than on object identity:
+            // loadAllFromPreferences hands back every configuration this app has
+            // ever created, and a status change belonging to some other provider
+            // must not be reported as this tunnel's.
+            guard let expected = self.providerBundleIdentifier,
+                  let proto = connection.manager.protocolConfiguration
+                      as? NETunnelProviderProtocol,
+                  proto.providerBundleIdentifier == expected
+            else {
+                return
+            }
+            self.publish(self.translate(connection.status))
         }
-        publish(translate(connection.status))
     }
 
     private func publish(_ status: TunnelStatus) {
-        lastPublished = status
-        // FlutterEventSink must be used from the platform thread. NE delivers
-        // its completion handlers on queues of its own choosing, so without this
-        // hop the first status of a failing start would crash the engine instead
-        // of reporting the failure.
-        if Thread.isMainThread {
-            sink?(status.toEvent())
-        } else {
-            DispatchQueue.main.async { self.sink?(status.toEvent()) }
-        }
+        // FlutterEventSink must be used from the platform thread. Every caller
+        // in this file is already on it, and the hop stays because a sink fed
+        // from an NE queue crashes the engine instead of reporting the failure
+        // it was carrying -- the single loudest way to lose a diagnostic here.
+        onMain { self.sink?(status.toEvent()) }
     }
 
     private func currentStatus() -> TunnelStatus {
@@ -136,9 +174,19 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         // real crash mid-session would be reported as a clean disconnect.
         if status != .disconnected, status != .invalid {
             adoptRunningStartId()
+            sessionSeenLive = true
         }
         switch status {
         case .invalid:
+            if profileRemovedByApp {
+                // The app removed it, and this is iOS agreeing. Not the failure
+                // below: nothing broke, nothing is missing that should be there,
+                // and the person asked for exactly this.
+                return TunnelStatus(
+                    .disconnected,
+                    "The VPN profile has been removed from this device. The credentials it "
+                        + "carried are still valid on the server until `vpn user rm` runs there.")
+            }
             return TunnelStatus(
                 .failed,
                 "The VPN configuration this app installed is gone -- removed under Settings > "
@@ -177,11 +225,7 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
     /// whether that was an ending or a failure.
     private func disconnectedStatus() -> TunnelStatus {
         guard let shared = sharedStatus() else {
-            // Either nothing has run since this app launched, or the only
-            // record on disk belongs to a run this process neither started nor
-            // ever saw live. Nothing is running and nothing is known to be
-            // broken, which is exactly what a launch onto a stopped tunnel is.
-            return TunnelStatus(.disconnected)
+            return missingRecordStatus()
         }
         switch shared.stage {
         case TunnelStage.failed.rawValue:
@@ -206,6 +250,39 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
                     + "-- a network extension is held to a hard memory ceiling -- or a crash. "
                     + "Nothing is being tunnelled.")
         }
+    }
+
+    /// iOS says the connection is down and there is no record of a run to read.
+    /// Two very different situations, and collapsing them cost the only
+    /// diagnostic this platform has.
+    ///
+    /// A cold launch onto a stopped tunnel, or a record belonging to a run this
+    /// process neither started nor saw live, is plainly `disconnected`: nothing
+    /// is running and nothing is known to be broken.
+    ///
+    /// A run THIS process started, that iOS reported live and then down, with no
+    /// status of its own, is a failure and the only evidence of one. The
+    /// extension writes `connecting` as its first act, before anything that can
+    /// fail, so no record at all means it did not get that far: it never
+    /// launched, or it could not open the App Group container. A tunnel that
+    /// actually came up cannot land here -- `startBox` takes the same container
+    /// for libbox's own paths and throws without it -- so this is not a healthy
+    /// run misread.
+    private func missingRecordStatus() -> TunnelStatus {
+        guard expectedStartId != nil, sessionSeenLive else {
+            return TunnelStatus(.disconnected)
+        }
+        return TunnelStatus(
+            .failed,
+            "The tunnel extension never wrote a status for this run: it did not launch, or it "
+                + "could not open the App Group container. iOS reported the session up and then "
+                + "down and says nothing about why, and the extension's own record -- the only "
+                + "other account there is -- was never written. The likeliest cause on a build "
+                + "that has not been signed for this device is an App Group mismatch: the "
+                + "identifier in \(SharedContainer.appGroupInfoKey), in both targets' "
+                + "com.apple.security.application-groups entitlements and registered against the "
+                + "signing team has to be one string, and a disagreement is a sandbox refusal at "
+                + "run time and nothing at all at build time. Nothing is being tunnelled.")
     }
 
     /// The extension's last word about THIS run, or nil.
@@ -283,6 +360,8 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
             start(call, result)
         case "stop":
             stop(result)
+        case "removeProfile":
+            removeProfile(result)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -384,6 +463,10 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
                 return
             }
             self.expectedStartId = startId
+            // Cleared with the id it belongs to: whether iOS has reported THIS
+            // run live is the question missingRecordStatus() asks, and a true
+            // left over from the previous run would answer it about that one.
+            self.sessionSeenLive = false
             // Set here rather than waiting for the system's first status, so
             // there is no window in which a start has been asked for and the
             // status still reads disconnected.
@@ -413,21 +496,138 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
                 result(FlutterError(code: "no_configuration", message: error.message, details: nil))
                 return
             }
+            // The configuration goes first, and before the stop rather than
+            // after it: from the moment the person asks for the tunnel to end,
+            // nothing on disk should be able to bring it back. iOS starts a
+            // provider with no options from the Settings switch and reads
+            // whatever is on file, so leaving it there is a tunnel that can come
+            // up again, with a credential the app may have been told to forget,
+            // without anybody choosing it. The running engine does not need the
+            // file -- it has the configuration in memory -- and the extension
+            // deletes it too on the same reason code, for the case where this
+            // process is not running at all.
+            let complaint = self.clearStartOptions()
             guard let manager else {
                 // Tearing down nothing is not an error, and must not become one
                 // by waiting for a status change nobody is going to send.
-                self.publish(TunnelStatus(.disconnected))
+                self.publish(TunnelStatus(.disconnected, complaint))
                 result(nil)
                 return
             }
             let status = manager.connection.status
             if status == .disconnected || status == .invalid {
-                self.publish(TunnelStatus(.disconnected))
+                self.publish(TunnelStatus(.disconnected, complaint))
                 result(nil)
                 return
             }
             manager.connection.stopVPNTunnel()
+            if let complaint {
+                // Published and not returned as an error: the tunnel is coming
+                // down, which is what was asked for, and a failure result would
+                // say it did not. The sentence still has to reach somebody,
+                // because a configuration that would not delete is a credential
+                // left in the container.
+                self.publish(TunnelStatus(.connecting, complaint))
+            }
             result(nil)
+        }
+    }
+
+    /// Takes this app's VPN profile out of iOS and the configuration out of the
+    /// shared container.
+    ///
+    /// Without this, the `NETunnelProviderManager` installed at the first
+    /// connect outlives the app's own record of the server: deleting the server
+    /// in the app left a row under Settings > General > VPN & Device Management
+    /// that, when somebody flipped it, started the extension from
+    /// `tunnel-start.json` -- a tunnel to a server the app no longer knows
+    /// about, with a credential it had stopped showing anybody.
+    ///
+    /// It revokes NOTHING on the server, and the wording everywhere around this
+    /// has to keep saying so: the VLESS UUID, the Hysteria2 password and every
+    /// other credential in that configuration stay valid until `vpn user rm`
+    /// runs on the server. What this removes is this device's copy and this
+    /// device's ability to use it unattended. The app's own confirm dialog
+    /// already tells the person that removal is local; this is what makes that
+    /// true of the phone as well as of the app's database.
+    private func removeProfile(_ result: @escaping FlutterResult) {
+        resolveManager { manager, error in
+            // Unconditionally, and before the profile: the credential is the
+            // part that matters, and it has to go even when there is no manager
+            // to remove or iOS refuses to remove it.
+            let complaint = self.clearStartOptions()
+            guard let manager else {
+                if let error {
+                    result(
+                        FlutterError(
+                            code: "no_configuration", message: error.message, details: nil))
+                    return
+                }
+                // Nothing installed is the state this method exists to reach.
+                self.forgetProfile()
+                self.finishRemoval(complaint, result)
+                return
+            }
+            manager.removeFromPreferences { removeError in
+                self.onMain {
+                    if let removeError {
+                        result(
+                            FlutterError(
+                                code: "remove_failed",
+                                message:
+                                    "iOS refused to remove this app's VPN profile: "
+                                    + "\(removeError.localizedDescription). It is still listed "
+                                    + "under Settings > General > VPN & Device Management and can "
+                                    + "still be switched on there; the configuration it would "
+                                    + "start with has been deleted.",
+                                details: nil))
+                        return
+                    }
+                    self.forgetProfile()
+                    self.finishRemoval(complaint, result)
+                }
+            }
+        }
+    }
+
+    /// Drops everything this process knew about a profile that no longer exists,
+    /// so that the `.invalid` iOS is about to report reads as the end of a
+    /// removal rather than as a configuration somebody deleted behind the app's
+    /// back, and so that no run of the old profile can be attributed to a new one.
+    private func forgetProfile() {
+        manager = nil
+        expectedStartId = nil
+        sessionSeenLive = false
+        profileRemovedByApp = true
+        publish(
+            TunnelStatus(
+                .disconnected,
+                "The VPN profile has been removed from this device. The credentials it carried "
+                    + "are still valid on the server until `vpn user rm` runs there."))
+    }
+
+    private func finishRemoval(_ complaint: String?, _ result: @escaping FlutterResult) {
+        guard let complaint else {
+            result(nil)
+            return
+        }
+        // A failure here is the one part of a removal that is not cosmetic: the
+        // profile is gone and the credential is not, which is the opposite of
+        // what was asked for and has to be said rather than logged.
+        result(FlutterError(code: "config_not_deleted", message: complaint, details: nil))
+    }
+
+    /// Deletes the persisted configuration, returning what to tell somebody when
+    /// it could not be deleted. Nil is success, including "there was none".
+    private func clearStartOptions() -> String? {
+        do {
+            try SharedState.clearStartOptions()
+            return nil
+        } catch {
+            return
+                "The sing-box configuration could not be deleted from the App Group container: "
+                + "\(error.localizedDescription). It holds this server's credentials, so it is "
+                + "worth knowing that it is still there."
         }
     }
 
@@ -453,20 +653,22 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
         }
         providerBundleIdentifier = expected
         NETunnelProviderManager.loadAllFromPreferences { managers, error in
-            if let error {
-                completion(
-                    nil,
-                    TunnelSetupError(
-                        "iOS could not read this app's VPN configurations: "
-                            + "\(error.localizedDescription). Nothing was started."))
-                return
+            self.onMain {
+                if let error {
+                    completion(
+                        nil,
+                        TunnelSetupError(
+                            "iOS could not read this app's VPN configurations: "
+                                + "\(error.localizedDescription). Nothing was started."))
+                    return
+                }
+                let mine = (managers ?? []).first { candidate in
+                    (candidate.protocolConfiguration as? NETunnelProviderProtocol)?
+                        .providerBundleIdentifier == expected
+                }
+                self.manager = mine
+                completion(mine, nil)
             }
-            let mine = (managers ?? []).first { candidate in
-                (candidate.protocolConfiguration as? NETunnelProviderProtocol)?
-                    .providerBundleIdentifier == expected
-            }
-            self.manager = mine
-            completion(mine, nil)
         }
     }
 
@@ -516,46 +718,54 @@ public class SingboxTunnelPlugin: NSObject, FlutterPlugin, FlutterStreamHandler 
             manager.onDemandRules = nil
 
             manager.saveToPreferences { saveError in
-                if let saveError {
-                    let unresolved = Self.isPermissionUnresolved(saveError)
-                    completion(
-                        SaveFailure(
-                            message: unresolved
-                                ? "iOS did not install the VPN configuration for this app: "
-                                    + "\(saveError.localizedDescription) (NEVPNErrorDomain "
-                                    + "configurationReadWriteFailed). Without it no tunnel can be "
-                                    + "started and no traffic is being routed -- but WHY it "
-                                    + "refused is not something this build can tell you. That one "
-                                    + "code comes back both when somebody taps Don't Allow on the "
-                                    + "system's sheet and when this build's VPN entitlement is "
-                                    + "missing or wrong, and Apple documents no code for a "
-                                    + "declined sheet. Settings > General > VPN & Device "
-                                    + "Management shows whether a configuration exists; a refusal "
-                                    + "that repeats for every person on every launch is the "
-                                    + "entitlement, not a person, and a decline can be reversed by "
-                                    + "connecting again and approving."
-                                : "iOS refused to save the VPN configuration: "
-                                    + "\(saveError.localizedDescription). Nothing was started.",
-                            permissionUnresolved: unresolved))
-                    return
-                }
-                // Re-read, always. saveToPreferences leaves this in-memory
-                // manager older than the record it just wrote, and
-                // startVPNTunnel on a stale manager throws
-                // NEVPNError.configurationStale instead of starting anything.
-                manager.loadFromPreferences { loadError in
-                    if let loadError {
+                self.onMain {
+                    if let saveError {
+                        let unresolved = Self.isPermissionUnresolved(saveError)
                         completion(
                             SaveFailure(
-                                message:
-                                    "iOS saved the VPN configuration and then could not read it "
-                                    + "back: \(loadError.localizedDescription). Nothing was "
-                                    + "started.",
-                                permissionUnresolved: false))
+                                message: unresolved
+                                    ? "iOS did not install the VPN configuration for this app: "
+                                        + "\(saveError.localizedDescription) (NEVPNErrorDomain "
+                                        + "configurationReadWriteFailed). Without it no tunnel can "
+                                        + "be started and no traffic is being routed -- but WHY it "
+                                        + "refused is not something this build can tell you. That "
+                                        + "one code comes back both when somebody taps Don't Allow "
+                                        + "on the system's sheet and when this build's VPN "
+                                        + "entitlement is missing or wrong, and Apple documents no "
+                                        + "code for a declined sheet. Settings > General > VPN & "
+                                        + "Device Management shows whether a configuration exists; "
+                                        + "a refusal that repeats for every person on every launch "
+                                        + "is the entitlement, not a person, and a decline can be "
+                                        + "reversed by connecting again and approving."
+                                    : "iOS refused to save the VPN configuration: "
+                                        + "\(saveError.localizedDescription). Nothing was started.",
+                                permissionUnresolved: unresolved))
                         return
                     }
-                    self.manager = manager
-                    completion(nil)
+                    // Re-read, always. saveToPreferences leaves this in-memory
+                    // manager older than the record it just wrote, and
+                    // startVPNTunnel on a stale manager throws
+                    // NEVPNError.configurationStale instead of starting anything.
+                    manager.loadFromPreferences { loadError in
+                        self.onMain {
+                            if let loadError {
+                                completion(
+                                    SaveFailure(
+                                        message:
+                                            "iOS saved the VPN configuration and then could not "
+                                            + "read it back: \(loadError.localizedDescription). "
+                                            + "Nothing was started.",
+                                        permissionUnresolved: false))
+                                return
+                            }
+                            self.manager = manager
+                            // A configuration exists again, so the next
+                            // `.invalid` is a configuration that went away and
+                            // not the tail of a removal this app performed.
+                            self.profileRemovedByApp = false
+                            completion(nil)
+                        }
+                    }
                 }
             }
         }

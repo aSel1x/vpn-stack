@@ -65,6 +65,30 @@ enum SharedState {
         try read(StartOptions.self, from: startOptionsFileName)
     }
 
+    /// Takes the configuration off disk.
+    ///
+    /// This file is the one thing in this package that holds a credential: the
+    /// sing-box configuration it carries has the VLESS UUID or the Hysteria2
+    /// password in it. It is written so that iOS can start the provider with no
+    /// options -- the switch in Settings, or the system relaunching an extension
+    /// it killed -- and the moment there is no tunnel the person asked for, that
+    /// reason is gone and the credential is just a credential sitting in a
+    /// container. So it is deleted on a stop the person asked for and when the
+    /// VPN profile it belongs to is removed, and nothing else deletes it: a
+    /// crashed run must still find it, which is the whole point of persisting it.
+    ///
+    /// `tunnel-status.json` is deliberately left alone. It carries no
+    /// credential, only a stage and a sentence, and it is keyed to a run id the
+    /// app matches -- deleting it here would race the extension writing its last
+    /// word about why it stopped, which is the one diagnostic iOS does not give.
+    static func clearStartOptions() throws {
+        let url = try SharedContainer.directory().appendingPathComponent(startOptionsFileName)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+
     private static func write<T: Encodable>(_ value: T, to name: String) throws {
         let url = try SharedContainer.directory().appendingPathComponent(name)
         let data = try JSONEncoder().encode(value)

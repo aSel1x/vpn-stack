@@ -11,10 +11,16 @@
 set -euo pipefail
 
 app="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# The path FRAMEWORK_SEARCH_PATHS names and the path the file reference in
-# Runner.xcodeproj resolves to. Both come from tool/ios_project.rb; this is the
-# third spelling and the one that puts the bytes there.
-dir="$app/packages/singbox_tunnel/ios/Frameworks"
+# shellcheck source=tool/ios_identifiers.sh
+. "$app/tool/ios_identifiers.sh"
+
+# The path FRAMEWORK_SEARCH_PATHS names, the path the file reference in
+# Runner.xcodeproj resolves to, and the path the bytes land at. All three are
+# $PACKAGE_SUBDIR from tool/ios_identifiers.sh -- resolved against app/ios/ by
+# tool/ios_project.rb and against app/ here -- because a fourth spelling is a
+# directory that gets moved in three places and missed in one, and the symptom
+# is a build that links nothing and an .appex that dies at the first connect.
+dir="$app/$PACKAGE_SUBDIR/Frameworks"
 tarball="$dir/Libbox.xcframework.tar.gz"
 
 [ -f "$tarball" ] || {

@@ -14,6 +14,12 @@ import Foundation
 enum TunnelWire {
     static let commandChannel = "io.github.asel1x/singbox_tunnel/commands"
     static let statusChannel = "io.github.asel1x/singbox_tunnel/status"
+
+    /// The os_log subsystem, and the error domain of the two NSErrors this
+    /// package has to build by hand. One string, because the extension's log is
+    /// read with `log stream --subsystem <this>` and two spellings would hand
+    /// somebody half a run.
+    static let logSubsystem = "io.github.asel1x.singbox_tunnel"
 }
 
 /// The four stages the Dart interface declares. Nothing wider, so a state that
