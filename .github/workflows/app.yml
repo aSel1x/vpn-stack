@@ -683,31 +683,39 @@ jobs:
       # gone wrong here: build.gradle's own comment records
       # `:app:mergeReleaseNativeLibs` failing with "Could not find :libbox:,
       # required by project ':app'" -- the classes resolved and the .so had
-      # nowhere to come from. A flatDir repository on every project fixed it,
-      # and nothing asserts it stayed fixed.
+      # nowhere to come from. A flatDir repository declared on every project
+      # fixed it, and nothing asserted it stayed fixed.
       #
-      # gomobile puts libgojni.so under jni/<abi>/ in the .aar and AGP merges it
-      # to lib/<abi>/ in the apk. Asserted per ABI rather than once, because a
-      # merge that drops ONE architecture produces an apk that installs and runs
-      # everywhere except on the devices using that ABI -- which is the shape of
-      # failure nobody finds from a green build.
-      - name: The apk carries libgojni.so for every ABI it claims
+      # The expected name and the expected ABI set are read OUT OF THE .aar
+      # rather than written here. The first version of this step asserted
+      # `libgojni.so`, which is what `gomobile bind` produces by default, and it
+      # failed on an apk that was perfectly correct: sing-box's own build passes
+      # a library name, so the file is `libbox.so`. A check that hardcodes what
+      # it expects to find is a check that fails when the build is right and
+      # passes when the .aar quietly ships fewer architectures than it used to.
+      # Reading both from the artifact closes the second case as well: an .aar
+      # with three ABIs and an apk with two is a silent loss of a platform.
+      - name: The apk carries the library the .aar shipped, for every ABI
         run: |
+          aar=packages/singbox_tunnel/android/libs/libbox.aar
           apk=build/app/outputs/flutter-apk/app-release.apk
-          # `|| true`: unzip exits non-zero when a pattern matches nothing, and
-          # GitHub runs this under `bash -e`, so without it the step dies on
-          # unzip's own "caution: filename not matched" instead of on the
-          # sentence below that says what that means.
+          # `|| true` on both: unzip exits non-zero when a pattern matches
+          # nothing, and GitHub runs this under `bash -e`, so without it the step
+          # dies on unzip's own "caution: filename not matched" instead of on the
+          # sentence that says what that means.
+          jni=$(unzip -Z1 "$aar" 'jni/*/*.so' 2>/dev/null | sort || true)
+          [ -n "$jni" ] || { echo "$aar ships no jni/<abi>/*.so -- it is not a gomobile library" >&2; exit 1; }
+          echo "the .aar ships:"; printf '  %s\n' $jni
           libs=$(unzip -Z1 "$apk" 'lib/*/*.so' 2>/dev/null | sort || true)
-          printf '%s\n' "$libs"
-          abis=$(printf '%s\n' "$libs" | awk -F/ 'NF==3 {print $2}' | sort -u)
-          [ -n "$abis" ] || { echo "no native libraries in $apk at all" >&2; exit 1; }
+          echo "the apk carries:"; printf '  %s\n' $libs
           rc=0
-          for abi in $abis; do
-            printf '%s\n' "$libs" | grep -qx "lib/$abi/libgojni.so" || {
-              echo "$abi has native libraries but no libgojni.so -- the .aar" >&2
-              echo "resolved and its .so was not merged, which is an apk that" >&2
-              echo "dies at the first connect inside a Go callback" >&2
+          for entry in $jni; do
+            abi=$(printf '%s' "$entry" | awk -F/ '{print $2}')
+            so=$(printf '%s' "$entry" | awk -F/ '{print $3}')
+            printf '%s\n' $libs | grep -qx "lib/$abi/$so" || {
+              echo "MISSING lib/$abi/$so: the .aar ships it and the apk does not," >&2
+              echo "so on a $abi device this build dies at the first connect," >&2
+              echo "inside a Go callback, which is the least legible place for it" >&2
               rc=1
             }
           done
