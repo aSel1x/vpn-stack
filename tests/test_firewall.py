@@ -2,10 +2,12 @@
 
 Only two things are faked, both named here: `available()`, which shells out to
 `which ufw`, and `_ufw()`, the single wrapper every ufw call goes through. The
-parsing, the diff and the 22/tcp invariant are the real code.
+parsing, the diff and the `vpn-stack:ssh` invariant are the real code.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import pytest
 
@@ -87,7 +89,7 @@ def test_the_diff_adds_what_is_missing_and_removes_what_is_ours(ufw) -> None:
     assert ok
     assert actions == [
         "+ allow 20443/udp (hysteria2)",
-        f"! refusing to remove {firewall.SSH_RULE} (invariant)",
+        "! refusing to remove 22/tcp (tagged vpn-stack:ssh -- the only way back in)",
         "- delete 53/udp (was dnstt)",
     ]
     assert ufw.mutations == [
@@ -104,8 +106,61 @@ def test_22_tcp_is_never_removed(ufw) -> None:
     """
     ok, actions = firewall.reconcile(protocols.ordered())
     assert ok
-    assert f"! refusing to remove {firewall.SSH_RULE} (invariant)" in actions
+    assert (
+        "! refusing to remove 22/tcp (tagged vpn-stack:ssh -- the only way back in)"
+        in actions
+    )
     assert all("22/tcp" not in " ".join(call) for call in ufw.mutations)
+
+
+# The same box with sshd moved off 22: the app's provisioner allows whichever
+# port the operator set and tags it the same way, so this is the status a real
+# server presents -- and the one shape an exemption keyed on a port literal
+# cannot protect.
+STATUS_SSH_2222 = """Status: active
+
+To                         Action      From
+--                         ------      ----
+2222/tcp                   ALLOW       Anywhere                   # vpn-stack:ssh
+10443/tcp                  ALLOW       Anywhere                   # vpn-stack:vless-reality
+2222/tcp (v6)              ALLOW       Anywhere (v6)              # vpn-stack:ssh
+10443/tcp (v6)             ALLOW       Anywhere (v6)              # vpn-stack:vless-reality
+"""
+
+
+@pytest.mark.parametrize("port", ["2222", "49222"])
+def test_an_ssh_rule_on_any_port_is_never_removed(ufw, port) -> None:
+    """Protection is by tag. A port literal bricks the box it is wrong about.
+
+    No protocol is called `ssh`, so a `vpn-stack:ssh` rule is always in `have`
+    and never in `want`. With the exemption keyed on the literal `22/tcp`,
+    reconcile deletes the ssh rule of every box whose sshd is elsewhere, against
+    an active default-deny firewall with the install deadman long disarmed --
+    recoverable only from the provider's console.
+    """
+    ufw.status = STATUS_SSH_2222.replace("2222/tcp", f"{port}/tcp")
+    ok, actions = firewall.reconcile(protocols.ordered(["vless-reality"]))
+    assert ok
+    assert all(f"{port}/tcp" not in " ".join(call) for call in ufw.mutations)
+    # The line has to name the rule it spared, or an operator reading a green
+    # apply cannot tell which door stayed open.
+    assert (
+        f"! refusing to remove {port}/tcp "
+        "(tagged vpn-stack:ssh -- the only way back in)" in actions
+    )
+
+
+def test_the_ssh_tag_is_reserved_against_the_registry(ufw) -> None:
+    """A protocol named `ssh` would make the protection ambiguous.
+
+    Its ports would land in `want` under the one tag the removal loop refuses
+    to act on, so "is this rule protected?" would depend on which of the two
+    wrote it. Nothing can add such a protocol except an edit to the registry,
+    which is why this is a test and not a runtime branch.
+    """
+    impostor = dataclasses.replace(protocols.get("dnstt"), name=firewall.SSH_TAG)
+    with pytest.raises(ValueError, match="reserved"):
+        firewall.desired([impostor])
 
 
 def test_nothing_a_human_added_is_ever_touched(ufw) -> None:
@@ -176,3 +231,51 @@ def test_an_unreadable_status_adds_rather_than_deletes(monkeypatch) -> None:
     ok, actions = firewall.reconcile(protocols.ordered(["vless-reality"]))
     assert ok
     assert actions == ["+ allow 10443/tcp (vless-reality)"]
+
+
+def test_an_identical_hand_added_rule_is_reported_not_adopted(ufw) -> None:
+    """Adopting a human's rule means deleting it later.
+
+    `ufw allow <rule> comment vpn-stack:<proto>` over an identical untagged
+    rule either skips silently or rewrites the rule with our comment -- and
+    then `protocol off` deletes a rule this tool never opened. The port is
+    already open, so reconcile reports it and mutates nothing.
+    """
+    ufw.status = """Status: active
+
+To                         Action      From
+--                         ------      ----
+20443/udp                  ALLOW       Anywhere
+"""
+    ok, actions = firewall.reconcile(protocols.ordered(["hysteria2"]))
+    assert ok
+    assert ufw.mutations == []
+    assert actions == [
+        "~ 20443/udp already allowed by hand and untagged, left alone "
+        "(hysteria2 is served; tag it vpn-stack:hysteria2 to hand it over)"
+    ]
+
+
+def test_a_narrower_hand_added_rule_does_not_count_as_open(ufw) -> None:
+    """`ALLOW 10.0.0.0/8` is not `ALLOW Anywhere`.
+
+    Reading it as "already allowed" would leave the protocol reachable only
+    from that subnet while reconcile reported it served. It is a different rule
+    to ufw, so ours is added and the human's is left untouched.
+    """
+    ufw.status = """Status: active
+
+To                         Action      From
+--                         ------      ----
+20443/udp                  ALLOW       10.0.0.0/8
+"""
+    ok, actions = firewall.reconcile(protocols.ordered(["hysteria2"]))
+    assert ok
+    assert actions == ["+ allow 20443/udp (hysteria2)"]
+    assert ufw.mutations == [("allow", "20443/udp", "comment", "vpn-stack:hysteria2")]
+
+
+def test_a_tagged_rule_is_not_mistaken_for_a_hand_added_one(ufw) -> None:
+    # current_untagged() reads the same `ufw status`; if it claimed our own
+    # rules, every add would report as "already allowed by hand" instead.
+    assert firewall.current_untagged() == {"443/tcp", "8080/tcp"}
