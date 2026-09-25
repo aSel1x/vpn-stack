@@ -3,15 +3,33 @@ users.json
 .env
 exports/
 ikev2/.env
-# Directory-wide, not filename-exact. Anything dropped into these two dirs is
-# credential-bearing by default (a second inbound fragment, a .bak, a new cert),
-# and an exact-path rule silently fails to cover it. Only sing-box/common/ is
-# tracked. Same for keys/ and the deploy key: ignore the directory, allowlist
-# the one public file.
-sing-box/vless-reality/
-sing-box/hysteria2/
+
+# Kept because a document in this repo asks for the path: dnstt/SETUP.md § 2 walks
+# a reader through `dnstt-server -gen-key -privkey-file dnstt/keys/server.key`
+# inside this checkout and tells them to gitignore it. Grep that file and the rule
+# checks out, which is the difference between a check and a claim. Directory-wide
+# and with no allowlisted exception, so a second file dropped beside the key is
+# covered too. What the stack does itself never lands here: `protocol on dnstt`
+# parses `-gen-key`'s stdout and stores both halves in /etc/vpn-stack/secrets.
 dnstt/keys/*
-scripts/.deploy_key*
+
+# There is deliberately NO rule for a rendered credential in this tree, because
+# nothing renders one here: render() writes only into
+# /etc/vpn-stack/rendered-<stamp>-<rand>/, 0600 under a 0700 parent. Rules stood
+# for sing-box/vless-reality/ and sing-box/hysteria2/ -- the three-sibling fragment
+# layout, gone: everything renders into one directory in the state directory and
+# only sing-box/common/ is tracked -- and for scripts/.deploy_key*, which nothing
+# mints any more, since CI holds no secrets and has no ssh step and install.sh
+# pushes this checkout rather than cloning. An ignore for a path nothing in the
+# tree ever creates is an invariant a reader cannot verify from the file, and one
+# of these was cited elsewhere as carrying a `!server.pub` exception it never had.
+# If a credential-bearing directory shows up in the checkout again, the fix is to
+# stop writing it there; ignoring it would only keep it out of review.
+#
+# What is left covers what an OPERATOR can put here, plus the paths a server's own
+# checkout genuinely carries -- ./.env is a symlink to /etc/vpn-stack/.env, because
+# docker compose reads .env from the project directory. push.sh rsyncs with
+# `--filter=':- .gitignore'`, so this file also decides what a deploy sends.
 
 # Backups and issued client bundles. `./vpn backup` writes a tar of the WHOLE
 # state directory plus the IKEv2 volume — every secret, every user's password,
