@@ -686,16 +686,22 @@ jobs:
       # nowhere to come from. A flatDir repository declared on every project
       # fixed it, and nothing asserted it stayed fixed.
       #
-      # The expected name and the expected ABI set are read OUT OF THE .aar
-      # rather than written here. The first version of this step asserted
-      # `libgojni.so`, which is what `gomobile bind` produces by default, and it
-      # failed on an apk that was perfectly correct: sing-box's own build passes
-      # a library name, so the file is `libbox.so`. A check that hardcodes what
-      # it expects to find is a check that fails when the build is right and
-      # passes when the .aar quietly ships fewer architectures than it used to.
-      # Reading both from the artifact closes the second case as well: an .aar
-      # with three ABIs and an apk with two is a silent loss of a platform.
-      - name: The apk carries the library the .aar shipped, for every ABI
+      # Two sources, and which question each one answers took three attempts to
+      # get right, so it is written down. The NAME comes from the .aar: the
+      # first version asserted `libgojni.so`, gomobile's default, and failed on
+      # a perfectly correct apk because sing-box's build passes a library name
+      # and the file is `libbox.so`. The ABI SET comes from the APK: the second
+      # version demanded every architecture the .aar ships and failed because
+      # gomobile builds four and `flutter build apk` targets three -- Flutter
+      # dropped 32-bit x86, so an .aar entry with no apk counterpart is Flutter's
+      # decision and not a merge that lost something.
+      #
+      # So: for every architecture this apk actually carries native code for, it
+      # must carry the Go library too. That is the property -- a merge that
+      # drops ONE architecture yields an apk that installs and runs everywhere
+      # except on the devices using it, which is the shape of failure nobody
+      # finds from a green build.
+      - name: The apk carries the library the .aar shipped, for every ABI it targets
         run: |
           aar=packages/singbox_tunnel/android/libs/libbox.aar
           apk=build/app/outputs/flutter-apk/app-release.apk
@@ -706,18 +712,33 @@ jobs:
           jni=$(unzip -Z1 "$aar" 'jni/*/*.so' 2>/dev/null | sort || true)
           [ -n "$jni" ] || { echo "$aar ships no jni/<abi>/*.so -- it is not a gomobile library" >&2; exit 1; }
           echo "the .aar ships:"; printf '  %s\n' $jni
+          so=$(printf '%s\n' $jni | awk -F/ '{print $3}' | sort -u)
+          [ "$(printf '%s\n' "$so" | wc -l)" -eq 1 ] || {
+            echo "the .aar names its library differently per architecture ($so)," >&2
+            echo "so there is no single file to look for; teach this step which" >&2
+            echo "one belongs to which ABI before trusting it again" >&2
+            exit 1
+          }
           libs=$(unzip -Z1 "$apk" 'lib/*/*.so' 2>/dev/null | sort || true)
           echo "the apk carries:"; printf '  %s\n' $libs
+          abis=$(printf '%s\n' $libs | awk -F/ 'NF==3 {print $2}' | sort -u)
+          [ -n "$abis" ] || { echo "no native libraries in $apk at all" >&2; exit 1; }
           rc=0
-          for entry in $jni; do
-            abi=$(printf '%s' "$entry" | awk -F/ '{print $2}')
-            so=$(printf '%s' "$entry" | awk -F/ '{print $3}')
+          for abi in $abis; do
             printf '%s\n' $libs | grep -qx "lib/$abi/$so" || {
-              echo "MISSING lib/$abi/$so: the .aar ships it and the apk does not," >&2
-              echo "so on a $abi device this build dies at the first connect," >&2
-              echo "inside a Go callback, which is the least legible place for it" >&2
+              echo "MISSING lib/$abi/$so: this apk carries native code for $abi" >&2
+              echo "and not the Go library, so on a $abi device it dies at the" >&2
+              echo "first connect inside a Go callback -- the least legible place" >&2
               rc=1
             }
+          done
+          # Not a failure: gomobile builds every architecture it knows and
+          # `flutter build apk` targets the ones Flutter still supports. Said out
+          # loud so a genuinely dropped architecture is not mistaken for this.
+          for entry in $jni; do
+            abi=$(printf '%s' "$entry" | awk -F/ '{print $2}')
+            printf '%s\n' $abis | grep -qx "$abi" || \
+              echo "note: the .aar ships $abi and this apk does not target it"
           done
           exit $rc
 
