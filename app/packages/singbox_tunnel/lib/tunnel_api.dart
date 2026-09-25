@@ -1,10 +1,13 @@
-// MOVED, not copied: this is app/lib/tunnel/tunnel.dart, byte-identical below this
-// header. A Dart class can only implement a type it can import, and the package
-// cannot import the app (app -> package -> app is a cycle pub refuses), so the
-// interface has to live on the package side. app/lib/tunnel/tunnel.dart becomes
-// one line -- `export 'package:singbox_tunnel/tunnel_api.dart';` -- in the same
-// commit that adds the path dependency; until then this file and that one are two
-// definitions of one interface, which is the drift app/README.md warns about.
+// The app's tunnel interface, which lives here because the implementation does.
+//
+// A Dart class can only implement a type it can import and this package cannot
+// import the app (app -> package -> app is a cycle pub refuses), so the
+// interface had to move to the package side rather than be depended upon from
+// it. app/lib/tunnel/tunnel.dart is one `export` of this file, which is what
+// keeps `import 'tunnel.dart'` resolving from every screen. While there were two
+// copies, SingboxTunnel implemented a DIFFERENT TunnelController than the
+// screens used -- 1,800 lines of plugin satisfying nothing, with every test
+// green.
 import 'dart:async';
 
 /// Establishing the tunnel on THIS device.

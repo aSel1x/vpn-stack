@@ -1,4 +1,4 @@
-/// sing-box on Android, behind the app's tunnel interface.
+/// sing-box on Android and iOS, behind the app's tunnel interface.
 ///
 /// One import for the composition root:
 ///
@@ -13,5 +13,10 @@
 /// depended upon.
 library;
 
+// Exported because it is a parameter of SingboxTunnel's constructor: the
+// wording of a failure is per-platform (see platform_text.dart) and the
+// default is read from defaultTargetPlatform, which a test cannot move. A
+// type a caller cannot name is a parameter a caller cannot pass.
+export 'src/platform_text.dart' show TunnelPlatformText;
 export 'src/singbox_tunnel.dart' show SingBoxConfigBuilder, SingboxTunnel;
 export 'tunnel_api.dart';

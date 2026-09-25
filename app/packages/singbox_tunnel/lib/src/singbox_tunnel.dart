@@ -1,16 +1,24 @@
-// The Android engine behind TunnelController.
+// The engine behind TunnelController, on both platforms that have one.
 //
 // Commands go out over a MethodChannel; status comes back over an EventChannel,
 // so the tunnel's state arrives as a stream instead of being polled. Polling
 // would have to pick an interval, and every interval is either a busy loop or a
 // window in which the UI shows a tunnel that is already down.
+//
+// One controller for Android and iOS, because the channel contract is the same
+// on both -- five commands, one status event shape -- and nothing above it has
+// to care which platform answered. What is NOT the same is the prose in a
+// failure, which is why the controller is handed a TunnelPlatformText rather
+// than writing the words itself: see platform_text.dart.
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../tunnel_api.dart';
 import 'channels.dart';
+import 'platform_text.dart';
 
 /// Turns a profile's share URIs into the sing-box configuration JSON the engine
 /// is started with.
@@ -22,10 +30,11 @@ import 'channels.dart';
 /// one, and `main.dart` supplies the builder.
 typedef SingBoxConfigBuilder = String Function(TunnelProfile profile);
 
-/// sing-box on Android, through libbox and `VpnService`.
+/// sing-box through libbox: a `VpnService` on Android, a
+/// `NEPacketTunnelProvider` on iOS.
 ///
-/// Reports [TunnelStage.connected] on exactly one condition: the Android side
-/// said so, and it only says so after libbox's `CommandServer.startOrReloadService`
+/// Reports [TunnelStage.connected] on exactly one condition: the platform said
+/// so, and it only says so after libbox's `CommandServer.startOrReloadService`
 /// returned without throwing. That call is synchronous all the way down --
 /// sing-box v1.14.0 `daemon/started_service.go:250` returns nil only after
 /// `instance.Start()` has succeeded, which is what calls back into `openTun` and
@@ -35,7 +44,14 @@ class SingboxTunnel extends BaseTunnelController {
   /// [buildConfig] is called on [connect] and its output is handed to the
   /// engine verbatim. If it throws, the tunnel fails with that message and
   /// nothing is started.
-  SingboxTunnel(this._buildConfig) {
+  ///
+  /// [platform] is the wording of a failure, not a switch over behaviour: the
+  /// code paths are identical on Android and iOS. It is injectable because
+  /// `defaultTargetPlatform` cannot be moved except by a debug override, and a
+  /// test that asserts an iPhone's message is not running on one.
+  SingboxTunnel(this._buildConfig, {TunnelPlatformText? platform})
+      : _platform =
+            platform ?? TunnelPlatformText.forPlatform(defaultTargetPlatform) {
     _events = _statusChannel.receiveBroadcastStream().listen(
           _onPlatformStatus,
           onError: _onPlatformError,
@@ -43,6 +59,8 @@ class SingboxTunnel extends BaseTunnelController {
   }
 
   final SingBoxConfigBuilder _buildConfig;
+
+  final TunnelPlatformText _platform;
 
   static const MethodChannel _commands = MethodChannel(commandChannelName);
   static const EventChannel _statusChannel = EventChannel(statusChannelName);
@@ -95,10 +113,9 @@ class SingboxTunnel extends BaseTunnelController {
     if (!await _ensurePermission(profile.id)) {
       _fail(
         profile.id,
-        'Android did not grant VPN permission for ${profile.label}. Without it '
-        'no tunnel was established and no traffic is being routed. Android asks '
-        'once per app, from a system dialog; declining it leaves this app unable '
-        'to open a TUN interface at all.',
+        '${_platform.osName} ${_platform.consentDenied} for ${profile.label}. '
+        'Without it no tunnel was established and no traffic is being routed. '
+        '${_platform.consentDetail}',
       );
     }
 
@@ -128,11 +145,10 @@ class SingboxTunnel extends BaseTunnelController {
         return TunnelStatus(
           TunnelStage.failed,
           profileId: profile.id,
-          message:
-              'The Android service was started but reported neither success nor '
-              'failure within ${_connectTimeout.inSeconds}s. The tunnel may or '
-              'may not be up; this build will not guess. `adb logcat -s '
-              'SingboxTunnel` carries what libbox said.',
+          message: '${_platform.startedProcess} was started but reported '
+              'neither success nor failure within ${_connectTimeout.inSeconds}s. '
+              'The tunnel may or may not be up; this build will not guess. '
+              '${_platform.logHint} carries what libbox said.',
         );
       },
     );
@@ -173,12 +189,10 @@ class SingboxTunnel extends BaseTunnelController {
         return TunnelStatus(
           TunnelStage.failed,
           profileId: _activeProfileId,
-          message:
-              'Asked Android to stop the tunnel and it did not confirm within '
-              '${_disconnectTimeout.inSeconds}s. Treat the tunnel as still up: '
-              'reporting it down here would be the one lie this layer must not '
-              'tell. The VPN key in the status bar, and Settings > Network > '
-              'VPN, are the ground truth.',
+          message: 'Asked ${_platform.osName} to stop the tunnel and it did not '
+              'confirm within ${_disconnectTimeout.inSeconds}s. Treat the tunnel '
+              'as still up: reporting it down here would be the one lie this '
+              'layer must not tell. ${_platform.groundTruth}',
         );
       },
     );
@@ -197,14 +211,16 @@ class SingboxTunnel extends BaseTunnelController {
     await super.dispose();
   }
 
-  /// True when Android has already granted VPN permission, or granted it in
-  /// response to the consent dialog this raises.
+  /// True when the system has already consented to this app opening a tunnel,
+  /// or consented in response to the sheet this raises.
   ///
   /// `VpnService.prepare()` returns null when consent is already on file and an
-  /// Intent otherwise, and that Intent can only be shown from an Activity. Both
-  /// paths are handled on the platform side; what must not happen is the third
-  /// one -- never asking, and running a service that silently establishes
-  /// nothing.
+  /// Intent otherwise, and that Intent can only be shown from an Activity; iOS
+  /// has no permission API at all, so the plugin reads consent as "a VPN
+  /// configuration for this app's extension is installed" and asks by saving
+  /// one, which is what raises the approval sheet. Both platforms handle both
+  /// paths; what must not happen is the third one -- never asking, and running
+  /// a service that silently establishes nothing.
   Future<bool> _ensurePermission(String profileId) async {
     try {
       if (await _commands.invokeMethod<bool>('prepare') ?? false) {
@@ -237,7 +253,7 @@ class SingboxTunnel extends BaseTunnelController {
   }
 
   void _onPlatformStatus(Object? event) {
-    final TunnelStatus next = decodeStatus(event, _activeProfileId);
+    final TunnelStatus next = decodeStatus(event, _activeProfileId, _platform);
     emit(next);
     if (next.stage != TunnelStage.connecting) {
       _settle(next);
@@ -251,23 +267,39 @@ class SingboxTunnel extends BaseTunnelController {
     final TunnelStatus next = TunnelStatus(
       TunnelStage.failed,
       profileId: _activeProfileId,
-      message: 'The Android status channel failed: $error',
+      message: 'The ${_platform.osName} status channel failed: $error',
     );
     emit(next);
     _settle(next);
   }
 
+  /// The platform's own words, unwrapped.
+  ///
+  /// Both platform sides write their failures as prose that names what is
+  /// missing and what to do about it -- `no_activity` says to bring the app to
+  /// the foreground, `no_session` says the extension's bundle identifier names a
+  /// target that is not a NEPacketTunnelProvider -- and [TunnelStatus.message]
+  /// is shown verbatim. A frame in front of that sentence added nothing on
+  /// Android and, when the frame said "Android", put the wrong operating system
+  /// in front of the right diagnosis on iOS.
+  ///
+  /// The code and the method are the fallback rather than the frame: a platform
+  /// that fails with no message leaves nothing else to show, and `(no message)`
+  /// on its own names neither the call that failed nor where to look it up.
   String _describe(String method, PlatformException error) {
-    final String detail = error.message ?? '(no message)';
     final String extra = error.details == null ? '' : ' -- ${error.details}';
-    return 'Android refused `$method` (${error.code}): $detail$extra';
+    final String? detail = error.message;
+    if (detail == null || detail.isEmpty) {
+      return '${_platform.osName} refused `$method` with code '
+          '"${error.code}" and no message. Nothing here can say more than '
+          'that; ${_platform.logHint} carries the rest.$extra';
+    }
+    return '$detail$extra';
   }
 
   String _describeMissing(MissingPluginException error) =>
       'The singbox_tunnel platform channel is not registered on this build: '
-      '$error. Either this is not Android, or the plugin was added to '
-      'pubspec.yaml without a rebuild -- a hot restart does not register a new '
-      'plugin. Nothing was connected.';
+      '$error. ${_platform.unregistered} Nothing was connected.';
 
   /// Emits [TunnelStage.failed] and throws with the same text, which is what
   /// TunnelController.connect promises: the awaiting caller gets an exception
@@ -284,17 +316,22 @@ class SingboxTunnel extends BaseTunnelController {
 
 /// Decodes one platform status event.
 ///
-/// Separate from the controller so the channel contract reads in one place.
-/// Every shape it cannot read becomes [TunnelStage.failed] carrying the raw
-/// event: an unknown stage string is a version skew between this Dart and that
-/// Kotlin, and the one answer that must never come out of a skew is
-/// "connected".
-TunnelStatus decodeStatus(Object? event, String? profileId) {
+/// Separate from the controller so the channel contract reads in one place, and
+/// so it can be tested without a channel at all. Every shape it cannot read
+/// becomes [TunnelStage.failed] carrying the raw event: an unknown stage string
+/// is a version skew between this Dart and the platform code, and the one answer
+/// that must never come out of a skew is "connected".
+TunnelStatus decodeStatus(
+  Object? event,
+  String? profileId,
+  TunnelPlatformText platform,
+) {
   if (event is! Map<Object?, Object?>) {
     return TunnelStatus(
       TunnelStage.failed,
       profileId: profileId,
-      message: 'The Android side sent a status this build cannot read: $event',
+      message: 'The ${platform.osName} side sent a status this build cannot '
+          'read: $event',
     );
   }
 
@@ -325,17 +362,18 @@ TunnelStatus decodeStatus(Object? event, String? profileId) {
         TunnelStage.failed,
         profileId: profileId,
         message: text ??
-            'The Android side reported failure without saying why. That is a '
-            'bug in SingboxVpnService, which is required to name what broke.',
+            'The ${platform.osName} side reported failure without saying why. '
+                'That is a bug in ${platform.engineClass}, which is required to '
+                'name what broke.',
       );
     default:
       return TunnelStatus(
         TunnelStage.failed,
         profileId: profileId,
-        message:
-            'Unknown tunnel stage "${event['stage']}" from the Android side. '
-            'This Dart and that Kotlin disagree about the channel contract; '
-            'refusing to guess which state the tunnel is in.',
+        message: 'Unknown tunnel stage "${event['stage']}" from the '
+            '${platform.osName} side. This Dart and that ${platform.language} '
+            'disagree about the channel contract; refusing to guess which state '
+            'the tunnel is in.',
       );
   }
 }

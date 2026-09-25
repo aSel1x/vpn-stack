@@ -19,6 +19,14 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  # Not for a lint configuration of its own: this package has none, and inherits
+  # app/analysis_options.yaml from the directory above, which includes
+  # `package:flutter_lints/flutter.yaml`. The analyzer resolves that include
+  # against the NEAREST package config, so a `flutter pub get` run here -- which
+  # the test suite below needs -- creates a .dart_tool that cannot see
+  # flutter_lints and silently drops every rule in it, while CI, resolving only
+  # app/, still enforces them. Declaring it makes the two agree.
+  flutter_lints:
 
 flutter:
   plugin:
@@ -39,11 +47,13 @@ flutter:
       # pod deliberately vendors no framework (see ios/singbox_tunnel.podspec),
       # so this costs `flutter build ios` nothing but the two Swift directories.
       #
-      # What it does NOT do is make an iOS build tunnel. That needs the
-      # NEPacketTunnelProvider EXTENSION TARGET, which lives in an Xcode project
-      # `flutter create` cannot produce -- see ios/README.md -- and until
-      # app/ios/ is committed with it, lib/main.dart keeps iOS on
-      # UnimplementedTunnel.
+      # What this line does not reach is the other process. A plugin is linked
+      # into the app target, and the tunnel runs in an app EXTENSION target with
+      # its own bundle identifier and its own Network Extension entitlement,
+      # which `flutter create` does not write -- so app/ios/ is committed rather
+      # than generated per run, with tool/ios_project.rb producing it and
+      # Extension/ compiled into SingboxTunnel.appex from there. ios/README.md
+      # is that half's record.
       ios:
         pluginClass: SingboxTunnelPlugin
       # Still not macos/windows/linux: app/README.md's table puts each of them
