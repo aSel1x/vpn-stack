@@ -22,6 +22,7 @@ class ApplyResult {
     required this.convergePending,
     this.teardown,
     this.ready,
+    this.portsReady,
     this.firewall,
     this.ikev2Forwarding,
     this.ikev2Reconcile,
@@ -40,6 +41,7 @@ class ApplyResult {
     'converge_pending',
     'teardown',
     'ready',
+    'ports_ready',
     'firewall',
     'ikev2_forwarding',
     'ikev2_reconcile',
@@ -76,6 +78,7 @@ class ApplyResult {
       convergePending: readBool(json, 'converge_pending', where: where),
       teardown: readNullableString(json, 'teardown', where: where),
       ready: readNullableStringList(json, 'ready', where: where),
+      portsReady: readNullableBool(json, 'ports_ready', where: where),
       firewall: readNullableStringList(json, 'firewall', where: where),
       ikev2Forwarding:
           readNullableString(json, 'ikev2_forwarding', where: where),
@@ -111,8 +114,16 @@ class ApplyResult {
 
   /// One line per port that never bound, or a single "all N port(s) bound".
   /// `apply` only *warns* about these, so a caller that wants to know whether
-  /// the server is really serving has to read them.
+  /// the server is really serving has to read them. Prose, for a person: the
+  /// verdict is [portsReady].
   final List<String>? ready;
+
+  /// The server's own answer to "did every expected port bind?", from
+  /// `composectl.wait_ready` rather than from its wording.
+  ///
+  /// Null means the server did not say: one too old to emit the key, or an
+  /// apply that rendered without converging and therefore waited for nothing.
+  final bool? portsReady;
 
   final List<String>? firewall;
   final String? ikev2Forwarding;
@@ -131,8 +142,24 @@ class ApplyResult {
   final List<String> unknownKeys;
 
   /// True when the ports the server expected to serve are all bound.
+  ///
+  /// [portsReady] is the server's own boolean and wins whenever it is there.
+  /// The English in [ready] is written for a person -- rewording
+  /// `composectl.wait_ready`'s success note is a change nobody would think of
+  /// as breaking a client -- so deciding health by matching "all " against it
+  /// meant the app could start calling a healthy server dead on a server-side
+  /// edit that touched no contract. That is the fragility `ports_ready` was
+  /// added to remove.
+  ///
+  /// The prose parse survives only for a server that predates the key, which
+  /// arrived with the rest of apply's converge verdicts (`teardown_ok`,
+  /// `firewall_ok`, `forwarding_ok`). Delete it -- and make [portsReady] the
+  /// whole of this getter -- once no server this app is pointed at is older
+  /// than those, because until then an upgraded app against an un-upgraded
+  /// server would report every apply as "ports never bound".
   bool get portsBound =>
-      ready != null && ready!.length == 1 && ready!.single.startsWith('all ');
+      portsReady ??
+      (ready != null && ready!.length == 1 && ready!.single.startsWith('all '));
 }
 
 /// `apply`'s IKEv2 reconciliation: certificates made to match the enabled

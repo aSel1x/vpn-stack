@@ -30,18 +30,21 @@ checkout rsynced over a `users.json` that had grown a field.
 — `app/` and the `app/packages/singbox_tunnel` plugin — on every push and every pull request, with
 no path filter, beside the Python lint and tests. So a commit that touches only `vpnctl/` does run
 the Dart tests, in the same run, and both halves go green or red together. The five artifact
-builds in `.github/workflows/app.yml` stay filtered on `app/**`, because a server-side one-liner
-should not spend two macOS runners. That filter used to be the *only* Dart trigger, which meant
-the contract tests never ran against the side that breaks them. The plugin needed a step of its
+builds in `.github/workflows/app.yml` stay filtered on `app/**` — plus that workflow itself and
+`compose.yml`, which is the server's sing-box pin and therefore the client's engine — because a
+server-side one-liner should not spend two macOS runners. Notably absent from that list is
+`vpnctl/**`, deliberately. That filter used to be the *only* Dart trigger, which meant the
+contract tests never ran against the side that breaks them. The plugin needed a step of its
 own because `flutter test` from `app/` collects `app/test/` and never descends into `packages/`:
 38 tests over the state machine that decides when this app may say "Connected" were analysed on
 every push and executed by nothing.
 
-**The payload is the shared artifact, and it is generated.** This file used to promise that a
-breaking `--json` change "cannot land without the app's tests failing in the same CI run", and
-then that the promise was not kept: the Dart fixtures were hand-typed from what somebody
-remembered `cli.py` printing, and nothing compared the two. Rename `enabled_protocols` to
-`enabled` in `cli.py` and the Dart suite stayed green, because `control_fakes.dart` and
+**The payload is the shared artifact, it is generated, and the mechanism is in the tree.** It was
+not, through two earlier revisions of this file: the first promised that a breaking `--json` change
+"cannot land without the app's tests failing in the same CI run", and the second withdrew the
+promise and recorded why it had never held. The Dart fixtures were hand-typed from what somebody
+remembered `cli.py` printing, and nothing compared the two. Rename `enabled_protocols` to `enabled`
+in `cli.py` and the Dart suite stayed green, because `control_fakes.dart` and
 `lib/control/models.dart` agreed with each other about a payload the server no longer sent. Three
 of those transcriptions were *already wrong*, and all three parsed: an export fixture carried
 `failed: ["hysteria2"]`, where only a `share_via_container` protocol can ever land; the IKEv2
@@ -59,19 +62,19 @@ signal that the payload change is the point of the commit.
 
 Three details that are the difference between a test and a decoration:
 
-- - **It is deliberately not a regex over `models.dart`**, which is the cheap option this file
+- **It is deliberately not a regex over `models.dart`**, which is the cheap option this file
   used to sketch. A Dart parser written in Python is a second thing to get wrong, and it would
   pass on a model that compiles and refuses every real payload. Key *names* are not enough either:
   `spki` was added to `hysteria2.share()` and the Dart list of expected values stayed as it was,
   so every test passed while the parser refused every real link. `config_fakes.dart` keeps its
   synthetic builder, because only a builder can drop one parameter at a time for the nine refusal
   tests, and it gained a reader for the real URI out of `user-export.json` beside it.
-- - **The comparison is on the serialised text, not the parsed object.** Two maps compare equal
+- **The comparison is on the serialised text, not the parsed object.** Two maps compare equal
   across a reordering and the order is not free: the app decodes into an order-preserving map, so
   a protocol's position is the order `ShareBundle` offers its URIs to a tunnel engine. Measured —
   moving a key in `cmd_status` left all 21 tests in that file green under dict equality and red on
   the line comparison.
-- - **The corpus is walked as well as read per command, on both sides.** Every fixture must be
+- **The corpus is walked as well as read per command, on both sides.** Every fixture must be
   given a reader, declared a refusal, or listed with a reason a human wrote; a per-command list
   only reaches the fixtures somebody remembered to name. Python additionally asserts that the
   directory holds exactly the files it generates, that each carries the `schema`/`ok` envelope the
@@ -108,8 +111,8 @@ dropped SSH connection broke the server screen permanently and every later actio
 dead socket with no way back but restarting the app.
 
 `tunnel` is the layer whose platform halves no test here can reach, and it is where the remaining
-work is. Its Dart controller is tested in the plugin package (38 tests); the Kotlin and the Swift
-are judged by `app.yml` and by nothing else.
+work is. Its Dart controller is tested in the plugin package, in that package's own suite; the
+Kotlin and the Swift are judged by `app.yml` and by nothing else.
 
 `config` is the one layer that might look like the duplication this file forbids, and it is not.
 The rule is against a second *producer* of a credential format: if the app minted a VLESS URI it
@@ -191,10 +194,11 @@ runs a tree somebody reviewed rather than whatever was on the default branch whi
 fetching it — which is what CLAUDE.md means by "unpinned and unsigned". The default is `v0.2.0`,
 and the constant is the one line to change when the app adopts a newer server tree. Two things
 follow: the tag has to exist in the public repository before any provision can work, and it has to
-name a tree that actually contains `scripts/provision-host.sh`. `main` did not — the script is a
-pure addition on this branch — so a provision against it cloned perfectly and then died at exit
-127 on its first host stage, on a box whose apt and git had already been touched. The clone step
-now asserts the script is present in the fetched ref and names both the ref and the path.
+name a tree that actually contains `scripts/provision-host.sh`. Back when that script lived only on
+the branch that introduced it, the default branch had none, and a provision aimed there cloned
+perfectly and then died at exit 127 on its first host stage, on a box whose apt and git had already
+been touched. The clone step now asserts the script is present in the fetched ref before running
+anything, and names both the ref and the path when it is not.
 
 What does **not** move is the firewall step. `scripts/install.sh` arms a detached deadman that
 disables ufw unconditionally after a timeout, enables the firewall, then opens a **brand-new SSH

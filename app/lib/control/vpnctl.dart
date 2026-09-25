@@ -25,20 +25,27 @@ const int vpnctlSchema = 1;
 /// repository already produced an `exit 127` that explained nothing.
 const String defaultVpnctlPath = '/usr/local/bin/vpnctl';
 
-/// The same lock `./vpn` takes, at the same path.
+/// The same lock `./vpn` takes, at the same path, and the same one vpnctl now
+/// takes from inside for every mutating command.
 ///
-/// "One SSH call, one lock" is the entire multi-operator story here: two people
-/// writing users.json at once interleave instead of serialising. An app that
-/// skipped it would be the second operator.
+/// "One SSH call, one lock" is the multi-operator story here: two people
+/// writing users.json at once interleave instead of serialising. Holding it out
+/// here as well is not redundant -- this one covers the whole remote command,
+/// vpnctl's own covers vpnctl -- and an app that skipped it would be the second
+/// operator. VPN_STACK_LOCK_HELD is how the two agree on who is holding it; see
+/// provision/commands.dart.
 const String defaultLockPath = '/run/vpn-stack.lock';
 
 /// What flock exits with when it waited and never got the lock.
 ///
-/// Chosen (EX_TEMPFAIL) so that "somebody else is mid-apply" is distinguishable
-/// from anything vpnctl itself can exit with -- 1 for a refusal, 2 for argparse
-/// or the not-the-server guard, 127 for a missing binary. `./vpn` blocks for
-/// ever instead; a phone that hangs with nothing on screen is indistinguishable
-/// from a crash, so this one waits with a bound and then says why.
+/// EX_TEMPFAIL, so that "somebody else is mid-apply" is distinguishable from
+/// every other status either half produces -- 1 for a refusal, 2 for argparse
+/// or the not-the-server guard, 127 for a missing binary. vpnctl's own lock
+/// refusal exits 75 too, deliberately and for the same meaning, so a client
+/// does not have to know which of the two turned the call away. `./vpn` blocks
+/// for ever instead; a phone that hangs with nothing on screen is
+/// indistinguishable from a crash, so this one waits with a bound and then says
+/// why.
 const int lockConflictExit = 75;
 
 /// Every call is `flock … vpnctl … --json`.

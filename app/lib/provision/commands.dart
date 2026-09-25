@@ -280,25 +280,34 @@ RemoteProgram hostCodeCommand(ProvisionConfig config) =>
 
 // Every vpnctl invocation this layer sends goes through the lock, exactly as
 // `./vpn`'s remote(), install.sh, deploy.sh, provision-host.sh's own bootstrap
-// and the boot unit do. vpnctl takes no lock of its own, so this is the whole of
-// the multi-operator story, and app/README.md is flat about it: a call that
-// skips the lock is a bug even on the run where it works. The race is not
-// hypothetical -- two processes rendering candidate trees over each other is the
-// one thing the atomic promote downstream cannot save you from, because both
-// halves are valid and merely come from different inputs.
+// and the boot unit do. vpnctl takes /run/vpn-stack.lock itself now, for every
+// mutating command, and this outer flock is still the load-bearing half rather
+// than a leftover: it covers the WHOLE remote command -- the shell around the
+// call, and anything this layer sends after it -- while vpnctl's own window
+// opens after argparse and closes when the process exits. app/README.md is flat
+// about it: a call that skips the lock is a bug even on the run where it works.
+// The race is not hypothetical -- two processes rendering candidate trees over
+// each other is the one thing the atomic promote downstream cannot save you
+// from, because both halves are valid and merely come from different inputs.
 //
 // `-w` and `-E 75` where the shell call sites use a bare `flock`: a phone
 // blocking for ever with nothing on screen is indistinguishable from a crash,
-// and EX_TEMPFAIL is a status vpnctl itself cannot produce -- 1 for a refusal, 2
-// for argparse or the not-the-server guard, 127 for a missing shim -- so
-// "somebody else is mid-apply" stays distinguishable from every real failure.
+// and 75 (EX_TEMPFAIL) is the one status reserved for "somebody else is
+// mid-apply" on both sides of the handshake -- vpnctl's own refusal exits 75
+// too, and its other statuses are 1 for a refusal, 2 for argparse or the
+// not-the-server guard and 127 for a missing shim -- so busy stays
+// distinguishable from broken whichever half decided it.
 // ProvisionContext.runVpnctl translates it.
 //
-// VPN_STACK_LOCK_HELD is the handshake install.sh and deploy.sh already set, for
-// the day vpnctl takes the lock itself: flock(1) inside flock(1) on the same
-// path from a child process opens a second file description and blocks for ever
-// (measured on this stack), and an outer `-w` does not bound a child's wait. Set
-// here so the app is not the one call site left to deadlock on that day.
+// VPN_STACK_LOCK_HELD is the handshake that keeps the two halves from fighting
+// over one file, and it is why this is `flock` around vpnctl rather than one or
+// the other: flock(1) inside flock(1) on the same path from a child process
+// opens a second file description, which the kernel treats as a different
+// holder, so the inner wait never returns (measured on this stack) and an outer
+// `-w` does not bound it. The variable tells vpnctl the caller already holds
+// the file, so it skips taking it; vpnctl's own non-blocking acquire is the
+// second line of defence, refusing with 75 rather than hanging if a call site
+// ever forgets to set it.
 //
 // `env` rather than a bare `VAR=1 cmd` prefix: the same list is then valid as an
 // argv and as a shell word, so nothing here depends on which of the two a
@@ -441,14 +450,54 @@ RemoteProgram enableUfwCommand(ProvisionConfig config) =>
       '@PORT@': ShellArg('${config.sshPort}'),
     });
 
-/// Negative pid first, so the `sleep` dies with its leader; the plain pid is the
-/// fallback for a kernel that already reaped the group.
+// Disarming is the one step here that is allowed to fail, and it has to be able
+// to. This program was `kill -TERM` with both kills' stderr discarded, an
+// unconditional `rm -f` of the pid file BEFORE anything checked, and a closing
+// `true`: it could not exit non-zero whatever happened, so a kill that did not
+// land left a timer counting down towards `ufw --force disable` on a healthy
+// server with the one record of its existence deleted. provision-host.sh's
+// deadman_kill was hardened into TERM, poll until it is provably gone, KILL,
+// poll again -- and these two are halves of one safety net, so they have to
+// agree about what disarming means.
+//
+// Negative pid first, so the `sleep` dies with its leader; the plain pid is the
+// fallback for a group the kernel has already torn down. Under root a signal to
+// one of our own processes cannot be refused, so the escalation is defence in
+// depth; what the polling really buys is that a surviving timer is REPORTED,
+// with its pid, instead of being assumed dead.
+//
+// The pid file is removed only once the process is provably gone, and left in
+// place otherwise: it is the single record of a live timer, and deleting it
+// while the timer breathes is the one irreversible mistake available here.
+//
+// A missing pid file is fatal rather than a shrug: either the timer already
+// fired, in which case ufw is off right now and the operator has to know, or it
+// was never armed, in which case the firewall went up with nothing under it.
 const String _disarmDeadman = r'''
+set -u
 pidfile=@PID@
-pid=$(cat "$pidfile" 2>/dev/null || true)
-[ -n "$pid" ] && { kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }
+alive() { kill -0 -"$1" 2>/dev/null || kill -0 "$1" 2>/dev/null; }
+[ -s "$pidfile" ] || {
+  echo "no deadman pid file at $pidfile. Either its timer already expired -- in which case ufw is off right now, check \`ufw status\` -- or nothing ever armed it and the firewall went up with no net under it. Neither is a state to call an install finished from." >&2
+  exit 1; }
+pid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null || true)
+[ -n "$pid" ] || {
+  echo "$pidfile holds no pid this can read, so there is no way to tell what to kill. A deadman may still be counting down towards \`ufw --force disable\`." >&2
+  exit 1; }
+kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+i=0
+while [ "$i" -lt 25 ]; do alive "$pid" || break; sleep 0.2; i=$((i + 1)); done
+if alive "$pid"; then
+  kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 10 ]; do alive "$pid" || break; sleep 0.2; i=$((i + 1)); done
+fi
+if alive "$pid"; then
+  echo "deadman pid $pid survived TERM and KILL. It runs \`ufw --force disable\` when its timer expires, on a server that is fine. Kill it by hand from a console: kill -KILL -$pid. $pidfile is left in place -- it is the only record that it is still counting." >&2
+  exit 1
+fi
 rm -f "$pidfile"
-true
+echo "disarmed=$pid"
 ''';
 
 RemoteProgram disarmDeadmanCommand(ProvisionConfig config) =>

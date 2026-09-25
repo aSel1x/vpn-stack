@@ -157,6 +157,10 @@ class _ServerTile extends StatelessWidget {
   Future<void> _onMenu(BuildContext context, String choice) async {
     final ServersModel servers = context.read<ServersModel>();
     final CredentialVault vault = context.read<CredentialVault>();
+    // Read before the dialog, not after: every use of `context` past an await
+    // is a use of a context that may be gone.
+    final TunnelModel tunnel = context.read<TunnelModel>();
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     if (choice == 'forget-credential') {
       vault.forget(server.id);
       return;
@@ -178,7 +182,12 @@ class _ServerTile extends StatelessWidget {
           'no user is deleted and no key is destroyed on the server -- it keeps '
           'serving, and adding it again gets everything back.\n\n'
           'The host key this device pinned goes with the record, so adding the '
-          'server again asks about its key from scratch.',
+          'server again asks about its key from scratch.\n\n'
+          'This device\'s VPN profile goes too, along with the configuration it '
+          'would start from -- so the server stops appearing in the system\'s '
+          'VPN settings and cannot be switched on from there. That still '
+          'revokes nothing: the credentials it carried stay valid until '
+          '`vpn user rm` deletes the user on the server.',
         ),
         actions: <Widget>[
           TextButton(
@@ -193,8 +202,24 @@ class _ServerTile extends StatelessWidget {
       ),
     );
     if (confirmed ?? false) {
+      // Before the app's own record goes, because afterwards there is nothing
+      // left that names this server: the system VPN profile and the stored
+      // configuration behind it are this device's copy of the credential, and
+      // leaving them is how a removed server keeps a row under the system's
+      // VPN settings that still connects.
+      //
+      // It cannot veto the removal -- the person asked for the server to go,
+      // and a tunnel layer that could not tidy up is not a reason to keep the
+      // record -- but what it could not remove has to be said, because what
+      // survives is a credential.
+      final String? left = await tunnel.forgetProfile(server.id);
       vault.forget(server.id);
       await servers.remove(server.id);
+      if (left != null) {
+        messenger.showSnackBar(
+          SnackBar(content: Text(left), duration: const Duration(seconds: 10)),
+        );
+      }
     }
   }
 }

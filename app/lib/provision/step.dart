@@ -196,8 +196,9 @@ class ProvisionContext {
     }
   }
 
-  /// The one status flock owns, as this layer's failure. Built in one place so
-  /// the two callers cannot drift into describing the same condition differently.
+  /// The one status the lock owns -- whichever half refused, flock(1) out here
+  /// or vpnctl's own acquire inside -- as this layer's failure. Built in one
+  /// place so the two callers cannot drift into describing it differently.
   LockBusyError _lockBusy(String what) => LockBusyError(
         step: stepName,
         what: what,

@@ -456,6 +456,117 @@ void main() {
     });
   });
 
+  group('forgetting a server takes this device off it', () {
+    // Deleting a server in the app used to reach no native teardown at all, so
+    // the NETunnelProviderManager installed at the first connect stayed under
+    // Settings > General > VPN & Device Management -- and flipping it started
+    // the extension from a saved configuration carrying a VLESS UUID or a
+    // Hysteria2 password, for a server the app no longer knew about.
+    //
+    // None of this revokes anything. The credentials stay valid until
+    // `vpn user rm` runs on the server; what these assert is that this
+    // DEVICE's copy goes.
+    test('removes the profile the system installed', () async {
+      final _FakePlatform platform = _FakePlatform()
+        ..answers['removeProfile'] = null;
+      final SingboxTunnel tunnel = tunnelFor(platform);
+
+      expect(await tunnel.forgetProfile(profile.id), isNull);
+
+      expect(platform.methods, contains('removeProfile'));
+    });
+
+    test('stops a live tunnel first, because the stored config is the credential',
+        () async {
+      // Android deletes the persisted start request when the service stops and
+      // at no other time, so a tunnel left running is the whole content of a
+      // share URI left in clear on a device whose owner just deleted the
+      // server.
+      final _FakePlatform platform = _FakePlatform()
+        ..answers['prepare'] = true
+        ..answers['start'] = null
+        ..answers['stop'] = null
+        ..answers['removeProfile'] = null;
+      final SingboxTunnel tunnel = tunnelFor(platform);
+      final _Attempt connecting = _Attempt(tunnel.connect(profile));
+      await pumpEventQueue();
+      platform.emit(<Object?, Object?>{'stage': stageConnected});
+      await pumpEventQueue();
+      await connecting.settled;
+
+      final Future<String?> forgetting = tunnel.forgetProfile(profile.id);
+      await pumpEventQueue();
+      platform.emit(<Object?, Object?>{'stage': stageDisconnected});
+      await pumpEventQueue();
+
+      expect(await forgetting, isNull);
+      // Both halves: that it stopped at all, and that it stopped BEFORE the
+      // profile went. `indexOf` alone would pass on a -1 for a stop that never
+      // happened, which is the mutation this test exists to catch.
+      expect(platform.methods, contains('stop'));
+      expect(platform.methods, contains('removeProfile'));
+      expect(platform.methods.indexOf('stop'),
+          lessThan(platform.methods.indexOf('removeProfile')));
+    });
+
+    test('leaves the device copy alone when it belongs to another server',
+        () async {
+      // One configuration per device -- iOS installs a single manager, the
+      // Android service keeps one start request -- and it belongs to whatever
+      // was connected last. Removing it here would take a different server's
+      // credential, and its running tunnel, with it.
+      final _FakePlatform platform = _FakePlatform()
+        ..answers['prepare'] = true
+        ..answers['start'] = null
+        ..answers['removeProfile'] = null;
+      final SingboxTunnel tunnel = tunnelFor(platform);
+      final _Attempt connecting = _Attempt(tunnel.connect(profile));
+      await pumpEventQueue();
+      platform.emit(<Object?, Object?>{'stage': stageConnected});
+      await pumpEventQueue();
+      await connecting.settled;
+
+      expect(await tunnel.forgetProfile('some-other-server'), isNull);
+
+      expect(platform.methods, isNot(contains('removeProfile')));
+      expect(platform.methods, isNot(contains('stop')));
+    });
+
+    test('a platform with nothing of the kind does not fail the removal',
+        () async {
+      // Android answers `notImplemented`, which arrives here as a
+      // MissingPluginException: it installs no system profile. Forgetting the
+      // server is the person's decision and a tunnel layer with nothing to do
+      // may not veto it, so this is a no-op and not a failure.
+      final _FakePlatform platform = _FakePlatform()
+        ..answers['removeProfile'] =
+            MissingPluginException('No implementation found for removeProfile');
+      final SingboxTunnel tunnel = tunnelFor(platform);
+
+      expect(await tunnel.forgetProfile(profile.id), isNull);
+    });
+
+    test('a profile the system would not delete is reported, not swallowed',
+        () async {
+      // The one part of a removal that is not cosmetic: the app's record is
+      // gone and the credential is not. The platform's own sentence comes back
+      // for the UI to show, because it names where the row still is.
+      final _FakePlatform platform = _FakePlatform()
+        ..answers['removeProfile'] = PlatformException(
+          code: 'remove_failed',
+          message: 'iOS refused to remove this app\'s VPN profile. It is still '
+              'listed under Settings > General > VPN & Device Management.',
+        );
+      final SingboxTunnel tunnel =
+          tunnelFor(platform, text: TunnelPlatformText.ios);
+
+      final String? left = await tunnel.forgetProfile(profile.id);
+
+      expect(left, isNotNull);
+      expect(left, contains('VPN & Device Management'));
+    });
+  });
+
   group('on iOS nothing says Android', () {
     // Every failure message named Android unconditionally, so an iPhone whose
     // tunnel would not come up was told to inspect an Android artifact with a

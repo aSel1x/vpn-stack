@@ -70,10 +70,11 @@ class ProvisionConfig {
   final String vpnctl;
 
   /// The lock every other call site takes: `./vpn`'s remote(), install.sh,
-  /// deploy.sh, provision-host.sh and the boot unit. vpnctl holds none of its
-  /// own, so it is the only thing serialising two operators -- and the app IS
-  /// the second operator. app/README.md: a call that skips it is a bug even on
-  /// the run where it works.
+  /// deploy.sh, provision-host.sh and the boot unit. vpnctl takes this same
+  /// file itself for every mutating command, which does not make holding it
+  /// here optional: this one covers the whole remote command rather than
+  /// vpnctl's own window, and the app IS the second operator. app/README.md: a
+  /// call that skips it is a bug even on the run where it works.
   final String lockPath;
 
   /// How long to wait for it before failing. Bounded, unlike `./vpn`, which

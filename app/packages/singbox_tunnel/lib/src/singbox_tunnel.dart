@@ -206,6 +206,52 @@ class SingboxTunnel extends BaseTunnelController {
   }
 
   @override
+  Future<String?> forgetProfile(String profileId) async {
+    // This device holds exactly one configuration: iOS installs a single
+    // NETunnelProviderManager for the app, and the Android service keeps one
+    // persisted start request. It belongs to whatever was connected last, so
+    // if that is demonstrably a different server then this server's copy was
+    // overwritten long ago and there is nothing of it here to delete --
+    // removing the profile would take somebody else's credential, and their
+    // running tunnel, with it. A controller that has seen no profile at all
+    // (a fresh launch, nothing connected) does NOT get that benefit of the
+    // doubt: an extra consent sheet on the next connect is cheaper than a
+    // credential left in the container.
+    final String? installed = status.profileId;
+    if (installed != null && installed != profileId) {
+      return null;
+    }
+
+    String? complaint;
+    // Stopped first, and not only for tidiness. On Android the persisted
+    // configuration -- the share URIs in clear -- is deleted when the service
+    // stops and by nothing else, so a tunnel left running is a credential left
+    // on disk for a server the app is in the middle of forgetting.
+    if (status.isUp || status.isBusy) {
+      try {
+        await disconnect();
+      } on Object catch (error) {
+        complaint = 'The tunnel for this server would not stop: $error -- so '
+            'it may still be up, still routing traffic, and the configuration '
+            'behind it may still be on this device.';
+      }
+    }
+
+    try {
+      await _commands.invokeMethod<void>('removeProfile');
+    } on MissingPluginException {
+      // Android answers `notImplemented` here, deliberately: it installs no
+      // system profile to remove. VpnService consent is per-app, granted once
+      // and withdrawn in Settings, and the start request was deleted by the
+      // stop above. Nothing to do, and nothing worth telling anybody.
+      return complaint;
+    } on PlatformException catch (error) {
+      return _merge(complaint, _describe('removeProfile', error));
+    }
+    return complaint;
+  }
+
+  @override
   Future<void> dispose() async {
     await _events.cancel();
     await super.dispose();
@@ -295,6 +341,15 @@ class SingboxTunnel extends BaseTunnelController {
           'that; ${_platform.logHint} carries the rest.$extra';
     }
     return '$detail$extra';
+  }
+
+  /// Both halves of a partial removal, or whichever there is. Neither may be
+  /// dropped: one says a tunnel is still up, the other that a credential is
+  /// still stored, and they are separate things to act on.
+  static String? _merge(String? first, String? second) {
+    if (first == null) return second;
+    if (second == null) return first;
+    return '$first\n\n$second';
   }
 
   String _describeMissing(MissingPluginException error) =>

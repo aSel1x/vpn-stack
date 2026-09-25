@@ -144,8 +144,10 @@ void main() {
 
   group('every vpnctl invocation takes the lock', () {
     // app/README.md: "a call that skips the lock is a bug even on the run where
-    // it works". vpnctl holds no lock of its own, so this is the whole of the
-    // multi-operator story, and provisioning ran three calls outside it while
+    // it works". vpnctl takes /run/vpn-stack.lock itself now for every mutating
+    // command, and this outer one still has to be here: it holds the file
+    // across the whole remote command instead of only across vpnctl's own
+    // window, and provisioning once ran three calls outside it while
     // control/vpnctl.dart put every one of its own inside.
     List<RemoteProgram> vpnctlPrograms() => <RemoteProgram>[
           vpnctlReadyCommand(plain),
@@ -163,11 +165,13 @@ void main() {
       }
     });
 
-    test('bounded, and with a status vpnctl itself cannot produce', () {
+    test('bounded, and with the one status reserved for a busy lock', () {
       // `./vpn` blocks for ever; a phone with nothing on screen is
       // indistinguishable from a crash. EX_TEMPFAIL is what makes "somebody
       // else is mid-apply" different from 1 (a refusal), 2 (argparse or the
-      // guard) and 127 (a missing shim).
+      // guard) and 127 (a missing shim) -- and vpnctl's own lock refusal exits
+      // 75 as well, deliberately, so the two halves cannot disagree about which
+      // status means busy.
       for (final RemoteProgram program in vpnctlPrograms()) {
         expect(program.text, contains('-w 300'), reason: program.text);
         expect(program.text, contains('-E 75'), reason: program.text);

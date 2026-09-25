@@ -240,13 +240,23 @@ Everything about its lifetime follows from those two sentences together.
   device was ever handed rides into a Finder backup and into iCloud, where the
   person who deleted the server in the app has no idea it still is.
 
-`removeProfile` is the other half and it is a method Dart calls, not something
-this package does on its own. `NETunnelProviderManager` is installed once, at the
-first connect, and it **outlives the app's own record of the server**: without
-`removeFromPreferences` deleting a server in the app left a row under Settings >
-General > VPN & Device Management that started the extension from
-`tunnel-start.json` when somebody flipped it — a tunnel to a server the app no
-longer knows, on a credential it had stopped showing anybody.
+`removeProfile` is the other half, and it is reached from Dart — through
+`TunnelController.forgetProfile`, which the server list calls when somebody
+removes a server. It was not, for a while: the Swift existed, this paragraph
+already described it as a method Dart calls, and no Dart file mentioned it, so
+every removal left the profile installed. `NETunnelProviderManager` is installed
+once, at the first connect, and it **outlives the app's own record of the
+server**: without `removeFromPreferences` deleting a server in the app left a row
+under Settings > General > VPN & Device Management that started the extension
+from `tunnel-start.json` when somebody flipped it — a tunnel to a server the app
+no longer knows, on a credential it had stopped showing anybody.
+
+The Dart half stops a running tunnel first — on Android the stop is what deletes
+the persisted configuration, and that file is the credential — leaves the device's copy alone when the controller can see it
+belongs to a **different** server, and treats a platform that answers
+`notImplemented` — Android, which installs no system profile — as a no-op rather
+than a failure. A removal this cannot complete does not block the server from
+being forgotten; what survived comes back as a sentence the app shows.
 
 **It revokes nothing on the server, and every sentence around it has to keep
 saying so.** The credentials in that configuration stay valid until `vpn user rm`

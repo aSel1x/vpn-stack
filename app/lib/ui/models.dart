@@ -547,6 +547,16 @@ class TunnelModel extends ChangeNotifier {
     }
   }
 
+  /// Drops this device's copy of a profile -- the system VPN configuration and
+  /// the stored configuration behind it -- and returns what survived, or null.
+  ///
+  /// Not wrapped in the failure bookkeeping the other two get: this is called
+  /// while a server is being deleted, and a tunnel that cannot tidy up must not
+  /// turn that into a failed removal. What it returns is shown to the person
+  /// instead, because what survives a partial removal is a credential.
+  Future<String?> forgetProfile(String profileId) =>
+      _controller.forgetProfile(profileId);
+
   Future<void> disconnect() async {
     try {
       await _controller.disconnect();

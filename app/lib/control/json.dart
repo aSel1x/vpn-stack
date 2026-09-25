@@ -112,6 +112,19 @@ String? readNullableString(Map<String, Object?> json, String key,
   _wrongType(jsonPath(where, key), 'a string or null', value);
 }
 
+/// Absent or null both give null, so a caller can tell "this server is too old
+/// to answer" from a server that answered false. A verdict a client invented
+/// because the key was missing is exactly the fabrication these models exist to
+/// avoid.
+bool? readNullableBool(Map<String, Object?> json, String key,
+    {String where = ''}) {
+  if (!json.containsKey(key)) return null;
+  final Object? value = json[key];
+  if (value == null) return null;
+  if (value is bool) return value;
+  _wrongType(jsonPath(where, key), 'a boolean or null', value);
+}
+
 bool readBool(Map<String, Object?> json, String key, {String where = ''}) {
   final Object? value = _present(json, key, where);
   if (value is bool) return value;

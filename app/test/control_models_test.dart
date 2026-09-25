@@ -137,26 +137,64 @@ void main() {
       expect(result.configChanged, <String>['ikev2', 'sing-box']);
       expect(result.convergePending, isFalse);
       expect(result.ready, <String>['all 5 port(s) bound']);
+      expect(result.portsReady, isTrue);
       expect(result.portsBound, isTrue);
       expect(result.ikev2Reconcile!.ran, isTrue);
       expect(result.ikev2Reconcile!.failed, isEmpty);
-      // The carve-out, doing its job. `apply` gained one boolean per converge
-      // step -- ports_ready, teardown_ok, firewall_ok, forwarding_ok and
-      // not_running -- so a caller can find out whether the server is serving
-      // without pattern-matching English. [ApplyResult] does not declare them
-      // yet, and it must not refuse the payload for that: these keys arrive on
-      // a receipt for work that has already happened. Anything OUTSIDE that set
-      // is a key nobody has looked at, which is what this pins.
+      // `ports_ready` is declared and consumed now, so it is no longer one of
+      // the keys this payload merely tolerates -- which is the point of the
+      // carve-out shrinking rather than growing.
+      expect(result.unknownKeys, isNot(contains('ports_ready')));
+      // The carve-out, doing its job for the rest. `apply` gained one boolean
+      // per converge step so a caller can find out whether the server is
+      // serving without pattern-matching English; [ApplyResult] does not
+      // declare the other three, and it must not refuse the payload for that,
+      // because these keys arrive on a receipt for work that has already
+      // happened. Anything OUTSIDE this set is a key nobody has looked at,
+      // which is what this pins.
       expect(
         result.unknownKeys,
         everyElement(isIn(<String>[
-          'ports_ready',
           'teardown_ok',
           'firewall_ok',
           'forwarding_ok',
           'not_running',
         ])),
       );
+    });
+
+    test('the verdict is the boolean, not the wording of the prose', () {
+      // The whole reason `ports_ready` exists. `composectl.wait_ready`'s
+      // success note is English for a person, and somebody rewording it is not
+      // making a protocol change -- but a client that decided health by
+      // matching "all " against it would start calling this healthy server
+      // dead on that edit alone.
+      final ApplyResult reworded = ApplyResult.fromJson(_json(
+          '{"rendered": "r", "enabled_protocols": ["ikev2"], '
+          '"restarted": true, "config_changed": [], "converge_pending": false, '
+          '"ready": ["every expected port is serving"], "ports_ready": true}'));
+      expect(reworded.portsBound, isTrue);
+
+      // And the other way: a payload whose prose starts with "all " while the
+      // server says the wait failed. The boolean is what the server measured.
+      final ApplyResult contradicted = ApplyResult.fromJson(_json(
+          '{"rendered": "r", "enabled_protocols": ["ikev2"], '
+          '"restarted": true, "config_changed": [], "converge_pending": false, '
+          '"ready": ["all 5 port(s) bound"], "ports_ready": false}'));
+      expect(contradicted.portsBound, isFalse);
+    });
+
+    test('a server too old to send ports_ready still gets an answer', () {
+      // The fallback, and the only thing keeping it alive: an app newer than
+      // the server it is pointed at must not report every apply as "ports
+      // never bound". It goes when no such server is left.
+      final ApplyResult old = ApplyResult.fromJson(_json(
+          '{"rendered": "r", "enabled_protocols": ["ikev2"], '
+          '"restarted": true, "config_changed": [], "converge_pending": false, '
+          '"ready": ["all 5 port(s) bound"]}'));
+      expect(old.portsReady, isNull);
+      expect(old.portsBound, isTrue);
+      expect(old.unknownKeys, isEmpty);
     });
 
     test('null config_changed is not the same answer as an empty one', () {

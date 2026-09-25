@@ -12,10 +12,14 @@ import 'dart:async';
 
 /// Establishing the tunnel on THIS device.
 ///
-/// The UI talks to [TunnelController] and to nothing else, so a real engine --
-/// libbox on Android and iOS, a privileged helper on desktop -- drops in behind
-/// this interface without a screen changing. That is the only thing this layer
-/// has to get right today, because the engine itself is not here yet.
+/// The UI talks to [TunnelController] and to nothing else, so an engine drops in
+/// behind this interface without a screen changing. Two already have, in this
+/// package: libbox behind a `VpnService` in `android/`, libbox behind a
+/// `NEPacketTunnelProvider` in `ios/`, both driven by `SingboxTunnel` beside
+/// this file. The three desktop targets have none, and the sibling that serves
+/// them will be a client of a privileged helper rather than another method
+/// channel -- only a root process can open a TUN device there. That is the
+/// whole reason this seam is an interface and not a class.
 ///
 /// There is deliberately no mock that reports success. See
 /// `unimplemented_tunnel.dart`.
@@ -101,6 +105,31 @@ abstract class TunnelController {
   /// Tears the tunnel down. Tearing down nothing is not an error.
   Future<void> disconnect();
 
+  /// Drops this device's copy of [profileId]: the VPN configuration the system
+  /// installed for it, and whatever the engine persisted to start it with.
+  ///
+  /// Called when the app forgets a server, and it is not cosmetic. On iOS the
+  /// `NETunnelProviderManager` installed at the first connect outlives the
+  /// app's own record: deleting a server left a row under Settings > General >
+  /// VPN & Device Management that, when somebody flipped it, started the
+  /// extension from the saved configuration -- a tunnel to a server the app no
+  /// longer knows, on a credential it had stopped showing anybody. The saved
+  /// configuration is the credential: a VLESS UUID or a Hysteria2 password, in
+  /// clear, in a container the app no longer has a screen for.
+  ///
+  /// **It revokes nothing.** Those credentials stay valid on the server until
+  /// `vpn user rm` runs there; what goes is this device's copy and this
+  /// device's ability to use it unattended. Every sentence a person reads
+  /// around this has to keep saying so.
+  ///
+  /// Returns null when the removal was complete or there was nothing to
+  /// remove, and a sentence to show otherwise -- a configuration the system
+  /// refused to delete is a credential still on the phone, which is worth
+  /// interrupting somebody for. It must NOT throw and must not fail on a
+  /// platform with nothing of the kind: forgetting a server is the caller's
+  /// decision, and a tunnel layer that cannot help may not veto it.
+  Future<String?> forgetProfile(String profileId);
+
   Future<void> dispose();
 }
 
@@ -132,6 +161,17 @@ abstract class BaseTunnelController implements TunnelController {
       _changes.add(next);
     }
   }
+
+  /// Nothing installed, nothing to forget.
+  ///
+  /// The default is a no-op because it is the truth for an engine that holds no
+  /// system-level profile -- the desktop stub, and Android, where consent is
+  /// per-app rather than a configuration and the persisted start request is
+  /// deleted when the service stops. An engine that installs one (iOS through
+  /// `NETunnelProviderManager`) overrides this and says what it could not
+  /// remove.
+  @override
+  Future<String?> forgetProfile(String profileId) async => null;
 
   @override
   Future<void> dispose() async {
