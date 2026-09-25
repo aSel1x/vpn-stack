@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,13 +46,38 @@ def build_tree(
     return tree
 
 
+def _rmtree_not_live(path: Path) -> None:
+    """Delete a generation, refusing the one `rendered` points at.
+
+    The invariant, kept separate from the naming scheme that makes it
+    unreachable: two running containers bind-mount paths under the live tree, so
+    removing it does not fail loudly -- it leaves sing-box and dnstt-sshd holding
+    deleted inodes, serving until the next restart and then refusing to start,
+    with the config they were serving gone from the disk and unrecoverable
+    except by another render.
+    """
+    live = RENDERED_LINK.resolve() if RENDERED_LINK.is_symlink() else None
+    if live is not None and path.resolve() == live:
+        raise protocols.RenderError(
+            f"refusing to delete {path}: it is the live rendered tree that "
+            "`rendered` points at and that the containers are mounted from."
+        )
+    shutil.rmtree(path)
+
+
 def write_candidate(tree: dict[str, bytes]) -> Path:
+    # mkdtemp rather than a name derived only from the clock. The stamp is at
+    # one-second resolution, and this used to rmtree whatever already had that
+    # name before rendering into it -- so two applies inside the same second (a
+    # `user add` scripted in a loop, or a deploy racing the boot unit) had the
+    # second one delete the tree the first had just promoted and the containers
+    # were mounted from. The stamp stays in the prefix because `prune` orders
+    # generations by name, `.gitignore` and `vpn backup` both match `rendered*`,
+    # and a human reading the state directory needs to see when each was built.
+    # mkdtemp also creates at 0700 in one syscall instead of mkdir-then-chmod.
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    candidate = STATE_DIR / f"rendered-{stamp}"
-    if candidate.exists():
-        shutil.rmtree(candidate)
-    candidate.mkdir(parents=True, exist_ok=True)
-    candidate.chmod(0o700)
+    candidate = Path(tempfile.mkdtemp(prefix=f"rendered-{stamp}-", dir=STATE_DIR))
     for rel, content in tree.items():
         target = candidate / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +125,11 @@ def prune(keep: int = KEEP_GENERATIONS) -> list[Path]:
     for old in generations[keep:]:
         if old == live:
             continue
-        shutil.rmtree(old)
+        # Through the guard as well as past the `live` skip above: the skip
+        # compares what glob() returned against a resolved symlink target, and a
+        # state directory reached through a symlinked path makes those two
+        # spellings of the same directory differ.
+        _rmtree_not_live(old)
         removed.append(old)
     return removed
 
@@ -146,8 +176,14 @@ def missing_deployment_config(proto: protocols.Protocol) -> str | None:
     """What `protocol on` has to refuse for, before it writes anything.
 
     Lives beside the read it depends on rather than in cli.py, so the command
-    surface stays free of protocol names; the registry's own home for this is a
-    field on Protocol, and until it has one the single case is here.
+    surface stays free of protocol names -- `protocol on` must not grow a branch
+    per protocol. It is not on `Protocol` because a field there would have to be
+    a callable reaching back into this module for the .env read, which is the
+    dependency the pure registry does not take: render imports protocols, never
+    the other way round. One case is also not a pattern yet; the second protocol
+    to need deployment config before it can be enabled is what would pay for
+    generalising this, and it can be generalised then without moving anything a
+    caller can see.
     """
     if proto.name == dnstt.NAME and not dnstt_zone():
         return dnstt.NO_ZONE

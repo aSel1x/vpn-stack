@@ -183,3 +183,176 @@ def test_new_user_mints_a_credential_for_every_protocol() -> None:
     assert ":" not in user.dnstt_password
     assert user.dnstt_password.isalnum()
     assert users_store.new_user("alice").vless_uuid != user.vless_uuid
+
+
+# ------------------------------------- the other ways this file can be wrong
+
+
+def test_a_truncated_database_names_itself_instead_of_a_traceback() -> None:
+    # load() is the first thing nearly every command does, so a bare
+    # JSONDecodeError here replaces the whole command surface with a stack trace
+    # that names neither users.json nor a remedy.
+    users_store.USERS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    users_store.USERS_JSON.write_text('{"schema_version": 1, "users": [{"name": "al')
+    with pytest.raises(UsersError) as excinfo:
+        users_store.load()
+    message = str(excinfo.value)
+    assert str(users_store.USERS_JSON) in message
+    assert "Restore from a backup" in message
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param('["alice"]\n', id="top-level-list"),
+        pytest.param('{"schema_version": 1}\n', id="no-users-key"),
+        pytest.param('{"users": {"alice": {}}}\n', id="users-is-an-object"),
+    ],
+)
+def test_a_wrong_shaped_file_says_it_is_not_a_users_json(body) -> None:
+    # `KeyError: 'users'` reads like a bug in vpnctl rather than a damaged file.
+    users_store.USERS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    users_store.USERS_JSON.write_text(body)
+    with pytest.raises(UsersError) as excinfo:
+        users_store.load()
+    assert "not a users.json" in str(excinfo.value)
+
+
+def test_a_record_that_is_not_an_object_is_refused() -> None:
+    write_db(["alice"])
+    with pytest.raises(UsersError):
+        users_store.load()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["name", "vless_uuid", "hysteria2_password", "l2tp_password", "created_at"],
+)
+def test_every_required_field_is_named_when_absent(missing) -> None:
+    """Only l2tp_password had a sentence of its own.
+
+    The other four still reached the operator as `TypeError: User.__init__()
+    missing 1 required positional argument`, which is the exact error this
+    module exists to replace.
+    """
+    write_db([{k: v for k, v in COMPLETE.items() if k != missing}])
+    with pytest.raises(UsersError) as excinfo:
+        users_store.load()
+    message = str(excinfo.value)
+    assert missing in message
+    assert "restore from a backup" in message
+
+
+def test_the_required_set_is_derived_from_the_dataclass() -> None:
+    # Listed by hand, a new required field would be forgotten here and go back
+    # to raising TypeError.
+    assert set(users_store._REQUIRED_FIELDS) == {
+        "name",
+        "vless_uuid",
+        "hysteria2_password",
+        "l2tp_password",
+        "ikev2_provisioned",
+        "enabled",
+        "created_at",
+    }
+
+
+# ------------------------------------------------------------- schema version
+
+
+def test_a_schema_1_database_still_loads_with_no_dnstt_password() -> None:
+    """dnstt_password arrived without a bump, so files claiming 1 may have it.
+
+    Either way a schema 1 record must load: an operator upgrading from before
+    the field existed cannot be asked to edit users.json first.
+    """
+    lean = {k: v for k, v in COMPLETE.items() if k != "dnstt_password"}
+    write_db([lean], schema=1)
+    (user,) = users_store.load()
+    assert user.dnstt_password == ""
+    assert users_store.SCHEMA_VERSION >= 2
+
+
+def test_save_stamps_the_current_schema() -> None:
+    users_store.save([make_user("alice")])
+    written = json.loads(users_store.USERS_JSON.read_text())
+    assert written["schema_version"] == users_store.SCHEMA_VERSION
+
+
+# -------------------------------------------------------------- name validation
+
+
+def test_a_plain_name_is_accepted() -> None:
+    assert users_store.validate_name("anna.anatolievna") is None
+    assert users_store.validate_name("govomes") is None
+
+
+@pytest.mark.parametrize("name", ["anna anatolievna", "", "a" * 33, ".leading", "a;b"])
+def test_an_unrenderable_name_is_refused(name) -> None:
+    # The L2TP/Cisco user list is space-separated: a space misaligns names
+    # against passwords and hands one user another's credential.
+    assert "Invalid user name" in (users_store.validate_name(name) or "")
+
+
+@pytest.mark.parametrize("name", ["root", "sshd", "nobody", "tunnel", "Root", "ADM"])
+def test_a_name_that_collides_inside_the_dnstt_sshd_container_is_refused(name) -> None:
+    """The collision issues a credential that can never work.
+
+    dnstt-sshd/entrypoint.sh does `id "$name" || adduser -D -H -G tunnel
+    "$name"` and then chpasswd unconditionally. For a name the base image already
+    has, `id` succeeds, so the `-G tunnel` membership is never granted while the
+    container's own system account gets that person's dnstt password.
+    `AllowGroups tunnel` then refuses the login: the share card is printed, the
+    password is real, and it can never work.
+    """
+    message = users_store.validate_name(name) or ""
+    assert "Reserved user name" in message
+    assert "tunnel" in message
+
+
+def test_the_reserved_set_covers_the_base_image_accounts() -> None:
+    # Read out of `alpine:3.20` (dnstt-sshd's base) with openssh-server
+    # installed: /etc/passwd plus /etc/group, which busybox adduser resolves
+    # against too.
+    for name in (
+        "root",
+        "bin",
+        "daemon",
+        "lp",
+        "sync",
+        "shutdown",
+        "halt",
+        "mail",
+        "news",
+        "uucp",
+        "cron",
+        "ftp",
+        "sshd",
+        "games",
+        "ntp",
+        "guest",
+        "nobody",
+        "sys",
+        "adm",
+        "tty",
+        "disk",
+        "kmem",
+        "wheel",
+        "floppy",
+        "audio",
+        "cdrom",
+        "dialout",
+        "input",
+        "tape",
+        "video",
+        "netdev",
+        "kvm",
+        "shadow",
+        "www-data",
+        "users",
+        "abuild",
+        "utmp",
+        "ping",
+        "nogroup",
+    ):
+        assert users_store.validate_name(name) is not None, name
