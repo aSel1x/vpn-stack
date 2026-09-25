@@ -134,6 +134,49 @@ def _consumer(rel: str) -> tuple[str, str] | None:
     return None
 
 
+def expected_services(enabled: list[protocols.Protocol]) -> list[str]:
+    """Every container that has to be up for this set of protocols.
+
+    sing-box is unconditional: it carries every Kind.SINGBOX inbound, has no
+    compose profile to deactivate, and is the one service `protocol off` never
+    stops. Everything else comes from the registry, so a protocol that grows a
+    second container is counted here without this module being edited.
+    """
+    services = ["sing-box"]
+    for proto in enabled:
+        services.extend(proto.compose_services)
+    return services
+
+
+def not_running(enabled: list[protocols.Protocol]) -> list[str] | None:
+    """Which services that should be up are not. None means "could not tell".
+
+    A bound port is not health, and the gap is not hypothetical: dnstt-sshd
+    listens on loopback 2222, so it contributes no port to `wait_ready` at all,
+    and the tunnel's own 53/udp goes on being bound by dnstt-server while the
+    sshd behind it crash-loops under `restart: always`. Every dnstt client then
+    completes a DNS tunnel to a closed door, and `apply` reports success
+    because every port it knows about is bound.
+
+    This repo has been caught by exactly that shape twice. Both health checks
+    asserted the L2TP subnet while IKEv2 clients were handed addresses from the
+    XAUTH pool, so they reported green in the one failure they existed to catch.
+    And `diagnose-ikev2.sh probe` sent a junk datagram to port 500 and read its
+    arrival as "IKE is not being blocked" -- a test that could not fail in the
+    way anyone cared about. A check has to be able to observe the failure.
+
+    None is its own outcome and must not be read as "all fine": `docker compose
+    ps` failing is the same query failure `_running_services` documents, and
+    reporting an empty list there would turn an unanswerable question into a
+    clean bill of health -- which is how `protocol off` once reported success
+    while the protocol kept serving traffic.
+    """
+    running = _running_services()
+    if running is None:
+        return None
+    return sorted({s for s in expected_services(enabled) if s not in running})
+
+
 def up(
     enabled: list[protocols.Protocol], changed: dict[str, str] | None = None
 ) -> tuple[bool, str]:
@@ -147,14 +190,20 @@ def up(
     service is recreated, which is what this function always used to do.
     """
     profiles = [p.compose_profile for p in enabled if p.compose_profile]
-    services = ["sing-box"]
-    for proto in enabled:
-        services.extend(proto.compose_services)
+    services = expected_services(enabled)
 
     before = _container_ids()
     # --build, or a change to a Dockerfile or an entrypoint script is rsynced
     # to the server and then silently ignored: compose reuses the existing
     # image because the tag already exists. Cheap when nothing changed.
+    #
+    # What makes that cheapness safe is that the three dnstt Dockerfiles pin
+    # what they fetch. While they said `go install ...@latest` and `git clone
+    # --depth 1`, this flag meant every apply on a dnstt server -- including
+    # the one vpn-stack.service runs at boot, unattended -- rebuilt them from
+    # whatever upstream had published since, on a live box, with nothing
+    # recording what the previous build was. The flag is load-bearing; the pins
+    # are what keep it from being a rolling deployment of somebody else's HEAD.
     ok, output = _compose(
         "up", "-d", "--no-deps", "--build", *services, profiles=profiles
     )

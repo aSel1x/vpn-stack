@@ -8,8 +8,51 @@ output of `render`, so there is no second source of truth to fall out of sync.
 
 from __future__ import annotations
 
+from typing import Callable, Mapping
+
 from vpnctl import protocols, secrets_store
 from vpnctl.paths import SECRETS_DIR
+
+# A function of the keyring that SURVIVED, producing one of a protocol's
+# bootstrap outputs. The distinction that makes this safe is that the result is
+# not a new credential: it is another face of one that is already on disk and
+# already in every client's hands.
+Derivation = Callable[[secrets_store.Secrets], bytes]
+
+
+def _derivable(proto: protocols.Protocol) -> Mapping[str, Derivation]:
+    """Which of this protocol's bootstrap outputs can be rebuilt, not minted.
+
+    Declared on the Protocol, beside the bootstrap() that mints the pair, so the
+    derivation and the minting cannot drift apart. A protocol that declares
+    nothing keeps the refuse-and-name behaviour for every gap.
+    """
+    return proto.derivable or {}
+
+
+def _heal(
+    derivable: Mapping[str, Derivation], gaps: list[str], have: secrets_store.Secrets
+) -> list[str]:
+    """Rebuild the gaps that are derivable; report which ones were.
+
+    A derivation that raises leaves its gap a gap. That happens when the
+    material it reads is itself missing or no longer parses -- reality.key gone
+    while reality.short_id survived, say -- which is a damaged keyring, and the
+    refusal below already knows how to name one. Letting the exception out
+    would answer a repairable keyring with a traceback instead.
+    """
+    healed: list[str] = []
+    for name in gaps:
+        derive = derivable.get(name)
+        if derive is None:
+            continue
+        try:
+            content = derive(have)
+        except Exception:
+            continue
+        secrets_store.write(name, content)
+        healed.append(name)
+    return healed
 
 
 def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
@@ -26,6 +69,7 @@ def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
     SECRETS_DIR.chmod(0o700)
 
     written: list[str] = []
+    derived: list[str] = []
     kept: list[str] = []
     partial: list[str] = []
     for proto in protocols.ordered():
@@ -44,6 +88,14 @@ def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
             # key under the surviving .crt.
             kept.extend(have)
             gaps = [n for n in produced if not existing.has(n)]
+            # The one exception, and it is as narrow as the reason for the
+            # refusal. Filling a gap is forbidden because it pairs a FRESH half
+            # with the stale survivor; a derived half is not fresh, it is the
+            # same key's other face, so the pair still agrees and every profile
+            # already issued keeps working. Anything not derivable stays a gap.
+            healed = _heal(_derivable(proto), gaps, existing)
+            derived.extend(healed)
+            gaps = [n for n in gaps if n not in healed]
             if gaps:
                 partial.append(f"{proto.name} (missing {', '.join(gaps)})")
             continue
@@ -61,14 +113,27 @@ def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
             "regenerate the whole set -- that invalidates every exported profile."
         )
 
-    if not written:
+    if not written and not derived:
         if partial:
             return False, note
         return False, (
             f"keyring already complete ({len(kept)} secrets), nothing generated. "
             "Use --force to regenerate -- that invalidates every exported profile."
         )
-    msg = f"generated {len(written)} secret(s): {', '.join(sorted(written))}"
+    parts = []
+    if written:
+        parts.append(
+            f"generated {len(written)} secret(s): {', '.join(sorted(written))}"
+        )
+    if derived:
+        # Said out loud and kept separate from "generated", because the whole
+        # point is that nothing a client holds has changed: these were rebuilt
+        # from material already on disk, so no profile needs re-exporting.
+        parts.append(
+            f"rebuilt {len(derived)} secret(s) from surviving material: "
+            f"{', '.join(sorted(derived))} -- no client credential changed"
+        )
+    msg = "; ".join(parts)
     if kept:
         msg += f" (kept {len(kept)} existing)"
     if note:

@@ -12,10 +12,18 @@ Convergence (`changed_services`, `_consumer`, `_container_ids`, `up`): the half
 that decides whether a container is touched at all. Nothing here needs a Docker
 daemon -- `_compose` and `_container_ids` are replaced one attribute at a time,
 and that is the only seam the module shells out through.
+
+Teardown and liveness (`down_disabled`, `not_running`): the two questions whose
+answers must distinguish "nothing is running" from "I could not find out".
+Collapsing the second into the first reports a clean bill of health it has not
+earned -- once as `protocol off` succeeding while the protocol served traffic,
+and, for liveness, as an `apply` that passes because 53/udp is bound while the
+sshd behind the tunnel crash-loops.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import socket
 import subprocess
@@ -25,6 +33,7 @@ import pytest
 from test_render_build_tree import EXPECTED_TREE
 
 from vpnctl import composectl, protocols, render
+from vpnctl.paths import ROOT
 
 SS = shutil.which("ss")
 
@@ -690,3 +699,175 @@ def test_container_ids_says_none_on_output_it_cannot_parse(monkeypatch) -> None:
 def test_container_ids_says_none_when_a_row_has_no_service(monkeypatch) -> None:
     install(monkeypatch, FakeSs('{"ID": "abc"}\n'))
     assert composectl._container_ids() is None
+
+
+# ------------------------------------------- what down_disabled tears down
+#
+# The mirror image of up(): `up -d --remove-orphans` does NOT stop a container
+# whose profile was deactivated (measured on Compose v5.3.1, still true on
+# v5.5.1), so without an explicit `rm -sf` "protocol off" leaves the protocol
+# serving traffic. Same seam as above: _compose and _running_services are the
+# only two things this half shells out through.
+
+
+def _fake_teardown(monkeypatch, running: set[str] | None) -> FakeCompose:
+    compose = FakeCompose()
+    monkeypatch.setattr(composectl, "_compose", compose)
+    monkeypatch.setattr(composectl, "_running_services", lambda: running)
+    return compose
+
+
+def test_everything_enabled_has_nothing_to_tear_down(monkeypatch) -> None:
+    compose = _fake_teardown(monkeypatch, set(ALL_IDS))
+    ok, message = composectl.down_disabled(protocols.ordered())
+    assert ok
+    assert "nothing to tear down" in message
+    assert compose.calls == []
+
+
+def test_nothing_enabled_and_nothing_running_removes_nothing(monkeypatch) -> None:
+    # A box whose containers are all down -- after a `docker compose stop`, or
+    # before the first apply. Every optional protocol is stale and none of them
+    # is running, so there is nothing to do and nothing may be run: `rm -sf` on
+    # a service that does not exist is noise that reads like an error.
+    compose = _fake_teardown(monkeypatch, set())
+    ok, message = composectl.down_disabled([])
+    assert ok
+    assert "already down" in message
+    assert compose.calls == []
+
+
+def test_a_disabled_dnstt_that_is_running_is_removed_explicitly(monkeypatch) -> None:
+    # All three of its services, in one call: the tunnel, the sshd behind it and
+    # the SOCKS exit. Leaving any of them up leaves udp/53 answering, or a login
+    # reachable through a tunnel the operator believes is off.
+    compose = _fake_teardown(monkeypatch, set(ALL_IDS))
+    ok, message = composectl.down_disabled(
+        protocols.ordered(["vless-reality", "hysteria2", "ikev2"])
+    )
+    assert ok
+    assert compose.calls == [("rm", "-sf", "dnstt", "dnstt-sshd", "dnstt-socks")]
+    assert "removed dnstt, dnstt-sshd, dnstt-socks" in message
+
+
+def test_a_disabled_dnstt_that_is_already_down_is_left_alone(monkeypatch) -> None:
+    compose = _fake_teardown(monkeypatch, {"sing-box", "ikev2"})
+    ok, message = composectl.down_disabled(
+        protocols.ordered(["vless-reality", "hysteria2", "ikev2"])
+    )
+    assert ok
+    assert "already down" in message
+    assert compose.calls == []
+
+
+def test_an_unanswerable_query_removes_nothing_at_all(monkeypatch) -> None:
+    """None from _running_services must not be read as "nothing is running".
+
+    This is the case that matters. Guessing in either direction is wrong, but
+    the two mistakes are not symmetrical: reading None as the empty set reports
+    success while a disabled protocol keeps serving traffic, and reading it as
+    "everything is up" issues `rm -sf` against services that may be the ones
+    carrying live sessions. So it removes nothing and says the query failed,
+    and the caller warns.
+    """
+    compose = _fake_teardown(monkeypatch, None)
+    ok, message = composectl.down_disabled(
+        protocols.ordered(["vless-reality", "hysteria2"])
+    )
+    assert not ok
+    assert compose.calls == []
+    assert "could not list" in message
+
+
+# -------------------------------------------------- liveness, which ports are not
+#
+# `wait_ready` answers "is something listening", and that is not the same
+# question. dnstt-sshd binds loopback 2222 and contributes no port at all, so a
+# crash-looping sshd is invisible to it while dnstt-server keeps 53/udp bound --
+# the tunnel completes and the door behind it is shut. The same shape has caught
+# this repo twice: both IKEv2 health checks asserted the L2TP subnet instead of
+# the XAUTH pool clients are actually given, and diagnose-ikev2.sh's `probe`
+# sent junk to port 500 and read its arrival as "IKE is not blocked".
+
+
+def test_expected_services_is_sing_box_plus_the_registrys_own() -> None:
+    assert composectl.expected_services([]) == ["sing-box"]
+    assert set(composectl.expected_services(protocols.ordered())) == set(ALL_IDS)
+
+
+def test_nothing_is_reported_down_when_everything_is_up(monkeypatch) -> None:
+    monkeypatch.setattr(composectl, "_running_services", lambda: set(ALL_IDS))
+    assert composectl.not_running(protocols.ordered()) == []
+
+
+def test_a_crash_looping_sshd_is_reported_even_though_its_ports_are_bound(
+    monkeypatch,
+) -> None:
+    running = set(ALL_IDS) - {"dnstt-sshd"}
+    monkeypatch.setattr(composectl, "_running_services", lambda: running)
+    assert composectl.not_running(protocols.ordered()) == ["dnstt-sshd"]
+
+
+def test_a_disabled_protocols_containers_are_not_expected_to_be_up(
+    monkeypatch,
+) -> None:
+    # `protocol off dnstt` means its services SHOULD be down; reporting them
+    # here would make every apply on a sing-box-only server warn about three
+    # containers nobody asked for.
+    monkeypatch.setattr(composectl, "_running_services", lambda: {"sing-box"})
+    assert composectl.not_running(protocols.ordered(["vless-reality"])) == []
+
+
+def test_liveness_cannot_be_answered_says_so_rather_than_all_fine(monkeypatch) -> None:
+    # Same rule as down_disabled: an empty list here is a clean bill of health,
+    # and a failed `docker compose ps` has not earned one.
+    monkeypatch.setattr(composectl, "_running_services", lambda: None)
+    assert composectl.not_running(protocols.ordered()) is None
+
+
+def test_running_services_distinguishes_empty_from_unanswerable(monkeypatch) -> None:
+    install(monkeypatch, FakeSs("sing-box\nikev2\n"))
+    assert composectl._running_services() == {"sing-box", "ikev2"}
+    install(monkeypatch, FakeSs(""))
+    assert composectl._running_services() == set()
+    install(monkeypatch, FakeSs("", returncode=1))
+    assert composectl._running_services() is None
+
+
+# -------------------------------------- the table's service names, against compose.yml
+#
+# _CONSUMERS is written by hand (`docker compose config` cannot answer the
+# env_file half), so a typo in a service name is not an error: _consumer returns
+# that name, up() finds it absent from `services` and skips it as "a protocol
+# that was turned off", and the changed config is never read by anything. A
+# rendered file silently delivered to nobody -- so the names are checked here.
+
+
+def _compose_service_names() -> set[str]:
+    """compose.yml's top-level service keys, by regex.
+
+    Deliberately not a YAML parse: the suite must run on a bare runner with no
+    dependency beyond what the server itself installs, and one anchored regex
+    over the two-space keys under `services:` is enough to compare name sets.
+    """
+    body = (ROOT / "compose.yml").read_text()
+    services = body.split("\nservices:\n", 1)[1]
+    return set(re.findall(r"^  ([A-Za-z0-9][\w.-]*):$", services, re.MULTILINE))
+
+
+def test_compose_yml_yields_the_services_this_file_reasons_about() -> None:
+    # The regex is the weak link in the two assertions below; if it silently
+    # matched nothing they would both pass vacuously.
+    assert _compose_service_names() == set(ALL_IDS)
+
+
+def test_every_consumer_names_a_service_the_registry_knows() -> None:
+    from_registry = {s for p in protocols.ordered() for s in p.compose_services}
+    for _prefix, service, _how in composectl._CONSUMERS:
+        assert service == "sing-box" or service in from_registry, _prefix
+
+
+def test_every_service_this_module_touches_exists_in_compose_yml() -> None:
+    declared = _compose_service_names()
+    assert {s for _p, s, _h in composectl._CONSUMERS} <= declared
+    assert set(composectl.expected_services(protocols.ordered())) <= declared

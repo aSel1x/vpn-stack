@@ -4,17 +4,28 @@ All protocol knowledge lives in the registry; this module only decides how to
 present it. Nothing is written to the server: credentials are printed or
 streamed back to the caller, so no directory of live client bundles
 accumulates on the box (the old exports/ did, indefinitely).
+
+Two things a caller building share items has to get right, both learned the
+hard way, and written here because this is the file anyone exporting opens:
+
+  * Never filter the protocol list on `per_user`. A protocol whose credential
+    is not per-person still has connection parameters the person needs, and
+    that filter made `user export` return nothing at all for dnstt back when
+    dnstt was one shared login. dnstt is per_user=True now; the filter stays
+    gone, because the next protocol of that shape would hit the same wall.
+  * Hand share() a `render.snapshot()`, not a `secrets_store.load()`. The
+    snapshot is the impure edge where deployment config the pure layer needs --
+    dnstt's zone, which lives in .env and not in the keyring -- is folded in.
+    Reading the keyring alone handed share() a snapshot with no zone, so dnstt
+    refused to build a link on a server where the zone had been set all along.
 """
 
 from __future__ import annotations
 
 import qrcode
 
-from vpnctl import protocols, render
 from vpnctl.dotenv import read as read_env
 from vpnctl.paths import ENV_FILE
-from vpnctl.protocols import ShareItem
-from vpnctl.users_store import User
 
 
 class ExportError(Exception):
@@ -31,25 +42,6 @@ def resolve_host(explicit_host: str | None) -> str:
             f"VPN_SERVER_HOST=... in {ENV_FILE}."
         )
     return host
-
-
-def items_for(user: User, host: str, names: list[str]) -> dict[str, list[ShareItem]]:
-    """Registry-driven: {protocol name: share items}. Pure apart from the snapshot.
-
-    render.snapshot(), not secrets_store.load(): the snapshot is the impure edge
-    where deployment config that the pure layer needs -- dnstt's zone -- is
-    folded in. Reading the keyring alone here handed share() a snapshot with no
-    zone, so dnstt refused on a server where the zone was set all along.
-    """
-    secrets = render.snapshot()
-    out: dict[str, list[ShareItem]] = {}
-    for proto in protocols.ordered(names):
-        # Note there is no per_user filter here. A protocol with no per-user
-        # credentials -- dnstt -- still has connection parameters the person
-        # needs, and skipping it meant `user export` returned nothing for it
-        # at all. Its share() simply ignores the user it is handed.
-        out[proto.name] = proto.share(secrets, user, host)
-    return out
 
 
 def print_ascii_qr(uri: str) -> None:

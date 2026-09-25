@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import STATE_ROOT
 
-from vpnctl import paths, render, secrets_store, state, users_store
+from vpnctl import guard, paths, render, secrets_store, state, users_store
 from vpnctl.protocols import dnstt
 
 # Every constant that names live state. Listed by hand: a loop over dir(paths)
@@ -29,6 +29,10 @@ LIVE = [
     secrets_store.SECRETS_DIR,
     users_store.USERS_JSON,
     state.STATE_JSON,
+    # guard's copy decides whether a mutation may proceed at all. Rooted at the
+    # live directory it would answer "yes, this is the server" from a laptop's
+    # /etc, which is the finding the guard exists to close.
+    guard.STATE_DIR,
 ]
 
 
@@ -45,6 +49,7 @@ def test_modules_that_import_the_constants_got_the_test_value() -> None:
     assert users_store.USERS_JSON == paths.USERS_JSON
     assert secrets_store.SECRETS_DIR == paths.SECRETS_DIR
     assert state.STATE_JSON == paths.STATE_JSON
+    assert guard.STATE_DIR == paths.STATE_DIR
 
 
 def test_code_paths_stay_in_the_checkout() -> None:
