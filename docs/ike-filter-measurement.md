@@ -316,8 +316,9 @@ have no ppp interface, so there is no per-client interface for a rule to match o
 guard tests a rule in the **nat** table while the accepts it protects live in **filter**. Anything
 that clears filter alone loses them with nothing to put them back, and the loss is invisible until
 somebody notices IKEv2 carries no traffic. Re-ensuring them costs two `iptables -C` calls. That is
-why `vpnctl` needs root, and why `vpn-stack.service` (oneshot, `After=docker.service`) re-applies
-them at boot: raw `iptables -I` inserts have no persistence of their own.
+why `vpnctl` needs root, and why `vpn-stack.service` (oneshot, `After=` and `Wants=` both naming
+`docker.service` and `network-online.target`) re-applies them at boot: raw `iptables -I` inserts
+have no persistence of their own.
 
 The instructive part is how this went unnoticed. The subnet was hardcoded as `192.168.42.0/24`
 until 2026-09-08 — the L2TP pool. Every rule installed therefore protected addresses no IKEv2
@@ -365,13 +366,22 @@ a hard dependency, since neither `probe` nor `path` can build a genuine `IKE_SA_
 the shell accepts, refuses and normalises precisely what `vpnctl/ikev2ctl.py` does, host bits included:
 `192.168.43.10/24` → `192.168.43.0/24`.
 
-And the agreement is held by a test rather than by care.
-`tests/test_diagnose_ikev2.py::test_the_shell_and_the_python_answer_identically` runs this script's
-`covering_net` against `ikev2ctl._covering_net` over six entry shapes — the stock
-range, a straddling range, a bare CIDR, a single address, a wide range and one padded with whitespace —
-and `test_an_ipv6_entry_is_refused_by_both` pins the refusal. `scripts/smoke.sh`'s copy of that function
-is byte-identical to this one (`diff` the two `covering_net` bodies), and
-`test_the_stock_pool_still_reads_as_the_image_default` names the one answer all three have to agree on.
+And the agreement is held by tests rather than by care, in two layers, because two different things
+go wrong. `tests/test_shell_scripts.py` lifts `valid_net`, `covering_net` and `ikev2_pool` out of both
+shell files and asserts the two are identical **text**, which is stronger than identical behaviour on
+the cases somebody thought to probe — and stronger for a reason that already happened: this script grew
+a `command -v python3` guard, `smoke.sh` was rewritten afterwards without it, and on a box with no
+python3 the pool fell through to the image default while the report blamed the container for a tool
+that was simply not installed. Beside it, the same file drives all three copies through the same
+questions and compares the network each one answers with — the stock pool, a straddling range, a bare
+CIDR, a single address, a padded pool, `rightaddresspool` outranking `VPN_XAUTH_NET`, an IPv6-only pool
+falling through to the net, a shape-only `192.168.256.0/24`, and a container that answered nothing.
+Only the network is compared, not the provenance: `ikev2ctl` spells its fallback `image default -- why`
+and the two shells `image default, why`, and that difference goes to a human where the network goes to
+`iptables`. `tests/test_diagnose_ikev2.py` keeps this script's own share of that —
+`test_the_shell_and_the_python_answer_identically`, `test_an_ipv6_entry_is_refused_by_both` and
+`test_the_stock_pool_still_reads_as_the_image_default`, which names the one answer all three must
+agree on.
 
 ## Limits
 

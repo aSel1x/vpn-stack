@@ -4,11 +4,15 @@ users.json
 exports/
 ikev2/.env
 
-# Kept because a document in this repo asks for the path: dnstt/SETUP.md § 2 walks
-# a reader through `dnstt-server -gen-key -privkey-file dnstt/keys/server.key`
-# inside this checkout and tells them to gitignore it. Grep that file and the rule
-# checks out, which is the difference between a check and a claim. Directory-wide
-# and with no allowlisted exception, so a second file dropped beside the key is
+# Kept for a path a reader might create by hand, not for one any document asks
+# them to. dnstt/SETUP.md § 2 still names `dnstt-server -gen-key -privkey-file
+# dnstt/keys/server.key`, but under "Nothing writes a key into this checkout,
+# and you should not either" -- it is what the document used to walk people
+# through, kept as the thing being warned against. So grep that file and the
+# rule still has something concrete to point at, which is the difference between
+# a check and a claim; what it points at is a retired step, which is why this is
+# belt and braces rather than cover for a documented one. Directory-wide and
+# with no allowlisted exception, so a second file dropped beside the key is
 # covered too. What the stack does itself never lands here: `protocol on dnstt`
 # parses `-gen-key`'s stdout and stores both halves in /etc/vpn-stack/secrets.
 dnstt/keys/*

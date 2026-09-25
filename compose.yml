@@ -40,6 +40,19 @@ services:
     # a config key this repo still uses, and the failure lands on a live server
     # with no way back -- exactly what the candidate-tree design exists to
     # prevent. Bump deliberately, with scripts/check.sh to prove it first.
+    #
+    # PINNED BY TAG, AND THE TAG FORM IS LOAD-BEARING -- this is the one pin in
+    # this file that must not become a digest. Three readers sed the version out
+    # of this line and every one of them matches on `sing-box:<tag>`:
+    # scripts/check.sh, which validates the candidate config against the binary
+    # that will serve it, and the libbox and libbox_apple jobs in
+    # .github/workflows/app.yml, which build the client's engine from the same
+    # source version so one number governs both ends of a configuration. Write
+    # `sing-box@sha256:...` here, the way ikev2 below is written, and all three
+    # stop matching. They fail loudly rather than validating against the wrong
+    # binary -- check.sh exits 2, the workflow jobs exit 1 having found zero
+    # pins -- so the cost is three red builds and not a silent mismatch. Pinning
+    # ikev2 by digest is safe for the opposite reason: nothing reads it.
     image: ghcr.io/sagernet/sing-box:v1.14.0
     container_name: sing-box
     logging: *logging

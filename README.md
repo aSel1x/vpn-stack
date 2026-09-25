@@ -224,10 +224,10 @@ layer in anything this repository can show you.** CI compiles and links the Kotl
 against a real libbox, built from the sing-box version `compose.yml` pins so that one number
 governs the engine at both ends of a configuration; it runs neither. There is no device, no
 emulator and no simulator in that pipeline, and the iOS extension in particular has never been
-signed, launched, or handed a utun descriptor. What *is* tested is the Dart — 288 tests under
-`app/` and 38 in the tunnel package — and the `--json` contract itself, through a fixture corpus
-generated from `cli.py` that both suites read. `app/README.md` is the client's own document, and
-`app/docs/ios-release.md` is what the iOS path costs.
+signed, launched, or handed a utun descriptor. What *is* tested is the Dart — both suites, the
+one under `app/` and the tunnel package's own — and the `--json` contract itself, through a
+fixture corpus generated from `cli.py` that both suites read. `app/README.md` is the client's own
+document, and `app/docs/ios-release.md` is what the iOS path costs.
 
 ## Changing code
 
@@ -235,7 +235,7 @@ Edit, then `./vpn deploy` — one deliberate command, from a checkout, aimed at 
 
 There are two workflows. `.github/workflows/ci.yml` runs on every push and every pull request and
 checks only the code, in three jobs: `python` is `ruff check`, `ruff format --check` and the
-491-test pytest suite; `shell` is `bash -n` over the 13 shell files in the tree; and `dart` runs
+pytest suite; `shell` is `bash -n` over every shell file the finder below turns up; and `dart` runs
 the analyzer and **both** of the client's Dart suites, with no path filter, so a commit that
 renames a key in `vpnctl/cli.py` runs them in the same run as the Python tests. The Python suite
 needs no server, no Docker and no root; anything that would belongs in `scripts/smoke.sh`, which
@@ -251,8 +251,8 @@ matches nothing fails rather than passes, and pytest's exit 5 for "collected not
 failure too: a green check that ran no checks is the shape of the wrong-subnet health checks this
 repo has already been bitten by.
 
-`.github/workflows/app.yml` is the other one — eleven jobs that build the client and the sing-box
-library it links, triggered on `app/**`, on itself, and on `compose.yml`, since bumping the
+`.github/workflows/app.yml` is the other one — it builds the client and the sing-box library it
+links, triggered on `app/**`, on itself, and on `compose.yml`, since bumping the
 server's engine must rebuild the client's. It is `app/README.md`'s subject; what matters here is
 the property it shares with `ci.yml`.
 
