@@ -10,10 +10,11 @@
 # every step re-runnable: an install that fails halfway must be fixable by
 # running it again, not by hand-editing the server.
 #
-# It runs in five separate SSH sessions rather than one long heredoc. That is
-# deliberate: the firewall step has to be able to prove a *fresh* connection
-# still works before it disarms its own safety net, and it cannot do that from
-# inside the connection it might be about to sever.
+# It runs in several separate SSH sessions rather than one long heredoc. That is
+# deliberate, and the count is not the point -- it moves whenever the steps do:
+# the firewall step has to be able to prove a *fresh* connection still works
+# before it disarms its own safety net, and it cannot do that from inside the
+# connection it might be about to sever.
 set -euo pipefail
 
 TARGET="${1:?usage: install.sh <user@host>}"; shift || true
@@ -28,6 +29,10 @@ done
 
 HOST="${TARGET#*@}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Single-quoted wherever it is spliced into a remote command below: it comes
+# from the environment, and an unquoted path with a space in it becomes two
+# arguments on the far side of ssh -- the same re-splitting `./vpn`'s remote()
+# exists to prevent.
 REPO_PATH="${VPN_REMOTE_PATH:-/opt/vpn-stack}"
 DEADMAN_SECONDS=180
 
@@ -67,37 +72,28 @@ SSH_OPTS="${ssh_opts[*]}" bash "$HERE/push.sh" "$TARGET" "$REPO_PATH"
 # without --force -- so a re-run of a half-finished install cannot invalidate a
 # profile already handed out.
 step "installing vpnctl and generating the keyring"
-on "bash $REPO_PATH/scripts/provision-host.sh code $REPO_PATH"
+on "bash '$REPO_PATH/scripts/provision-host.sh' code '$REPO_PATH'"
 
 # ------------------------------------------------------------- 4. the firewall
 # This is the step that locks people out, so it is the only one with a safety
 # net: a detached timer that disables ufw unconditionally, armed *before* the
 # first `ufw enable` and disarmed only after a brand-new SSH connection -- one
 # that had to pass through the new rules -- succeeds.
+#
+# Arming, opening ssh and disarming are all in provision-host.sh: the net also
+# exists in Dart (app/lib/provision/firewall.dart), and a third hand-written
+# copy here is how two of them end up behaving differently on the one box where
+# it matters. Piped in over stdin exactly like the `base` stage, not called by
+# path, so this step depends on no checkout having arrived and can be moved
+# between the stages -- which is where the app runs its own equivalent.
+#
+# Which port to open is a question only the server can answer, and it is asked
+# there: 22 was hardcoded, so against an sshd on 2222 ufw came up with only 22
+# open, the proof below failed, this script exited 1, the deadman restored
+# access three minutes later, and the identical re-run failed identically with
+# nothing in the output mentioning the port.
 step "firewall (armed with a ${DEADMAN_SECONDS}s deadman)"
-on bash -s -- "$DEADMAN_SECONDS" <<'REMOTE'
-set -euo pipefail
-SECONDS_TO_LIVE="$1"
-# The subshell records its *own* pid: `$!` is unreliable here because setsid
-# forks when the caller is already a process-group leader. setsid also makes it
-# a group leader, so a negative-pid kill takes the sleep down with it.
-setsid sh -c "echo \$\$ > /run/vpn-stack.deadman
-              sleep $SECONDS_TO_LIVE
-              ufw --force disable
-              rm -f /run/vpn-stack.deadman" </dev/null >/dev/null 2>&1 &
-# Give it a moment to write the pid file, or the disarm below finds nothing.
-for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s /run/vpn-stack.deadman ]] && break; sleep 0.2; done
-[[ -s /run/vpn-stack.deadman ]] || { echo "deadman failed to arm; refusing to touch ufw" >&2; exit 1; }
-
-ufw allow 22/tcp comment 'vpn-stack:ssh' >/dev/null
-if ufw status 2>/dev/null | grep -q '^Status: active'; then
-  echo "   ufw was already active; added 22/tcp and left your rules alone"
-else
-  echo "   ufw was inactive; enabling it (existing rules are kept, not reset)"
-  ufw --force enable >/dev/null
-fi
-ufw status | head -1
-REMOTE
+on bash -s -- firewall "$DEADMAN_SECONDS" < "$HERE/provision-host.sh"
 
 # A fresh connection: new TCP handshake, evaluated by the rules just installed.
 # Reusing the session above would prove nothing -- an established conntrack
@@ -106,9 +102,10 @@ step "verifying SSH still works through the new rules"
 if ssh "${ssh_opts[@]}" -o ControlMaster=no -o ControlPath=none \
        -o BatchMode=yes "$TARGET" true; then
   echo "  fresh connection accepted -- disarming the deadman"
-  on 'pid=$(cat /run/vpn-stack.deadman 2>/dev/null || true)
-      [[ -n "$pid" ]] && { kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }
-      rm -f /run/vpn-stack.deadman; true'
+  # Exits non-zero if the timer is still breathing afterwards, and `set -e`
+  # stops the install there: finishing while an armed deadman counts down would
+  # hand back a box whose firewall turns itself off minutes later.
+  on bash -s -- firewall-disarm < "$HERE/provision-host.sh"
 else
   echo
   echo "  A fresh SSH connection FAILED after enabling ufw." >&2
@@ -119,10 +116,17 @@ fi
 
 # ------------------------------------------------------------- 5. bring it up
 step "rendering and converging"
-on "vpnctl apply"
+# Under the lock, like every other call site: vpnctl takes none of its own, and
+# an apply that interleaves with somebody's `./vpn user add` has two candidate
+# trees rendering over each other -- the one thing the atomic promote downstream
+# cannot save you from. VPN_STACK_LOCK_HELD is the handshake for the day vpnctl
+# locks internally: an flock(1) inside an flock(1) on the same path from a child
+# process opens a second file description and blocks forever (measured), so the
+# inner lock has to be able to see that the outer one is already held.
+on "VPN_STACK_LOCK_HELD=1 flock /run/vpn-stack.lock vpnctl apply"
 
 step "smoke test"
-on "cd $REPO_PATH && bash scripts/smoke.sh"
+on "cd '$REPO_PATH' && bash scripts/smoke.sh"
 
 cat <<DONE
 

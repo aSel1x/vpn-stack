@@ -9,7 +9,9 @@
 # calls it the code is already here.
 #
 # THIS PROJECT IS DELIBERATELY NOT IN /opt/infra/projects, so nothing automatic ever runs
-# this. That is not an oversight, it is commit 61457b7:
+# this. That is not an oversight; it is the commit "Drop CI: deploy-on-push cost more than
+# it bought", named by subject because a hash in prose does not survive a history rewrite --
+# the one this file used to cite stopped resolving:
 #
 #     A push to main deployed to the server. That is how /opt/vpn-stack reappeared on a
 #     box that had just been deliberately wiped -- CI acting on production because someone
@@ -24,11 +26,18 @@
 #
 # Two things worth knowing before running it by hand:
 #
-#   * `vpnctl apply` is NEVER a no-op. composectl.up() always passes --force-recreate, so
-#     every apply recreates every enabled container and drops every live VPN session for as
-#     long as they take to come back - about thirty seconds for ipsec-vpn-server, which
-#     rebuilds nothing but binds slowly. That is true of `./vpn deploy` too; it is the
-#     shape of the tool, not a cost this file adds.
+#   * `vpnctl apply` bounces only what changed, and on a plain code deploy that is usually
+#     nothing. composectl.changed_services() diffs the promoted tree against the freshly
+#     rendered candidate and maps each differing file to the one service that consumes it,
+#     then restarts it (a bind mount: docker re-resolves the source on start) or recreates
+#     it (an env_file, or a container that builds state at create time, like dnstt-sshd).
+#     --force-recreate survives only on that selective per-service path. So an apply whose
+#     inputs are identical drops no session at all, and a `user add` bounces the services
+#     that read the user list rather than every container on the box. Two cases still cost
+#     everything: a rendered path this table does not recognise, and a first apply with no
+#     previous tree to diff, both of which recreate the whole enabled set -- and recreating
+#     ipsec-vpn-server drops IKEv2, L2TP and Cisco IPsec together for the ~30s it takes to
+#     bind again. That is true of `./vpn deploy` too; it is the shape of the tool.
 #   * It warns rather than fails on ports that never bind, on ufw reconciliation, and on
 #     IKEv2 FORWARD rules, so a zero exit here means "apply ran", not "the VPN is serving".
 #     `./vpn smoke` is the thing that asserts the second.
@@ -40,8 +49,15 @@ set -euo pipefail
   exit 77 # EX_NOPERM
 }
 
-# The same lock ./vpn takes around every forwarded command (vpn:52). vpnctl holds no lock
-# of its own, so without this a hand-run apply can interleave with an operator's `./vpn
-# user add` - two candidate trees rendering over each other, which is precisely what the
-# atomic promote downstream cannot save you from.
+# The same lock ./vpn takes around every forwarded command, and that scripts/deploy.sh,
+# scripts/install.sh and the boot unit take too. vpnctl holds no lock of its own, so
+# without this a hand-run apply can interleave with an operator's `./vpn user add` - two
+# candidate trees rendering over each other, which is precisely what the atomic promote
+# downstream cannot save you from.
+#
+# VPN_STACK_LOCK_HELD is the handshake for the day vpnctl takes the lock itself: flock(1)
+# inside flock(1) on the same path from a child process opens a second file description,
+# the kernel treats that as a different holder, and a blocking inner lock then waits on a
+# lock its own parent will never release. Measured, not assumed.
+export VPN_STACK_LOCK_HELD=1
 exec flock /run/vpn-stack.lock /usr/local/bin/vpnctl apply

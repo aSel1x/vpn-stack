@@ -47,9 +47,91 @@ remote() {
   # arguments -- or, with the wrong input, something else entirely.
   local cmd
   cmd="$(printf '%q ' "$@")"
+  # REMOTE_PATH is quoted for the same reason the arguments are: it comes from
+  # the environment, and a path with a space in it is re-split by the remote
+  # shell into two arguments to cd.
+  #
+  # VPN_STACK_LOCK_HELD is the handshake for the day vpnctl takes this lock
+  # itself. It has to be able to see that an outer flock(1) already holds it:
+  # flock(1) inside flock(1) on the same path from a child process opens a
+  # second file description, which the kernel treats as a different holder, and
+  # a blocking lock then waits for a lock its own parent will never release --
+  # measured, not assumed.
   # shellcheck disable=SC2029
   ssh "${ssh_opts[@]}" "${tty[@]}" "$HOST" \
-    "cd $REMOTE_PATH && flock /run/vpn-stack.lock /usr/local/bin/vpnctl $cmd"
+    "cd $(printf '%q' "$REMOTE_PATH") && VPN_STACK_LOCK_HELD=1 flock /run/vpn-stack.lock /usr/local/bin/vpnctl $cmd"
+}
+
+# The volumes a backup has to carry, and the tar member each one rides in.
+# compose.yml declares exactly two named volumes and neither holds anything that
+# can be regenerated without consequence:
+#
+#   ikev2-vpn-data   cert9.db/key4.db -- the NSS database holding the IKEv2 CA
+#                    private key. Omit it and every certificate this server ever
+#                    issued is unrecoverable.
+#   dnstt-sshd-keys  the dnstt SSH front's host key, which is in a volume for the
+#                    reason compose.yml states: so it does not change under
+#                    clients. Omit it and a restore onto a rebuilt box mints a
+#                    new one, and every dnstt client gets a changed-host-key
+#                    warning indistinguishable from an attack -- for the one
+#                    protocol whose users have no fallback to switch to.
+#
+# One definition, read by `backup` and by `restore`. The ikev2 name used to be
+# written out in both, which is how a two-entry list ends up updated in one place
+# -- the same "two literals drift" argument check.sh applies to the sing-box tag.
+#
+# The member names are on-disk format: every backup already taken carries
+# .vpn-state.tgz and .vpn-ikev2.tgz, so those never change, and restore treats
+# any member a given backup does not have as absent rather than as an error.
+BACKUP_VOLUMES=(
+  "vpn-stack_ikev2-vpn-data:.vpn-ikev2.tgz"
+  "vpn-stack_dnstt-sshd-keys:.vpn-dnstt-sshd-keys.tgz"
+)
+
+# The server half of a backup: one tar, on stdout, with the state directory as
+# .vpn-state.tgz and one member per volume above.
+backup_stream() {
+  ssh "${ssh_opts[@]}" "$HOST" bash -s -- "${BACKUP_VOLUMES[@]}" <<'REMOTE'
+set -euo pipefail
+# umask 077, a private temp directory, and a trap -- none of it decoration. The
+# two intermediates used to be created by plain shell redirection into /tmp at
+# root's umask (0022, so 0644) in a world-traversable directory, and the `rm -f`
+# that removed them ran only if the final `tar c` had succeeded. Break the pipe
+# -- the local age dies, the ssh drops, the operator Ctrl-Cs -- and
+# /tmp/.vpn-state.tgz stayed there indefinitely at a predictable path: every
+# user's password on every protocol, the REALITY private key and the NSS CA
+# private key, readable by any account on the box.
+umask 077
+tmp=$(mktemp -d)
+# HUP as well as EXIT: when the far end goes away sshd HUPs this shell, and an
+# untrapped HUP kills it WITHOUT running the EXIT trap -- which is precisely the
+# broken-pipe case the temp files used to survive.
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+# Why a temp directory at all, given that nothing here wants the plaintext on
+# disk: tar writes each member's SIZE into that member's header, so a member has
+# to exist in full before it can be streamed. The two-member layout is format --
+# `restore` opens .vpn-state.tgz by name -- so it does not change.
+#
+# No 2>/dev/null on this line any more. It discarded the reason the one tar that
+# matters had failed, and tar's stderr travels the ssh session's stderr to the
+# operator's terminal, not the stdout stream age is reading, so there is nothing
+# it can corrupt.
+#
+# rendered-* is excluded on purpose: it is derived, `vpnctl apply` rebuilds it,
+# and a backup should hold only what cannot be remade.
+tar cz -C /etc/vpn-stack --exclude='./rendered*' . > "$tmp/.vpn-state.tgz"
+members=(.vpn-state.tgz)
+for pair in "$@"; do
+  vol=${pair%%:*}; member=${pair#*:}
+  # A volume that does not exist yet (dnstt never enabled) is created empty by
+  # this run and tars to an empty member, so the stream's shape is the same
+  # whatever is switched on. An empty member restores to an empty volume, which
+  # is what a box that never ran dnstt had anyway.
+  docker run --rm -v "$vol":/v alpine tar cz -C /v . > "$tmp/$member"
+  members+=("$member")
+done
+tar c -C "$tmp" "${members[@]}"
+REMOTE
 }
 
 # Where the backup identity lives: on THIS machine, outside the repo, and never
@@ -124,7 +206,7 @@ case "${1:-}" in
 
   smoke)
     need_host
-    ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
+    ssh "${ssh_opts[@]}" "$HOST" "cd $(printf '%q' "$REMOTE_PATH") && bash scripts/smoke.sh"
     ;;
 
   backup-key)
@@ -154,21 +236,37 @@ EOF
 
   backup)
     need_host
-    # Streams through the SSH pipe into age on THIS machine: the key never
-    # reaches the server and the plaintext never lands on either disk.
     need_backup_key
-    # Both halves, and the second is the one people forget: the ikev2 volume
-    # holds cert9.db/key4.db, the NSS database with the IKEv2 CA private key.
-    # Without it every certificate this server ever issued is unrecoverable.
-    # rendered-* is excluded on purpose -- it is derived, `vpnctl apply`
-    # rebuilds it, and a backup should contain only what cannot be remade.
-    ssh "${ssh_opts[@]}" "$HOST" '
-      set -e
-      tar cz -C /etc/vpn-stack --exclude="./rendered*" . 2>/dev/null > /tmp/.vpn-state.tgz
-      docker run --rm -v vpn-stack_ikev2-vpn-data:/v alpine tar cz -C /v . > /tmp/.vpn-ikev2.tgz
-      tar c -C /tmp .vpn-state.tgz .vpn-ikev2.tgz
-      rm -f /tmp/.vpn-state.tgz /tmp/.vpn-ikev2.tgz' \
-      | age -r "$(age-keygen -y "$BACKUP_KEY")"
+    # Encrypted here, decrypted only here: the identity never reaches the server
+    # and the plaintext never touches THIS machine's disk. On the server it does
+    # exist for the length of the transfer -- tar cannot write a member's header
+    # without knowing its size -- but only inside a 0700 mktemp directory that a
+    # trap removes on exit, on a broken pipe and on a dropped connection alike.
+    # See backup_stream: the old wording claimed neither disk and was wrong in a
+    # way that mattered, because the files it left in /tmp were 0644.
+    out="${2:-}"
+    recipient="$(age-keygen -y "$BACKUP_KEY")"
+    if [[ -n "$out" ]]; then
+      # Written to <out>.partial and renamed only once age has exited 0. The
+      # bare-redirect form cannot do this and never will: `./vpn backup > f.age`
+      # is the SHELL truncating f.age before ssh has said a word, so a backup
+      # that fails half way has already destroyed the last good one, and the
+      # occasion you find out is a rebuilt box. Pass the path instead.
+      if ( umask 077; backup_stream | age -r "$recipient" > "$out.partial" ); then
+        mv -- "$out.partial" "$out"
+        echo "wrote $out" >&2
+      else
+        rc=$?
+        # Removed, not kept: a truncated .partial is indistinguishable from a
+        # backup by anything except age, and the whole point is that $out --
+        # which may be the only copy of the CA key -- is left untouched.
+        rm -f -- "$out.partial"
+        echo "backup FAILED (status $rc); $out was not written or modified" >&2
+        exit "$rc"
+      fi
+    else
+      backup_stream | age -r "$recipient"
+    fi
     ;;
 
   restore)
@@ -213,31 +311,61 @@ EOF
     fi
 
     echo "Decrypting locally and streaming to $HOST..." >&2
-    "${age_decrypt[@]}" | ssh "${ssh_opts[@]}" "$HOST" '
-      set -e
-      umask 077
-      tmp=$(mktemp -d)
-      trap "rm -rf \"$tmp\"" EXIT
-      tar x -C "$tmp"
-      # pluto keeps the NSS database open; writing under it corrupts the very
-      # thing being restored.
-      docker stop ipsec-vpn-server >/dev/null 2>&1 || true
-      install -d -m 700 /etc/vpn-stack
-      tar xz -C /etc/vpn-stack -f "$tmp/.vpn-state.tgz"
-      docker volume create vpn-stack_ikev2-vpn-data >/dev/null
-      docker run --rm -i -v vpn-stack_ikev2-vpn-data:/v alpine \
-        tar xz -C /v < "$tmp/.vpn-ikev2.tgz"
-      echo "restored $(ls /etc/vpn-stack/secrets | wc -l) secrets"'
+    # The volume list arrives as positional parameters rather than spliced into
+    # the script: `set -- <quoted list>` in front of it, because stdin is the
+    # backup stream here and so `bash -s` -- how backup_stream ships its half --
+    # is not available on this side.
+    read -r -d '' restore_remote <<'REMOTE' || true
+set -e
+umask 077
+tmp=$(mktemp -d)
+# HUP and the rest alongside EXIT: a dropped connection kills this shell with an
+# untrapped signal, and the EXIT trap alone would then never run -- leaving the
+# whole decrypted state directory in /tmp on a box that is being rebuilt.
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+tar x -C "$tmp"
+# pluto keeps the NSS database open; writing under it corrupts the very thing
+# being restored.
+docker stop ipsec-vpn-server >/dev/null 2>&1 || true
+install -d -m 700 /etc/vpn-stack
+tar xz -C /etc/vpn-stack -f "$tmp/.vpn-state.tgz"
+for pair in "$@"; do
+  vol=${pair%%:*}; member=${pair#*:}
+  # Tolerated, not required. Every backup taken before dnstt-sshd-keys joined
+  # the list carries the ikev2 member only, and those are exactly the backups
+  # this command exists to restore. Reported rather than passed over in
+  # silence: a host key that was quietly regenerated is a changed-host-key
+  # warning on every dnstt client, days later, with nothing pointing here.
+  if [ -f "$tmp/$member" ]; then
+    docker volume create "$vol" >/dev/null
+    docker run --rm -i -v "$vol":/v alpine tar xz -C /v < "$tmp/$member"
+    echo "restored volume $vol"
+  else
+    echo "note: this backup predates $member; $vol will be regenerated" >&2
+  fi
+done
+echo "restored $(ls /etc/vpn-stack/secrets | wc -l) secrets"
+REMOTE
+    "${age_decrypt[@]}" | ssh "${ssh_opts[@]}" "$HOST" \
+      "set -- $(printf '%q ' "${BACKUP_VOLUMES[@]}")
+$restore_remote"
 
     echo "Converging..." >&2
     remote apply
-    ssh "${ssh_opts[@]}" "$HOST" "cd $REMOTE_PATH && bash scripts/smoke.sh"
+    ssh "${ssh_opts[@]}" "$HOST" "cd $(printf '%q' "$REMOTE_PATH") && bash scripts/smoke.sh"
     ;;
 
   logs)
     need_host
     shift
-    ssh "${ssh_opts[@]}" -t "$HOST" "cd $REMOTE_PATH && docker compose logs -f ${*:-sing-box}"
+    # Quoted for the remote shell, exactly as remote() does it and for the same
+    # reason: `${*}` spliced in raw is re-split and glob-expanded over there, so
+    # a service name with a space or a `*` in it stopped being one argument --
+    # and this is a command an operator types arguments into by hand.
+    svc=("$@")
+    [[ ${#svc[@]} -eq 0 ]] && svc=(sing-box)
+    ssh "${ssh_opts[@]}" -t "$HOST" \
+      "cd $(printf '%q' "$REMOTE_PATH") && docker compose logs -f $(printf '%q ' "${svc[@]}")"
     ;;
 
   ""|-h|--help|help)
@@ -249,7 +377,9 @@ EOF
   ./vpn share <user>          one-shot LAN page: tap-to-import on a phone
   ./vpn smoke                 assert the server is actually serving
   ./vpn backup-key            create the local age identity backups use
-  ./vpn backup > f.age        encrypted to it, decrypted only on this machine
+  ./vpn backup f.age          encrypted to it, decrypted only on this machine
+                              (> f.age also works, but the shell truncates the
+                              file before the backup is known to have worked)
   ./vpn restore f.age         put one back on a rebuilt server
   ./vpn logs [service]        tail logs
 

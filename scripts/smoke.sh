@@ -70,6 +70,73 @@ emit() {
 }
 trap emit EXIT
 
+# Is this a real network, and what is its canonical form? The check used to be
+# a regex, and a regex is shape-only: "192.168.256.0/24" matches
+# ^[0-9]+(\.[0-9]+){3}/[0-9]+$ perfectly, is not an address, and makes
+# `iptables -C` fail in a way indistinguishable from "the rule is missing" --
+# which is the exact confusion the validation exists to prevent, arrived at
+# through the validation itself. python3 is already a hard dependency here (the
+# port enumeration below parses vpnctl's JSON with it) and ipaddress is what
+# vpnctl.ikev2ctl uses, so this accepts and normalises the same values the
+# Python side does, host bits included: 192.168.43.10/24 -> 192.168.43.0/24.
+valid_net() {
+  [[ -n "$1" ]] || return 1
+  python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))' \
+    "$1" 2>/dev/null
+}
+
+# Which containers each protocol needs, and the name docker knows them by.
+# Two authorities, and this file can read neither: protocols.compose_services
+# names the compose services, and compose.yml renames three of them with
+# container_name (ikev2 -> ipsec-vpn-server, dnstt -> dnstt-server). `vpnctl
+# --json protocol list` exposes no service list yet, so the mapping is restated
+# here; fold it back into the enumeration the moment that JSON carries it, for
+# the reason check.sh reads the sing-box tag out of compose.yml.
+protocol_containers() {
+  case "$1" in
+    # Both sing-box inbounds, one process.
+    vless-reality|hysteria2) printf 'sing-box' ;;
+    ikev2)                   printf 'ipsec-vpn-server' ;;
+    dnstt)                   printf 'dnstt-server dnstt-sshd dnstt-socks' ;;
+    *)                       printf '' ;;
+  esac
+}
+
+container_fields() {
+  printf '"status":%s,"restart_count":%s' "$(json_str "$1")" "${2:-0}"
+}
+
+# Running is not the same as healthy. Every one of these services carries
+# `restart: always`, so a container that starts, dies and is restarted looks
+# exactly like one that has been up for a week: `docker ps` shows it running,
+# because it is running again. RestartCount is the only thing that separates
+# them, and only over time -- read once it cannot tell a crash the operator
+# already fixed from a loop still going round, so a nonzero count is sampled
+# twice and only a count that GROWS is a failure.
+check_container() {
+  local c="$1" info status restarts started again
+  info=$(docker inspect -f '{{.State.Status}} {{.RestartCount}} {{.State.StartedAt}}' "$c" 2>/dev/null \
+         | tr -d '\r' | head -1)
+  read -r status restarts started <<< "$info"
+  if [[ "$status" != running ]]; then
+    bad "container_$c" "$c is '${status:-absent}'" "$(container_fields "${status:-absent}" "${restarts:-0}")"
+    return
+  fi
+  if [[ "$restarts" =~ ^[0-9]+$ && "$restarts" -gt 0 ]]; then
+    sleep 3
+    again=$(docker inspect -f '{{.RestartCount}}' "$c" 2>/dev/null | tr -d '\r' | head -1)
+    if [[ "$again" =~ ^[0-9]+$ && "$again" -gt "$restarts" ]]; then
+      bad "container_$c" "$c is crash-looping (restarts $restarts -> $again in 3s)" \
+          "$(container_fields crash-looping "$again")"
+      return
+    fi
+    ok "container_$c" "$c running since $started ($restarts restarts, not climbing)" \
+       "$(container_fields running "$restarts")"
+    return
+  fi
+  ok "container_$c" "$c running" "$(container_fields running "${restarts:-0}")"
+}
+
 # The /24 IKEv2 clients are actually assigned from, asked of the container
 # rather than hardcoded. Mirrors vpnctl.ikev2ctl._ikev2_ipv4_net exactly:
 # `conn ikev2-cp`'s rightaddresspool is authoritative (it is what pluto hands
@@ -78,21 +145,22 @@ trap emit EXIT
 # indistinguishable from "the rule is missing". Emits "net|provenance", since
 # a value that came from the hardcoded default must not read as a real answer.
 ikev2_pool() {
-  local line entry first v
+  local line entry first v net why="container unreadable"
   line=$(docker exec ipsec-vpn-server \
            sed -n 's/^[[:space:]]*rightaddresspool=//p' /etc/ipsec.d/ikev2.conf 2>/dev/null | head -1)
   if [[ -n "$line" ]]; then
     entry=$(printf '%s' "$line" | tr ',' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}' || true)
     first=${entry%%-*}
-    if [[ "$first" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-      printf '%s.0/24|conn ikev2-cp rightaddresspool' "${first%.*}"; return
-    fi
+    net=$(valid_net "${first%.*}.0/24") && {
+      printf '%s|conn ikev2-cp rightaddresspool' "$net"; return; }
+    why="conn ikev2-cp gave an unusable pool"
   fi
   v=$(docker exec ipsec-vpn-server printenv VPN_XAUTH_NET 2>/dev/null | tr -d '\r' | head -1)
-  if [[ "$v" =~ ^[0-9]+(\.[0-9]+){3}/[0-9]+$ ]]; then
-    printf '%s|VPN_XAUTH_NET' "$v"; return
+  if [[ -n "$v" ]]; then
+    net=$(valid_net "$v") && { printf '%s|VPN_XAUTH_NET' "$net"; return; }
+    why="VPN_XAUTH_NET=$v does not parse as a network"
   fi
-  printf '192.168.43.0/24|image default, container unreadable'
+  printf '192.168.43.0/24|image default, %s' "$why"
 }
 
 # The pool query's answer as fields, not as English inside the detail: a caller
@@ -150,25 +218,53 @@ echo "== rendered config =="
 [[ -f "$STATE/rendered/sing-box/00_base.json" ]] && ok rendered_singbox_tree "sing-box tree present" \
                                                  || bad rendered_singbox_tree "sing-box tree missing"
 
-echo "== containers =="
-for c in sing-box; do
-  s=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null | tr -d '\n')
-  [[ "$s" == "running" ]] && ok "container_$c" "$c running" || bad "container_$c" "$c is '${s:-absent}'"
-done
-
-echo "== listeners (a container can run and still bind nothing) =="
-# Enumerated from the registry, so this follows `protocol on/off` automatically.
-# The protocol name rides along because the check names are per protocol port:
-# port_hysteria2_20443_udp says what broke without a lookup table.
-# If the enumeration itself fails we FAIL rather than skip: a check that
-# silently verifies nothing and still reports PASS is worse than no check.
-PORTS=$(vpnctl --json protocol list 2>/dev/null \
+# One enumeration, read by both the container loop and the port loop, so both
+# follow `protocol on/off` automatically. The protocol name rides along because
+# the check names are per protocol port: port_hysteria2_20443_udp says what
+# broke without a lookup table. If the enumeration itself fails we FAIL rather
+# than skip: a check that silently verifies nothing and still reports PASS is
+# worse than no check.
+PLIST=$(vpnctl --json protocol list 2>/dev/null \
         | python3 -c 'import sys,json
 d=json.load(sys.stdin)
 for p in d.get("protocols",[]):
     if p["enabled"]:
+        print("proto", p["name"])
         for x in p["ports"]:
-            n,_,pr=x.partition("/"); print(p["name"],n,pr)' 2>/dev/null) || PORTS=""
+            n,_,pr=x.partition("/"); print("port", p["name"], n, pr)' 2>/dev/null) || PLIST=""
+ENABLED=$(awk '$1=="proto" {printf "%s ", $2}' <<< "$PLIST")
+PORTS=$(awk '$1=="port" {print $2, $3, $4}' <<< "$PLIST")
+
+echo "== containers =="
+# Driven from the enabled set, not from a literal list. This checked `sing-box`
+# alone, so a crash-looping dnstt-sshd -- the container that holds every dnstt
+# login, and the one whose recreation is what makes `user rm` revoke anything --
+# passed every check on this page while nobody could log in.
+#
+# sing-box is unconditional because composectl.up starts it unconditionally: it
+# is the process both sing-box-level protocols live in, and it is up even with
+# both of them somehow off.
+CONTAINERS="sing-box"
+if [[ -z "$ENABLED" ]]; then
+  bad container_enumeration \
+      "could not enumerate enabled protocols (is vpnctl on PATH?) -- only sing-box is checked below"
+else
+  for proto in $ENABLED; do
+    extra=$(protocol_containers "$proto")
+    if [[ -z "$extra" ]]; then
+      # A protocol the registry grew and this table did not hear about. Loud,
+      # for the reason the port enumeration is loud: the alternative is a green
+      # smoke test that checked nothing for that protocol.
+      bad "container_enumeration_$proto" \
+          "$proto is enabled and protocol_containers() does not know its containers"
+    else
+      CONTAINERS="$CONTAINERS $extra"
+    fi
+  done
+fi
+for c in $(printf '%s\n' $CONTAINERS | sort -u); do check_container "$c"; done
+
+echo "== listeners (a container can run and still bind nothing) =="
 
 if [[ -z "$PORTS" ]]; then
   bad port_enumeration "could not enumerate expected ports (is vpnctl on PATH?) -- failing, not skipping"
@@ -189,6 +285,50 @@ else
     served "$port" "$proto" && ok "port_${pname}_${port}_${proto}" "$port/$proto bound" \
                             || bad "port_${pname}_${port}_${proto}" "$port/$proto NOT bound"
   done <<< "$PORTS"
+fi
+
+# The other half of dnstt, and deliberately the opposite assertion. Its two
+# back-end services bind LOOPBACK on purpose -- dnstt-sshd on 127.0.0.1:2222 is
+# the only exit from the tunnel, dnstt-socks on 127.0.0.1:7300 is reachable only
+# through an authenticated SSH forward -- so served() above, which ignores
+# 127.0.0.0/8, can never see them: it ignores loopback because systemd-resolved
+# holds 127.0.0.53:53 on every stock Ubuntu and a loopback match would report
+# dnstt's own 53/udp as served on a box serving no DNS at all. Two separate
+# helpers rather than a flag, so neither piece of reasoning can leak into the
+# other. Without this, dnstt-server binding :53 was the whole test, and a tunnel
+# whose sshd was not listening passed it.
+#
+# A non-loopback bind is a FAILURE here, not a pass: these two admit anyone who
+# reaches them, and the credential's small blast radius is the entire argument
+# for PermitOpen any and a password login behind the Noise key.
+loopback_bind() {
+  local port="$1" flag
+  [[ "$2" == tcp ]] && flag=-ltn || flag=-lun
+  ss -H $flag "sport = :$port" 2>/dev/null | awk '
+    { a = $4; sub(/:[0-9]+$/, "", a); sub(/%.*/, "", a)
+      if (a ~ /^127\./ || a == "[::1]" || a == "::1") lo = 1; else pub = a }
+    END { if (pub != "") { print "public " pub }
+          else if (lo)   { print "loopback" }
+          else           { print "absent" } }'
+}
+
+if [[ " $ENABLED " == *" dnstt "* ]]; then
+  while read -r port proto svc what; do
+    [[ -z "$port" ]] && continue
+    case "$(loopback_bind "$port" "$proto")" in
+      loopback)
+        ok "loopback_${svc}_${port}_${proto}" "$svc on 127.0.0.1:$port ($what)" ;;
+      public\ *)
+        bad "loopback_${svc}_${port}_${proto}" \
+            "$svc is bound on a non-loopback address -- $what, and it must be reachable only through the tunnel" ;;
+      *)
+        bad "loopback_${svc}_${port}_${proto}" \
+            "$svc NOT listening on 127.0.0.1:$port -- $what, so dnstt clients get a tunnel that exits nowhere" ;;
+    esac
+  done <<'LOOPBACK'
+2222 tcp dnstt-sshd every dnstt login lands here
+7300 tcp dnstt-socks the SOCKS exit those logins forward into
+LOOPBACK
 fi
 
 echo "== firewall =="

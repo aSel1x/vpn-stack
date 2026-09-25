@@ -54,9 +54,23 @@ cd "$REPO_PATH"
 # it has no business carrying a test runner. Sync makes the environment match,
 # so this also removes one a previous deploy left behind.
 uv sync --frozen --no-dev
-vpnctl apply
+# Under the lock every other call site takes (./vpn's remote(), the boot unit,
+# install.sh). vpnctl holds no lock of its own, so a deploy that overlapped an
+# operator's `./vpn user add` had two processes rendering candidate trees over
+# each other -- the one race the atomic promote downstream cannot save you from,
+# because both halves are valid, they are just from different inputs.
+#
+# VPN_STACK_LOCK_HELD is the handshake for the day vpnctl takes the lock itself:
+# flock(1) inside flock(1) on the same path from a child process opens a second
+# file description and blocks forever -- measured, not assumed -- so an inner
+# lock has to be able to see that the outer one is already held.
+export VPN_STACK_LOCK_HELD=1
+flock /run/vpn-stack.lock vpnctl apply
 REMOTE
 
 echo "==> smoke test"
+# Single-quoted on the far side: REPO_PATH comes from the environment, and an
+# unquoted path with a space in it is re-split by the remote shell into two
+# arguments -- the hazard ./vpn's remote() spells out at length.
 # shellcheck disable=SC2086
-ssh $SSH_OPTS "$TARGET" "cd $REPO_PATH && bash scripts/smoke.sh"
+ssh $SSH_OPTS "$TARGET" "cd '$REPO_PATH' && bash scripts/smoke.sh"

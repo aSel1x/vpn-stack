@@ -5,9 +5,11 @@
 #
 #   scripts/provision-host.sh base <server-host>
 #   scripts/provision-host.sh code <repo-path>
+#   scripts/provision-host.sh firewall <deadman-seconds>
+#   scripts/provision-host.sh firewall-disarm
 #
-# Two stages, because the two callers have to cut this in half at two different
-# points and both cuts land here:
+# Four stages, because the callers have to cut this apart at three different
+# points and every cut lands here:
 #
 #   base   apt packages, docker, uv, /etc/vpn-stack, sysctls, /dev/ppp and the
 #          boot unit. Needs no repository -- and has to run BEFORE one arrives,
@@ -19,17 +21,24 @@
 #   code   the .env symlink, `uv sync`, the /usr/local/bin/vpnctl shim, and the
 #          keyring. Runs from the checkout, however it got there -- rsynced by
 #          install.sh or cloned by the app.
+#   firewall / firewall-disarm
+#          arm the deadman, open ssh, enable ufw -- and, after somebody else has
+#          proved a fresh connection survives, kill the timer. The *proving* is
+#          deliberately not here and cannot be: a process on this box cannot
+#          show from inside one connection that a *different* one would be
+#          accepted. install.sh does that between the two calls, and the app
+#          does its own equivalent.
 #
-# The firewall is deliberately NOT here. Enabling ufw is only safe if something
-# proves a brand-new connection survives the new rules, and a process on this
-# box cannot: it cannot show from inside one connection that a *different* one
-# would be accepted. install.sh does that, and the app does its own equivalent.
-# The split exists so the prover can run between the stages -- the app arms its
-# deadman and proves the firewall after `base` and before `code`, which is why
-# the keyring is minted by `code` and not in a stage of its own.
+# The arm/disarm pair lives here rather than inline in install.sh because it
+# also exists in Dart (app/lib/provision/firewall.dart), and a safety net with
+# three implementations is a safety net whose behaviour nobody knows. This is
+# the shell definition; install.sh pipes this file in over stdin for it, exactly
+# as it does for `base`, so the step keeps no dependency on a checkout having
+# landed yet and can be moved between the stages without breaking.
 #
-# Both stages are idempotent: an install that fails halfway has to be fixable by
-# running it again, not by hand-editing the server.
+# Every stage is idempotent: an install that fails halfway has to be fixable by
+# running it again, not by hand-editing the server. That includes the firewall
+# one -- arming over a timer that is still alive is the failure it guards.
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
@@ -46,8 +55,15 @@ usage() {
   cat >&2 <<'USAGE'
 usage: provision-host.sh base <server-host>   # host setup; needs no checkout
        provision-host.sh code <repo-path>     # vpnctl and the keyring, from one
+       provision-host.sh firewall <seconds>   # arm the deadman, then enable ufw
+       provision-host.sh firewall-disarm      # kill the timer, after the proof
 USAGE
 }
+
+# Where the armed timer records itself. One path, because it is the only thing
+# on the box that knows a countdown is running: anything that loses track of it
+# has lost the ability to stop `ufw --force disable` from firing later.
+DEADMAN_PID_FILE=/run/vpn-stack.deadman
 
 # Docker's own apt repository rather than `curl get.docker.com | sh`: signed,
 # upgradable with the rest of the system, and readable before it runs.
@@ -65,6 +81,17 @@ install_docker() {
   # whole stage. The app's preflight accepts Debian, so the two disagreed about
   # what they supported. Verified on Ubuntu only; Debian is untested here.
   . /etc/os-release
+  # Under `set -u` a bare "$VERSION_CODENAME" aborts the whole base stage on an
+  # os-release that does not carry it -- some derivatives set only
+  # UBUNTU_CODENAME -- and the abort names neither the variable nor the file.
+  # Docker's repository is per codename, so there is no default to fall back on.
+  local codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+  [[ -n "$codename" ]] || {
+    echo "/etc/os-release names no VERSION_CODENAME or UBUNTU_CODENAME, so the" >&2
+    echo "docker repository line cannot be written (it is per codename)." >&2
+    echo "Install docker yourself and re-run: if it is present, this leaves" >&2
+    echo "it completely alone." >&2
+    return 1; }
   local distro=ubuntu
   case "${ID:-}" in
     debian) distro=debian ;;
@@ -88,7 +115,7 @@ install_docker() {
   curl -"$family" -fsSL "$key" -o /etc/apt/keyrings/docker.asc
   chmod a+r /etc/apt/keyrings/docker.asc
   printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
-    "$(dpkg --print-architecture)" "$distro" "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list
+    "$(dpkg --print-architecture)" "$distro" "$codename" > /etc/apt/sources.list.d/docker.list
 
   # Persisted, not passed once: otherwise *your* next `apt update` fails on
   # this repository too. Reverted rather than left behind if it turns out the
@@ -103,6 +130,168 @@ install_docker() {
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
                          docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker
+}
+
+# ------------------------------------------------------------------ firewall
+# TERM the process group, wait for it to actually be gone, then KILL. Used by
+# both the arm (reaping a predecessor) and the disarm, so there is one answer to
+# "is that timer dead?" rather than two.
+#
+# Under root a signal to a process of our own cannot be refused, so this is
+# defence in depth rather than a failure anybody has seen. What it really buys
+# is observability: the old disarm removed the pid file BEFORE killing anything,
+# sent both kills' stderr to /dev/null and ended in `; true`, so `set -e` could
+# not see a failure -- and if the kill had not landed, nothing was left on the
+# box that knew a timer was still counting down towards disabling the firewall.
+deadman_kill() {
+  local pid="$1" _i
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  # Negative pid first so the `sleep` dies with its leader; the plain pid is the
+  # fallback for a group the kernel has already torn down.
+  for _i in $(seq 1 25); do
+    kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  for _i in $(seq 1 10); do
+    kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+# The safety net: a detached timer that disables ufw unconditionally after N
+# seconds, armed BEFORE the first `ufw enable` and disarmed only once somebody
+# has proved a brand-new connection survives the new rules.
+deadman_arm() {
+  local ttl="$1" pid
+  [[ "$ttl" =~ ^[0-9]+$ && "$ttl" -gt 0 ]] || {
+    echo "deadman: <seconds> must be a positive integer, got: $ttl" >&2; return 1; }
+  have ufw || {
+    echo "ufw is not installed; the base stage was supposed to install it." >&2; return 1; }
+
+  # A live predecessor is reaped, never clobbered. Overwriting the pid file left
+  # the earlier timer sleeping with nothing recording it: run A arms pid 100,
+  # its connection proof fails, the operator re-runs, run B writes pid 200 over
+  # the file, the disarm kills group 200 -- and 100 wakes up at its own T+180
+  # and runs `ufw --force disable`, possibly after the installer has printed
+  # success. An unattended firewall-off is exactly what this net exists to be
+  # the *only* cause of.
+  if [[ -s "$DEADMAN_PID_FILE" ]]; then
+    pid=$(tr -dc '0-9' < "$DEADMAN_PID_FILE")
+    if [[ -n "$pid" ]] && { kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; }; then
+      echo "   a deadman from an earlier run is still armed (pid $pid); reaping it"
+      deadman_kill "$pid" || {
+        echo "A deadman from an earlier run (pid $pid) survived TERM and KILL." >&2
+        echo "It will run \`ufw --force disable\` when its timer expires, so this" >&2
+        echo "refuses to arm a second one on top of it. Kill it by hand:" >&2
+        echo "    kill -KILL -$pid" >&2
+        return 1; }
+    fi
+    rm -f "$DEADMAN_PID_FILE"
+  fi
+
+  # The pid file and the timeout go in as positional parameters rather than
+  # spliced into the body: the body is single-quoted and a quoted word inside a
+  # quoted word does not nest, it ends it. `sh -c BODY NAME ARGS` sets $0 to
+  # NAME, which is what "deadman" is doing there.
+  #
+  # The subshell records its OWN pid: `$!` is unreliable because setsid forks
+  # when the caller is already a process-group leader. setsid also makes it a
+  # group leader, which is what lets a negative-pid kill take the sleep with it.
+  setsid sh -c 'echo $$ > "$1"
+                sleep "$2"
+                ufw --force disable
+                rm -f "$1"' deadman "$DEADMAN_PID_FILE" "$ttl" </dev/null >/dev/null 2>&1 &
+  # Give it a moment to write the pid file, or the disarm finds nothing.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$DEADMAN_PID_FILE" ]] && break; sleep 0.2; done
+  [[ -s "$DEADMAN_PID_FILE" ]] || {
+    echo "deadman failed to arm; refusing to touch ufw" >&2; return 1; }
+  echo "   deadman armed: pid $(cat "$DEADMAN_PID_FILE"), ufw off in ${ttl}s unless disarmed"
+}
+
+deadman_disarm() {
+  local pid
+  # Fatal, not a shrug. Either the timer already fired -- in which case ufw is
+  # off right now and the operator has to know -- or it was never armed, in
+  # which case whatever enabled the firewall did so with no net under it.
+  [[ -s "$DEADMAN_PID_FILE" ]] || {
+    echo "no deadman pid file at $DEADMAN_PID_FILE." >&2
+    echo "Either its timer already expired (ufw is off: check \`ufw status\`) or" >&2
+    echo "nothing ever armed it. Neither is a state to continue an install from." >&2
+    return 1; }
+  pid=$(tr -dc '0-9' < "$DEADMAN_PID_FILE")
+  [[ -n "$pid" ]] || {
+    echo "$DEADMAN_PID_FILE holds no pid; cannot tell what to kill." >&2; return 1; }
+  deadman_kill "$pid" || {
+    echo "deadman pid $pid survived TERM and KILL. It will run" >&2
+    echo "\`ufw --force disable\` when its timer expires. Kill it by hand:" >&2
+    echo "    kill -KILL -$pid" >&2
+    echo "$DEADMAN_PID_FILE is left in place -- it is the only record of it." >&2
+    return 1; }
+  # Only now, and only because the process is provably gone: the pid file is the
+  # single record of a live timer, so removing it while the timer breathes is
+  # the one irreversible mistake available here.
+  rm -f "$DEADMAN_PID_FILE"
+  echo "   deadman disarmed (pid $pid)"
+}
+
+# Which ports sshd is actually reachable on, asked rather than assumed. This
+# hardcoded 22, so `./vpn init` could never finish against an sshd on another
+# port: ufw came up with only 22 open, the fresh-connection proof failed, the
+# installer exited 1, the deadman restored access three minutes later and the
+# identical re-run failed identically with nothing in the output naming the
+# port. Mirrors scripts/smoke.sh's ssh_ports, and the app's own sshPort.
+ssh_ports_to_allow() {
+  local p out bin ports=""
+  # The port this session came in on. Nothing is more direct: it is the port
+  # that has to keep working, and it just demonstrably did.
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    p=$(awk '{print $4}' <<< "$SSH_CONNECTION")
+    [[ "$p" =~ ^[0-9]+$ ]] && ports="$p"
+  fi
+  # Plus every port the effective config names -- `sshd -T` sees a Port in an
+  # Include or an sshd_config.d drop-in, which grepping sshd_config does not.
+  # Every one of them, not the first: an operator whose sshd answers on two
+  # ports must not lose one to a firewall we enabled.
+  bin=$(command -v sshd || true); [[ -n "$bin" ]] || bin=/usr/sbin/sshd
+  if [[ -x "$bin" ]]; then
+    out=$("$bin" -T 2>/dev/null | awk '$1=="port" && $2 ~ /^[0-9]+$/ {print $2}' || true)
+    ports="$ports $out"
+  fi
+  # 22 only as a last resort: this runs over ssh, so there is always a real
+  # answer unless both sources were unreadable.
+  ports=$(printf '%s\n' $ports | sort -un | tr '\n' ' ')
+  ports=${ports% }
+  [[ -n "$ports" ]] || ports=22
+  printf '%s' "$ports"
+}
+
+# Existing rules are kept, not reset, and only rules carrying a `vpn-stack:`
+# comment are added -- the same contract firewall.reconcile honours.
+ufw_enable() {
+  local ports p
+  ports=$(ssh_ports_to_allow)
+  for p in $ports; do
+    ufw allow "$p"/tcp comment 'vpn-stack:ssh' >/dev/null
+  done
+  echo "   allowed ssh on: $ports"
+  if ufw status 2>/dev/null | grep -q '^Status: active'; then
+    echo "   ufw was already active; your other rules were left alone"
+  else
+    echo "   ufw was inactive; enabling it (existing rules are kept, not reset)"
+    ufw --force enable >/dev/null
+  fi
+  # `|| true`, because this line is a courtesy to the operator and nothing more:
+  # under pipefail a SIGPIPE from head closing the pipe would otherwise become
+  # the exit status of the whole firewall stage, and an install that aborted
+  # there would leave the deadman armed over a firewall that is perfectly fine.
+  ufw status | head -1 || true
+}
+
+stage_firewall() {
+  deadman_arm "$1"
+  ufw_enable
 }
 
 # ---------------------------------------------------------------------- base
@@ -143,8 +332,25 @@ stage_base() {
 
   echo "-- state directory"
   install -d -m 700 /etc/vpn-stack /etc/vpn-stack/secrets /etc/vpn-stack/data
-  grep -q '^VPN_SERVER_HOST=' /etc/vpn-stack/.env 2>/dev/null \
-    || echo "VPN_SERVER_HOST=$HOST" >> /etc/vpn-stack/.env
+  # Never overwritten: VPN_SERVER_HOST is the address every profile already
+  # handed out was issued against, and rewriting it here would change what the
+  # next `user export` produces without changing anything already on a phone.
+  # But keeping the old value SILENTLY is its own trap -- a re-run of `./vpn
+  # init` against a rebuilt box on a new address then renders, converges and
+  # smoke-tests green while every client still dials the address that is gone.
+  # So the mismatch is reported, with both values and what to do about it.
+  local existing_host=""
+  if [[ -f /etc/vpn-stack/.env ]]; then
+    existing_host=$(sed -n 's/^VPN_SERVER_HOST=//p' /etc/vpn-stack/.env | head -1)
+  fi
+  if [[ -z "$existing_host" ]]; then
+    echo "VPN_SERVER_HOST=$HOST" >> /etc/vpn-stack/.env
+  elif [[ "$existing_host" != "$HOST" ]]; then
+    echo "   VPN_SERVER_HOST is already $existing_host, not $HOST -- kept."
+    echo "   Every profile issued so far points at $existing_host. If this box"
+    echo "   really moved, edit /etc/vpn-stack/.env, run \`vpnctl apply\`, and"
+    echo "   re-export every user: the old profiles will not connect." >&2
+  fi
   # dnstt's zone belongs to whoever runs this box, so it is deployment config
   # here rather than a literal in git -- a shipped default would have every
   # install serving somebody else's domain. Left commented: this script cannot
@@ -191,13 +397,38 @@ SYSCTL
   cat > /etc/systemd/system/vpn-stack.service <<'UNIT'
 [Unit]
 Description=vpn-stack: render config, converge containers and firewall
+# Wants=, not only After=: network-online.target is a passive target that
+# nothing pulls in on its own, so ordering after it without wanting it orders
+# this unit after a target that never gets reached -- i.e. after nothing at all.
 After=docker.service network-online.target
-Wants=docker.service
+Wants=docker.service network-online.target
+# Type=oneshot forbids Restart=always; on-failure is allowed and is what is
+# wanted anyway. At boot `docker info` can answer long after docker.service is
+# "active", and an apply that raced it used to leave the box with the FORWARD
+# rules unapplied and containers down until somebody ran it by hand.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/vpnctl apply
+# The socket, not the unit: dockerd accepts connections a little after systemd
+# calls it started, and `vpnctl apply` talks to the socket on its first line.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done; echo "docker did not answer within 120s" >&2; exit 1'
+# Under the same lock as every other call site. Nothing stops an operator's
+# `./vpn user add` from landing during boot, and two candidate trees rendering
+# over each other is exactly what the atomic promote cannot save you from.
+# Absolute path because ExecStart demands one; /usr/bin/flock is util-linux's
+# on both 22.04 and 24.04 (/bin is a symlink to /usr/bin there).
+ExecStart=/usr/bin/flock /run/vpn-stack.lock /usr/local/bin/vpnctl apply
+# Set at every wrapped call site, unread for now: the day vpnctl takes this lock
+# itself it has to be able to tell that an outer flock(1) already holds it, or a
+# blocking inner lock on the same path -- a second file description, so a
+# different holder as far as the kernel is concerned -- waits on its own parent
+# forever. Measured.
+Environment=VPN_STACK_LOCK_HELD=1
+Restart=on-failure
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -242,37 +473,51 @@ SHIM
   # The keyring, last, because nothing before it can run without the shim.
   # bootstrap never overwrites an existing secret without --force, so re-running
   # this stage cannot invalidate a profile already handed out.
-  vpnctl bootstrap
+  #
+  # Under the lock, like every other vpnctl call site. vpnctl takes no lock of
+  # its own, so a bootstrap that overlapped an operator's `./vpn user add` would
+  # have two processes writing the keyring and users.json with nothing
+  # serialising them -- and the app can run this stage while somebody else is
+  # already using the box.
+  VPN_STACK_LOCK_HELD=1 flock /run/vpn-stack.lock vpnctl bootstrap
 }
 
 stage="${1:-}"
 case "$stage" in
   -h|--help) usage; exit 0 ;;
   '') echo "provision-host.sh needs a stage" >&2; usage; exit 2 ;;
-  base|code) ;;
+  base|code|firewall|firewall-disarm) ;;
   *) echo "unknown stage: $stage" >&2; usage; exit 2 ;;
 esac
 shift
 
-# Neither argument has a default. base's is VPN_SERVER_HOST, the address every
+# No argument has a default. base's is VPN_SERVER_HOST, the address every
 # profile is issued against, and this box cannot work it out -- behind NAT, or
 # reached through a jump host, the address clients need is not one it can see.
 # code's is where the checkout landed, which differs between the rsync and the
-# clone. Checked before the root test below so a usage error reads as one
-# whoever ran it.
+# clone. firewall's is how long the operator is prepared to be locked out for,
+# which is the caller's policy and not this script's. firewall-disarm is the one
+# stage with nothing to pass: what to kill is in the pid file, because that file
+# is the only durable record of the timer. Checked before the root test below so
+# a usage error reads as one to whoever ran it.
 arg="${1:-}"
-[[ -n "$arg" ]] || {
+if [[ -z "$arg" && "$stage" != firewall-disarm ]]; then
   case "$stage" in
     base) echo "base needs the address clients will connect to" >&2 ;;
     code) echo "code needs the path of the checkout" >&2 ;;
+    firewall) echo "firewall needs the deadman's lifetime in seconds" >&2 ;;
   esac
-  usage; exit 2; }
+  usage; exit 2
+fi
 
-# Both stages write /etc and drive systemd. Without this the first failure is a
-# permission denied out of apt-get, which does not say whose fault it is.
+# Every stage writes /etc, drives systemd, or reconfigures the firewall. Without
+# this the first failure is a permission denied out of apt-get or ufw, which does
+# not say whose fault it is.
 [[ "$(id -u)" == 0 ]] || { echo "provision-host.sh must run as root" >&2; exit 1; }
 
 case "$stage" in
   base) stage_base "$arg" ;;
   code) stage_code "$arg" ;;
+  firewall) stage_firewall "$arg" ;;
+  firewall-disarm) deadman_disarm ;;
 esac
