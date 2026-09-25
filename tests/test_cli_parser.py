@@ -192,24 +192,29 @@ def test_a_successful_listing_says_ok_once(monkeypatch, as_json, capsys) -> None
 
 
 def test_bootstrap_does_not_report_success_for_a_set_it_refused(monkeypatch) -> None:
-    # bootstrap_keyring returns True whenever some OTHER protocol's keys were
-    # written, so the bool answers "did anything get written", not "is the
-    # keyring sound". A half-present set left alone needs the missing file
-    # restored or the whole set regenerated -- the one outcome that demands a
-    # decision was the one that looked fine.
-    monkeypatch.setattr(
-        cli.bootstrap,
-        "bootstrap_keyring",
-        lambda force: (
-            True,
-            "generated 3 secret(s): ipsec.psk\n"
+    # A half-present set is a typed refusal, raised even when another protocol's
+    # keys WERE written -- because the write is not the verdict. It used to be a
+    # sentence inside the success message, so the one outcome that demands a
+    # decision (restore the missing file, or regenerate the whole set and reissue
+    # every profile) was the one that reported ok=true and exited 0, and the CLI
+    # recognised it by matching a literal prefix of that prose.
+    def refuse(force):
+        raise cli.bootstrap.KeyringRefused(
             "NOT refilled: hysteria2 (missing hysteria2.key).",
-        ),
-    )
+            ("hysteria2 (missing hysteria2.key)",),
+        )
 
-    with pytest.raises(SystemExit) as exc:
+    monkeypatch.setattr(cli.bootstrap, "bootstrap_keyring", refuse)
+
+    # main() is what turns it into exit 1, the same handler every other typed
+    # error in this package reaches -- so the refusal never needed a special case
+    # in cmd_bootstrap, which is the whole improvement.
+    with pytest.raises(cli.bootstrap.KeyringRefused):
         cli.cmd_bootstrap(parse(["bootstrap"]))
 
+    monkeypatch.setattr("sys.argv", ["vpnctl", "bootstrap"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
     assert exc.value.code == 1
 
 

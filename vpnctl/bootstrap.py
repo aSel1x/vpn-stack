@@ -20,6 +20,23 @@ from vpnctl.paths import SECRETS_DIR
 Derivation = Callable[[secrets_store.Secrets], bytes]
 
 
+class KeyringRefused(RuntimeError):
+    """A protocol's secret set is half present, so it was left alone.
+
+    Raised rather than returned because the two things a caller wants to do
+    with it -- exit non-zero and print the remedy -- are what every other
+    typed error in this package already gets for free in cli.main. It used to
+    be a sentence inside the success message, which meant `bootstrap` reported
+    ok=true and exited 0 on the one outcome that demands a decision, and the
+    CLI had to recognise it by matching a literal prefix of the prose.
+    """
+
+    def __init__(self, message: str, refused: tuple[str, ...]) -> None:
+        super().__init__(message)
+        # The protocols, so a caller can act on them without parsing English.
+        self.refused = refused
+
+
 def _derivable(proto: protocols.Protocol) -> Mapping[str, Derivation]:
     """Which of this protocol's bootstrap outputs can be rebuilt, not minted.
 
@@ -103,19 +120,21 @@ def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
             secrets_store.write(name, content)
             written.append(name)
 
-    note = ""
     if partial:
-        note = (
+        # Raised even when another protocol's keys WERE written: the write is not
+        # the verdict. Those secrets are already on disk and a re-run is a no-op
+        # for them, so failing here loses nothing and stops a half-present set
+        # from being reported as a completed bootstrap.
+        raise KeyringRefused(
             "NOT refilled: " + "; ".join(partial) + ". A half-present set is left "
             "alone rather than topped up: filling the gap pairs a fresh half with "
             "the stale one that survived, which renders, serves, and fails on every "
             "client. Restore the missing file from a backup, or `--force` to "
-            "regenerate the whole set -- that invalidates every exported profile."
+            "regenerate the whole set -- that invalidates every exported profile.",
+            tuple(partial),
         )
 
     if not written and not derived:
-        if partial:
-            return False, note
         return False, (
             f"keyring already complete ({len(kept)} secrets), nothing generated. "
             "Use --force to regenerate -- that invalidates every exported profile."
@@ -136,8 +155,6 @@ def bootstrap_keyring(force: bool = False) -> tuple[bool, str]:
     msg = "; ".join(parts)
     if kept:
         msg += f" (kept {len(kept)} existing)"
-    if note:
-        msg += "\n" + note
     return True, msg
 
 

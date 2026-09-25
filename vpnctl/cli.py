@@ -582,15 +582,6 @@ def reconcile_ikev2() -> dict:
 # -------------------------------------------------------------------- commands
 
 
-# The one thing bootstrap_keyring cannot say in its return type. A half-present
-# set it REFUSED to top up is reported inside the message and nowhere else, and
-# it still returns True whenever some other protocol's keys were written -- so
-# the bool answers "did anything get written", which is not the verdict. Matched
-# on the literal prefix it emits, a coupling worth having in one visible place
-# instead of discovering it the day `bootstrap` exits 0 on a keyring it refused.
-_BOOTSTRAP_REFUSED = "NOT refilled:"
-
-
 def cmd_bootstrap(args) -> None:
     guard.require_server("bootstrap")
     ok, message = bootstrap.bootstrap_keyring(force=args.force)
@@ -604,15 +595,14 @@ def cmd_bootstrap(args) -> None:
             "until it converges, the containers still serve the old keys and every "
             "freshly exported profile fails to connect."
         )
-    # Three outcomes, and only one of them is a failure. "Nothing to generate"
-    # is success: a complete keyring is what this command is for. A half-present
-    # set that was refused is not -- it needs the missing file restored from a
-    # backup or the whole set regenerated, and reporting ok=true and exit 0 for
-    # it meant the one outcome demanding a decision was the one that looked
-    # fine. A gap that was HEALED from surviving material (reality.pub from
-    # reality.key) is success too: nothing a client holds changed.
-    if _BOOTSTRAP_REFUSED in message:
-        die(message)
+    # Both remaining outcomes are success. "Nothing to generate" is what a
+    # complete keyring looks like, and a gap HEALED from surviving material
+    # (reality.pub from reality.key) changes nothing a client holds. The third
+    # outcome -- a half-present set left alone -- raises KeyringRefused and is
+    # turned into exit 1 by main(), which is the point: it needs the missing file
+    # restored from a backup or the whole set regenerated, and it used to be a
+    # sentence inside this message, so the one outcome demanding a decision was
+    # the one that reported ok=true.
     emit(ok=True, message=message)
 
 
@@ -1124,6 +1114,11 @@ def main() -> None:
         # The database being unreadable is an operator problem with a stated
         # remedy, not a bug. A traceback here buries the one sentence that
         # says what to do.
+        die(str(e))
+    except bootstrap.KeyringRefused as e:
+        # A half-present secret set. Here rather than in cmd_bootstrap because
+        # `apply` reaches bootstrap_keyring too, through the install path, and a
+        # refusal there deserves the same one sentence and the same exit code.
         die(str(e))
     except state.StateError as e:
         # Beside users_store for the same reason, and with a wider blast radius:

@@ -74,10 +74,11 @@ def test_one_missing_file_refuses_the_whole_protocol() -> None:
     survivor = secrets_store.load().raw("hysteria2.crt")
     (SECRETS_DIR / "hysteria2.key").unlink()
 
-    changed, message = bootstrap.bootstrap_keyring()
-    assert not changed
+    with pytest.raises(bootstrap.KeyringRefused) as refusal:
+        bootstrap.bootstrap_keyring()
+    message = str(refusal.value)
+    assert refusal.value.refused == ("hysteria2 (missing hysteria2.key)",)
     assert "NOT refilled" in message
-    assert "hysteria2 (missing hysteria2.key)" in message
     # The surviving certificate is untouched, and the gap stays a gap: a fresh
     # key beside a stale certificate renders, serves, and fails on every client.
     assert secrets_store.load().raw("hysteria2.crt") == survivor
@@ -92,10 +93,12 @@ def test_a_refusal_does_not_stop_an_untouched_protocol() -> None:
     for name in ("reality.key", "reality.pub", "reality.short_id"):
         (SECRETS_DIR / name).unlink()
 
-    changed, message = bootstrap.bootstrap_keyring()
-    assert changed
-    assert "reality.key" in message
-    assert "NOT refilled" in message and "hysteria2" in message
+    # The refusal is raised even though vless-reality's keys WERE written: the
+    # write is not the verdict. Those secrets are on disk, and a re-run is a
+    # no-op for them, so the untouched protocol is not held back by it.
+    with pytest.raises(bootstrap.KeyringRefused) as refusal:
+        bootstrap.bootstrap_keyring()
+    assert refusal.value.refused == ("hysteria2 (missing hysteria2.key)",)
     assert secrets_store.load().raw("hysteria2.crt") == survivor
     assert names() == FULL - {"hysteria2.key"}
 
@@ -105,9 +108,9 @@ def test_a_truncated_file_does_not_count_as_present() -> None:
     # protocol looks half-present and is refused rather than topped up.
     bootstrap.bootstrap_keyring()
     (SECRETS_DIR / "reality.key").write_bytes(b"")
-    changed, message = bootstrap.bootstrap_keyring()
-    assert not changed
-    assert "vless-reality (missing reality.key)" in message
+    with pytest.raises(bootstrap.KeyringRefused) as refusal:
+        bootstrap.bootstrap_keyring()
+    assert refusal.value.refused == ("vless-reality (missing reality.key)",)
     assert (SECRETS_DIR / "reality.key").read_bytes() == b""
 
 
@@ -191,9 +194,11 @@ def test_a_gap_is_only_filled_when_what_it_derives_from_survived() -> None:
     (SECRETS_DIR / "reality.key").unlink()
     (SECRETS_DIR / "reality.pub").unlink()
 
-    changed, message = bootstrap.bootstrap_keyring()
-    assert not changed
-    assert "vless-reality (missing reality.key, reality.pub)" in message
+    with pytest.raises(bootstrap.KeyringRefused) as refusal:
+        bootstrap.bootstrap_keyring()
+    assert refusal.value.refused == (
+        "vless-reality (missing reality.key, reality.pub)",
+    )
     assert names() == FULL - {"reality.key", "reality.pub"}
     assert secrets_store.load().raw("reality.short_id") == short_id
 
