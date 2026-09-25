@@ -6,6 +6,7 @@
 // A named, ordered, individually-reporting step is what lets the screen say
 // which of the nine it is on and what that one is doing.
 
+import '../control/control.dart';
 import 'commands.dart';
 import 'config.dart';
 import 'errors.dart';
@@ -151,6 +152,59 @@ class ProvisionContext {
     return open.session;
   }
 
+  /// The control layer, over this connection.
+  ///
+  /// There is one reader of `--json` in this app and it is this one: it takes
+  /// the lock, and it refuses a payload it does not fully understand by name.
+  /// Provisioning used to keep a loose copy for the one answer it needed and
+  /// skipped every row that copy could not read, so an answer it could not
+  /// understand at all became an empty list and the readiness wait reported
+  /// success without waiting for anything.
+  Vpnctl get vpnctl => Vpnctl(
+        session,
+        vpnctlPath: config.vpnctl,
+        lockPath: config.lockPath,
+        lockWait: config.lockWait,
+      );
+
+  /// One control call, with every way it can fail mapped into this layer's
+  /// family so a failure always names the step it happened in.
+  ///
+  /// The three outcomes stay apart because they ask different things: a
+  /// transport failure is worth retrying, a lock conflict means nothing ran,
+  /// and an answer this app cannot read is neither -- it is a version
+  /// disagreement, and the control layer has already said which field.
+  Future<T> control<T>(
+    Future<T> Function(Vpnctl vpnctl) call, {
+    required String what,
+  }) async {
+    try {
+      return await call(vpnctl);
+    } on VpnctlTransportError catch (error) {
+      throw ProvisionTransportError(
+        step: stepName,
+        cause: error.cause,
+        what: what,
+      );
+    } on VpnctlCommandError catch (error) {
+      if (error.exitCode == lockConflictExit) {
+        throw _lockBusy(what);
+      }
+      throw ProvisionControlError(step: stepName, what: what, cause: error);
+    } on VpnctlException catch (error) {
+      throw ProvisionControlError(step: stepName, what: what, cause: error);
+    }
+  }
+
+  /// The one status flock owns, as this layer's failure. Built in one place so
+  /// the two callers cannot drift into describing the same condition differently.
+  LockBusyError _lockBusy(String what) => LockBusyError(
+        step: stepName,
+        what: what,
+        lockPath: config.lockPath,
+        waited: config.lockWait,
+      );
+
   /// The transport the firewall step must not accept as its own prover.
   String? get primaryTransportId => _primary?.transportId;
 
@@ -198,6 +252,31 @@ class ProvisionContext {
     required String what,
   }) async {
     final CommandResult result = await run(program);
+    if (!result.ok) {
+      throw ProvisionCommandError(
+        step: stepName,
+        what: what,
+        exitCode: result.exitCode,
+        output: result.combined,
+      );
+    }
+    return result;
+  }
+
+  /// [runChecked] for a program that invokes vpnctl under the lock.
+  ///
+  /// Only the one exit status flock owns is treated differently, and it has to
+  /// be: `-E 75` exists precisely so that "somebody else is mid-apply" is not
+  /// reported as a vpnctl that exited 75 and printed nothing, which is a bug
+  /// report about the wrong program.
+  Future<CommandResult> runVpnctl(
+    RemoteProgram program, {
+    required String what,
+  }) async {
+    final CommandResult result = await run(program);
+    if (result.exitCode == lockConflictExit) {
+      throw _lockBusy(what);
+    }
     if (!result.ok) {
       throw ProvisionCommandError(
         step: stepName,

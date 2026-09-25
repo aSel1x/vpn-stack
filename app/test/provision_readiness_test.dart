@@ -102,6 +102,108 @@ void main() {
     expect(ssh.countOf('served()'), 1);
   });
 
+  group('an answer this app cannot read is not an empty answer', () {
+    // The degradation this group exists for: the step used to decode the
+    // payload itself and `continue` past any row it could not read, so a shape
+    // it did not recognise produced an empty spec list, "no protocol is
+    // enabled, so there is nothing to wait for", and a readiness step that
+    // reported success without waiting for anything -- on a server where every
+    // port may well have been unbound. Asking through `Vpnctl.listProtocols()`
+    // makes the unreadable row a named failure instead.
+
+    test('a row whose enabled is not a boolean fails the step', () async {
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      // The quiet one. A loose reader tests `row['enabled'] != true`, which is
+      // true of the string "true", so the row is skipped and the protocol that
+      // IS enabled is never waited for.
+      ssh.reply(
+        'protocol list',
+        stdout: '{"schema":1,"ok":true,"protocols":['
+            '{"name":"vless-reality","enabled":"true","ports":["10443/tcp"],'
+            '"kind":"singbox","summary":"","notes":""}]}\n',
+      );
+
+      try {
+        await runReadiness(ssh);
+        fail('an unreadable protocol list must not pass as an empty one');
+      } on ProvisionControlError catch (error) {
+        expect(error.step, 'readiness');
+        expect(error.message, contains('protocols[0].enabled'));
+        expect(error.message, contains('expected a boolean'));
+      }
+      expect(ssh.ran('served()'), isFalse);
+    });
+
+    test('rows that are not objects fail the step', () async {
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      ssh.reply(
+        'protocol list',
+        stdout: '{"schema":1,"ok":true,"protocols":["vless-reality"]}\n',
+      );
+
+      await expectLater(
+        runReadiness(ssh),
+        throwsA(isA<ProvisionControlError>().having(
+            (ProvisionControlError e) => e.message,
+            'message',
+            contains('protocols[0]'))),
+      );
+    });
+
+    test('a field this app does not know is refused by name', () async {
+      // Same stance as users_store.load(): the field may be the one that says a
+      // port moved, and waiting for the ports we did recognise would be reading
+      // a changed answer as an unchanged one.
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      ssh.reply(
+        'protocol list',
+        stdout: '{"schema":1,"ok":true,"protocols":['
+            '{"name":"wireguard","enabled":true,"ports":["51820/udp"],'
+            '"kind":"compose","summary":"","notes":"","obfuscated":true}]}\n',
+      );
+
+      await expectLater(
+        runReadiness(ssh),
+        throwsA(isA<ProvisionControlError>().having(
+            (ProvisionControlError e) => e.message,
+            'message',
+            allOf(contains('obfuscated'), contains('update the app')))),
+      );
+    });
+
+    test('a lock somebody else holds says nothing ran', () async {
+      // flock -E 75. Without the translation this is "exited 75 and printed
+      // nothing", which sends somebody looking for a bug in vpnctl instead of
+      // waiting a minute.
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      ssh.fail('protocol list', exitCode: 75);
+
+      try {
+        await runReadiness(ssh);
+        fail('a lock conflict is not a server that never binds');
+      } on LockBusyError catch (error) {
+        expect(error.step, 'readiness');
+        expect(error.lockPath, '/run/vpn-stack.lock');
+        expect(error.message, contains('never ran'));
+      }
+      expect(ssh.ran('served()'), isFalse);
+    });
+
+    test('asks under the lock, like every other vpnctl call', () async {
+      // app/README.md: a call that skips the lock is a bug even on the run
+      // where it works. This one ran outside it while control/vpnctl.dart put
+      // every one of its own inside.
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      await runReadiness(ssh);
+
+      final String asked = ssh.commands
+          .firstWhere((String c) => c.contains('protocol list'));
+      expect(asked, contains('flock'));
+      expect(asked, contains('/run/vpn-stack.lock'));
+      expect(asked, contains('-E 75'));
+    });
+  });
+
   test('waits for nothing when no protocol is enabled', () async {
     final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
     ssh.reply(

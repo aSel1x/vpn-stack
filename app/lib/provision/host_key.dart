@@ -12,10 +12,32 @@
 // Value types and one sealed failure family, nothing else. No crypto here: the
 // fingerprint is computed by whoever speaks the wire protocol -- it is
 // `SHA256:` plus the unpadded base64 of the SHA-256 of the key blob, exactly
-// what `ssh-keygen -lf` prints -- and the comparison that decides anything is
-// over the blob itself, never over a hash somebody else computed.
+// what `ssh-keygen -lf` prints.
+//
+// **What is pinned is the fingerprint, not the key.** dartssh2 hands its
+// verification callback the key type and that printed `SHA256:...` string and
+// nothing else; the wire blob is a local in
+// `SSHTransport._handleMessageKexReply` and no public member exposes it. So
+// [SshHostKey.blob] carries whatever identifying bytes the transport could
+// give, and with this transport that is the fingerprint -- `transport/exec.dart`
+// sets the two fields equal on purpose, so a pin minted here is recognisable to
+// whatever has to migrate it if a library that exposes the blob ever arrives.
+//
+// That is sufficient for the question this file asks, and the bound is worth
+// stating rather than implying. A fingerprint is second-preimage resistant, so
+// "the same SHA-256" is "the same key" for any adversary who cannot break
+// SHA-256; and the party that computed it is the same transport that had
+// already verified the host's signature over that same key moments earlier, so
+// there is no third party left whose arithmetic could differ from ours. What it
+// does NOT give is a pin anybody else can read: it is not a known_hosts line
+// and cannot be turned into one, which is why this type offers no way to write
+// one.
 
-/// One server's public host key, exactly as it was presented in the handshake.
+/// One server's host key identity, as the transport was able to state it.
+///
+/// Not the key: see the header. Named for what it is used as -- the thing a pin
+/// is made of and compared against -- rather than for the bytes it happens to
+/// hold, which depend on which SSH library is underneath.
 class SshHostKey {
   const SshHostKey({
     required this.algorithm,
@@ -55,26 +77,38 @@ class SshHostKey {
   /// for, so a pin is a pin of one algorithm's key.
   final String algorithm;
 
-  /// The public key blob, base64 -- the second field of a known_hosts line.
-  /// This is the thing that is compared.
+  /// The bytes that identify this key, as the transport was able to hand them
+  /// over. This is the thing that is compared.
+  ///
+  /// With dartssh2 it is the `SHA256:` fingerprint string, equal to
+  /// [fingerprint] -- see the header, and `transport/exec.dart`, which is where
+  /// that equality is decided. A real wire blob could never equal a fingerprint
+  /// string, so the two being equal is the marker of a pin from this transport.
+  /// Not a known_hosts field: there is no line to be built from it.
   final String blob;
 
   /// `SHA256:...`, for a human to read against what the provider's console or
-  /// `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` shows. Display only.
+  /// `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` shows.
+  ///
+  /// Under this transport it is also what [blob] holds, but the two are kept as
+  /// separate fields because they answer to different owners: this one is the
+  /// string shown to a person, and a transport that could expose the blob would
+  /// change the other without touching this.
   final String fingerprint;
 
-  /// Same key, deliberately ignoring [fingerprint]: the fingerprint is derived,
-  /// and comparing it would be trusting the transport's own arithmetic about
-  /// the thing we are trying to verify.
+  /// Same key, reading [blob] and never [fingerprint].
+  ///
+  /// The two carry the same string under this transport, so the distinction
+  /// looks academic and is not: [fingerprint] is the field a UI displays and a
+  /// store round-trips for display, and a comparison that read it would let a
+  /// record whose display half was edited match a key it does not identify. One
+  /// field decides, and it is the one the pin is made of.
   bool sameKeyAs(SshHostKey other) =>
       algorithm == other.algorithm && blob == other.blob;
 
-  /// What a known_hosts line carries after the host name.
-  String get knownHostsKey => '$algorithm $blob';
-
   /// The persisted shape. The store must keep all three fields: the blob is
   /// what pins, the algorithm is part of the identity, and the fingerprint is
-  /// the only half a human can check.
+  /// the half a human can check.
   Map<String, Object?> toJson() => <String, Object?>{
         'algorithm': algorithm,
         'blob': blob,

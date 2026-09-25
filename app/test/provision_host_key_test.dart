@@ -244,7 +244,13 @@ void main() {
       );
     });
 
-    test('compares the key, not the fingerprint somebody computed for it', () {
+    test('the pin decides, and the field a screen displays does not', () {
+      // Under dartssh2 the two fields carry the same string -- the transport
+      // never exposes the wire blob, so a pin IS a fingerprint -- which is
+      // exactly why `sameKeyAs` has to read one nominated field rather than
+      // whichever happens to be there. `fingerprint` is round-tripped through
+      // the store for display; a comparison that read it would let a record
+      // whose display half was edited match a key it does not identify.
       const SshHostKey lying = SshHostKey(
         algorithm: 'ssh-ed25519',
         blob: 'AAAAsomethingelse',
@@ -252,6 +258,20 @@ void main() {
       );
       expect(lying.fingerprint, scriptedHostKey.fingerprint);
       expect(lying.sameKeyAs(scriptedHostKey), isFalse);
+    });
+
+    test('offers no known_hosts line, because it cannot build one', () {
+      // It used to offer `'$algorithm $blob'`, documented as "what a
+      // known_hosts line carries after the host name". With this transport the
+      // blob is the `SHA256:` fingerprint string, so that line was one no
+      // known_hosts could ever use -- and nothing called it, so nothing failed.
+      // A promise in a doc comment that no caller exercises is the kind that
+      // survives until somebody believes it.
+      expect(
+        scriptedHostKey.toJson().keys.toSet(),
+        <String>{'algorithm', 'blob', 'fingerprint'},
+      );
+      expect(scriptedHostKey.toString(), 'ssh-ed25519 ${scriptedHostKey.fingerprint}');
     });
   });
 }

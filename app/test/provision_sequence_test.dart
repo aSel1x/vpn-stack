@@ -288,10 +288,78 @@ void main() {
       // Everything after it assumed it happened. The firewall step in
       // particular: arming a deadman and enabling ufw on a box we are about to
       // abandon is the one thing worse than failing here.
-      expect(ssh.ran('provision-host.sh'), isFalse);
+      // By stage, not by script name: the clone program itself names
+      // provision-host.sh now, because it asserts the file is in the tree it
+      // fetched. The stages are what must not have run.
+      expect(ssh.ran('stage=base'), isFalse);
+      expect(ssh.ran('stage=code'), isFalse);
       expect(ssh.ran('setsid'), isFalse);
       expect(ssh.ran('ufw allow'), isFalse);
-      expect(ssh.ran('stage=code'), isFalse);
+      expect(ssh.ran('smoke.sh'), isFalse);
+    });
+
+    test('a ref with no provision-host.sh is refused at the clone, by name',
+        () async {
+      // What the app used to do instead: clone `main` -- which has no
+      // scripts/provision-host.sh, the script being a pure addition -- and then
+      // die on the host stage at exit 127, on a box whose apt and git had
+      // already been touched, with nothing naming the ref or the file. The
+      // clone step asserts the file is in the fetched tree, so the failure
+      // arrives before the box has been changed any further.
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      ssh.fail(
+        'git clone',
+        exitCode: 1,
+        stderr: 'this build of the app needs a server tree containing '
+            'scripts/provision-host.sh; ref v0.2.0 has none',
+      );
+
+      try {
+        await Provisioner(
+          config: config,
+          connector: ssh,
+          hostKeys: ssh.hostKeys,
+          clock: FakeClock(),
+        ).run();
+        fail('a tree that cannot serve this build must not be provisioned from');
+      } on ProvisionCommandError catch (error) {
+        expect(error.step, 'clone');
+        expect(error.what, contains('v0.2.0'));
+        expect(error.message, contains('scripts/provision-host.sh'));
+      }
+
+      // Nothing after it. The host stage is the step that would have failed
+      // with exit 127 and no explanation, and the firewall step is the one that
+      // must never run on a box about to be abandoned.
+      expect(ssh.ran('stage=base'), isFalse);
+      expect(ssh.ran('setsid'), isFalse);
+    });
+
+    test('a lock somebody else holds stops the run and says nothing ran',
+        () async {
+      // Every vpnctl call here passes `flock -E 75`, and this is why: without
+      // the translation an apply that never started arrives as "exited 75 and
+      // printed nothing", which sends somebody looking for a bug in vpnctl
+      // instead of waiting out the operator who is mid-apply.
+      final ScriptedSsh ssh = ScriptedSsh.bareUbuntu();
+      ssh.fail('vpnctl apply', exitCode: 75);
+
+      try {
+        await Provisioner(
+          config: config,
+          connector: ssh,
+          hostKeys: ssh.hostKeys,
+          clock: FakeClock(),
+        ).run();
+        fail('a lock conflict is not a converge that failed');
+      } on LockBusyError catch (error) {
+        expect(error.step, 'apply');
+        expect(error.lockPath, '/run/vpn-stack.lock');
+        expect(error.message, contains('never ran'));
+        expect(error.message, contains('Nothing on the server was changed'));
+      }
+      // And nothing after it believed the config was promoted.
+      expect(ssh.ran('served()'), isFalse);
       expect(ssh.ran('smoke.sh'), isFalse);
     });
 

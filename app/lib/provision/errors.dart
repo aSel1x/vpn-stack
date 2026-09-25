@@ -4,6 +4,11 @@
 //   transport      nothing ran, or we cannot know whether it did. Re-run.
 //   command        a remote program ran and refused. It already wrote the
 //                  sentence; showing anything else loses it.
+//   control        a `vpnctl --json` call answered something this app cannot
+//                  read. The control layer has already located it -- which
+//                  field, which schema -- so this only says which step asked.
+//   lock busy      another operator holds /run/vpn-stack.lock. Nothing ran, and
+//                  that is the whole difference from every other failure here.
 //   unsupported    this box is not one this sequence knows how to provision.
 //   already        the server has secrets or users. Re-running would mint new
 //                  ones and silently invalidate every profile handed out.
@@ -18,6 +23,8 @@
 // Host key failures are deliberately NOT in this family: they are raised by the
 // transport seam, which control/ uses too, and they carry no step. See
 // host_key.dart's sealed HostKeyError, whose toString() is the sentence itself.
+
+import '../control/errors.dart';
 
 sealed class ProvisionException implements Exception {
   const ProvisionException({required this.step, required this.message});
@@ -73,6 +80,61 @@ final class ProvisionCommandError extends ProvisionException {
 
   /// stdout and stderr together, as the remote produced them.
   final String output;
+}
+
+/// A `vpnctl --json` call came back unreadable, or vpnctl refused.
+///
+/// Its own class rather than a [ProvisionCommandError] built from the exit
+/// status, because the control layer has already written the sentence and it is
+/// located: which field, which row, which schema, which way to move. Deriving
+/// one from `exited 1` instead would throw all of that away, which is the
+/// failure `control/json.dart` exists to prevent one layer down.
+///
+/// Its existence is what keeps an unreadable answer from being an empty one.
+/// Provisioning once read the single `--json` answer it needed with a loose
+/// reader of its own and skipped every row that reader could not understand, so
+/// a shape it did not recognise at all produced an empty list and a step that
+/// reported success having done nothing.
+final class ProvisionControlError extends ProvisionException {
+  ProvisionControlError({
+    required super.step,
+    required this.what,
+    required this.cause,
+  }) : super(message: '$what: ${cause.message}');
+
+  /// What was being asked, in words: "asking which protocols are enabled".
+  final String what;
+
+  /// The located failure, whole, for a report. Its `argv` is the contract with
+  /// the server and belongs in every account of a broken one.
+  final VpnctlException cause;
+}
+
+/// Another operator holds the lock, so the command never ran.
+///
+/// Distinguishable at all only because every vpnctl invocation here passes
+/// `flock -E 75`: EX_TEMPFAIL is a status vpnctl itself cannot produce -- 1 is
+/// a refusal, 2 is argparse or the not-the-server guard, 127 is a missing shim.
+/// Without it this arrives as "exited 75 and printed nothing", which sends
+/// somebody looking for a bug in vpnctl, and the honest answer is that nothing
+/// happened and the same command will work in a minute.
+final class LockBusyError extends ProvisionException {
+  LockBusyError({
+    required super.step,
+    required this.what,
+    required this.lockPath,
+    required this.waited,
+  }) : super(
+          message: 'another operator holds $lockPath and had not released it '
+              'within ${waited.inSeconds}s, so $what never ran. Nothing on the '
+              'server was changed by this step. A `vpnctl apply` on a first '
+              'IKEv2 start legitimately takes minutes -- wait, then run this '
+              'again.',
+        );
+
+  final String what;
+  final String lockPath;
+  final Duration waited;
 }
 
 /// Not a Debian or Ubuntu box, not root, or otherwise outside what this

@@ -170,9 +170,13 @@ Future<void> installDocker(ProvisionContext ctx) async {
 /// working checkout from a laptop that a phone does not have.
 Future<void> cloneRepo(ProvisionContext ctx) async {
   ctx.progress('git clone ${ctx.config.repoUrl} (${ctx.config.repoRef})');
+  // The ref is in the `what`, because the failure this step now catches is
+  // about the ref and not about the clone: a tree with no
+  // scripts/provision-host.sh cannot serve this build of the app, and saying so
+  // here beats exit 127 on the host stage with apt and git already touched.
   final CommandResult result = await ctx.runChecked(
     cloneRepoCommand(ctx.config),
-    what: 'cloning ${ctx.config.repoUrl}',
+    what: 'cloning ${ctx.config.repoUrl} at ${ctx.config.repoRef}',
   );
   final String head = valueOf(result.stdout, 'head') ?? '';
   if (head.isNotEmpty) {
@@ -201,6 +205,10 @@ Future<void> prepareHost(ProvisionContext ctx) async {
 /// `vpnctl bootstrap`, and a keyring minted on a box we have locked ourselves
 /// out of is a server to rebuild rather than one to reconnect to.
 Future<void> bootstrapKeyring(ProvisionContext ctx) async {
+  // Not wrapped in a lock from here: the stage takes it itself, around its own
+  // `vpnctl bootstrap`. flock(1) inside flock(1) on the same path from a child
+  // process opens a second file description and blocks for ever, so the outer
+  // one would hang this step on a healthy box.
   await ctx.runChecked(
     hostCodeCommand(ctx.config),
     what: 'running ${ctx.config.hostScriptPath} code',
@@ -208,7 +216,7 @@ Future<void> bootstrapKeyring(ProvisionContext ctx) async {
   // The stage runs `vpnctl --help` itself, with uv's directory exported. This
   // runs the shim from a bare environment instead -- which is what systemd does
   // at boot, and where a shim that forgot its own PATH fails.
-  await ctx.runChecked(
+  await ctx.runVpnctl(
     vpnctlReadyCommand(ctx.config),
     what: 'checking vpnctl runs',
   );
@@ -221,7 +229,12 @@ Future<void> bootstrapKeyring(ProvisionContext ctx) async {
 
 /// Render, validate, converge.
 Future<void> applyConfig(ProvisionContext ctx) async {
-  await ctx.runChecked(applyCommand(ctx.config), what: 'rendering and converging');
+  await ctx.runVpnctl(
+    applyCommand(ctx.config),
+    what: 'rendering and converging',
+  );
+  // Not "it is serving": apply only *warns* when a port never bound and still
+  // returns ok. The readiness step decides that, from what is bound.
   ctx.progress('containers converged');
 }
 

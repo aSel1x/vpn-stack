@@ -113,6 +113,124 @@ void main() {
       expect(hostBaseCommand(plain).text, contains(r'[ -f "$script" ]'));
       expect(hostBaseCommand(plain).text, contains('exit 127'));
     });
+
+    test('the clone refuses a ref that does not contain it', () {
+      // `main` did not contain it -- provision-host.sh is a pure addition -- so
+      // a provision against a branch cloned perfectly and then died on the host
+      // stage at exit 127, on a box whose apt and git had already been touched.
+      // The clone is where that is knowable, so the clone is where it is said.
+      final String program = cloneRepoCommand(plain).text;
+      expect(program, contains(r'[ -f "$repo/$script" ]'));
+      expect(program, contains(r'ref $ref has none'));
+      expect(program, contains(r'containing $script'));
+      // Both halves have to be IN the message, not merely in the program: the
+      // sentence a person reads has to name which ref and which file.
+      expect(program, contains('script=scripts/provision-host.sh'));
+      expect(program, contains('ref=v0.2.0'));
+    });
+  });
+
+  group('the ref the app provisions from', () {
+    test('is a tag, not a branch', () {
+      // A branch means an app-provisioned server executes whatever was on it at
+      // that instant, unpinned and unsigned -- CLAUDE.md says so in as many
+      // words. A tag makes it a reviewed tree, and bumping this constant is how
+      // the app adopts a new one.
+      expect(plain.repoRef, 'v0.2.0');
+      expect(plain.repoRef, isNot('main'));
+      expect(cloneRepoCommand(plain).text, contains('ref=v0.2.0'));
+    });
+  });
+
+  group('every vpnctl invocation takes the lock', () {
+    // app/README.md: "a call that skips the lock is a bug even on the run where
+    // it works". vpnctl holds no lock of its own, so this is the whole of the
+    // multi-operator story, and provisioning ran three calls outside it while
+    // control/vpnctl.dart put every one of its own inside.
+    List<RemoteProgram> vpnctlPrograms() => <RemoteProgram>[
+          vpnctlReadyCommand(plain),
+          applyCommand(plain),
+        ];
+
+    test('under the same lock at the same path', () {
+      for (final RemoteProgram program in vpnctlPrograms()) {
+        expect(program.text, contains('/run/vpn-stack.lock'), reason: program.text);
+        expect(
+          program.text,
+          contains('flock -w 300 -E 75 /run/vpn-stack.lock'),
+          reason: program.text,
+        );
+      }
+    });
+
+    test('bounded, and with a status vpnctl itself cannot produce', () {
+      // `./vpn` blocks for ever; a phone with nothing on screen is
+      // indistinguishable from a crash. EX_TEMPFAIL is what makes "somebody
+      // else is mid-apply" different from 1 (a refusal), 2 (argparse or the
+      // guard) and 127 (a missing shim).
+      for (final RemoteProgram program in vpnctlPrograms()) {
+        expect(program.text, contains('-w 300'), reason: program.text);
+        expect(program.text, contains('-E 75'), reason: program.text);
+      }
+    });
+
+    test('carrying the handshake for the day vpnctl locks itself', () {
+      // install.sh and deploy.sh already set it. flock(1) inside flock(1) on
+      // the same path from a child process opens a second file description and
+      // blocks for ever, and an outer `-w` does not bound a child's wait -- so
+      // the call site that omits this is the one that deadlocks that day.
+      for (final RemoteProgram program in vpnctlPrograms()) {
+        expect(program.text, contains('VPN_STACK_LOCK_HELD=1'),
+            reason: program.text);
+      }
+    });
+
+    test('and provision-host.sh is NOT wrapped, because it locks internally', () {
+      // Its `code` stage runs `flock /run/vpn-stack.lock vpnctl bootstrap`
+      // itself. An outer flock on the same path would hang this on a healthy
+      // box, which is the deadlock the handshake above exists for.
+      expect(hostBaseCommand(plain).text, isNot(contains('flock')));
+      expect(hostCodeCommand(plain).text, isNot(contains('flock')));
+    });
+  });
+
+  group('the deadman', () {
+    test('reaps a predecessor rather than writing over its pid', () {
+      // The failing proof leaves its deadman armed on purpose and says to wait
+      // and retry. Somebody who retries inside the timeout arrives with an
+      // earlier timer still sleeping and its pid still in the file: run A armed
+      // 100, run B writes 200 over it, and whichever the disarm reads, the other
+      // wakes at its own T+180 and disables ufw -- possibly after this reported
+      // success. Measured against dash with a stubbed ufw: without the reap the
+      // first timer is still sleeping after the disarm.
+      final String program = armDeadmanCommand(plain).text;
+      expect(program, contains(r'kill -0 -"$old"'));
+      expect(program, contains(r'rm -f "$pidfile"'));
+      // Clearing the file also closes a read race: the wait loop only tests that
+      // it is non-empty, so a stale pid in it satisfies the loop and `armed=`
+      // would report the old timer instead of the new one.
+      expect(
+        program.indexOf(r'rm -f "$pidfile"'),
+        lessThan(program.indexOf('setsid')),
+      );
+      // Refused rather than signalled: a pid the previous run left behind may
+      // have been recycled, and this step is about to change the firewall on the
+      // box it would be signalling into.
+      expect(program, contains('still armed (process group'));
+      expect(program, isNot(contains(r'kill -TERM')));
+    });
+
+    test('says nothing a shell would expand in its own message', () {
+      // The refusal text goes through `echo "..."`, where backticks and $(...)
+      // run on the server -- and it names a pid, so it is built by
+      // interpolation. Nothing in it may be syntax.
+      final String program = armDeadmanCommand(plain).text;
+      final RegExp echoed = RegExp(r'echo "([^"]*)" >&2');
+      for (final RegExpMatch m in echoed.allMatches(program)) {
+        expect(m.group(1), isNot(contains('`')), reason: m.group(1));
+        expect(m.group(1), isNot(contains(r'$(')), reason: m.group(1));
+      }
+    });
   });
 
   group('values that mean something to a shell', () {
@@ -159,8 +277,10 @@ void main() {
       repoPath: '/opt/vpn stack',
       repoUrl: r'https://example.invalid/$USER/repo.git',
       repoRef: 'branch with space',
+      hostScript: 'scripts/provision host.sh',
       stateDir: '/etc/vpn stack',
       vpnctl: '/usr/local/bin/vpn ctl',
+      lockPath: '/run/vpn stack.lock',
       deadmanPidFile: '/run/vpn stack.deadman',
     );
 
@@ -177,7 +297,6 @@ void main() {
           hostCodeCommand(nasty),
           vpnctlReadyCommand(nasty),
           applyCommand(nasty),
-          protocolListCommand(nasty),
           smokeCommand(nasty),
           armDeadmanCommand(nasty),
           enableUfwCommand(nasty),
@@ -191,8 +310,10 @@ void main() {
         nasty.repoPath,
         nasty.repoUrl,
         nasty.repoRef,
+        nasty.hostScript,
         nasty.stateDir,
         nasty.vpnctl,
+        nasty.lockPath,
         nasty.deadmanPidFile,
       ];
       for (final RemoteProgram program in everyProgram()) {

@@ -68,11 +68,13 @@ CommandResult sshCommandResult({
 /// wire blob -- it is a local in `SSHTransport._handleMessageKexReply` and no
 /// public member exposes it. So `SshHostKey.sameKeyAs`, which compares the
 /// blob, is a SHA-256 comparison here rather than a comparison of the key
-/// itself. host_key.dart says a fingerprint is "the transport's own arithmetic
-/// about the thing we are trying to verify", and that is exactly what this is;
-/// the bound on it is that the same transport verified the host's signature
-/// over that same key moments earlier, so there is no third party left to
-/// disagree with. Anything stronger needs a different SSH library.
+/// itself. That is the arrangement host_key.dart's header describes and bounds:
+/// SHA-256 is second-preimage resistant, so "the same fingerprint" is "the same
+/// key" for anybody who cannot break it, and the party that computed it is the
+/// same transport that had just verified the host's signature over that same
+/// key -- there is no third party left to disagree with. What it costs is a pin
+/// nothing else can read: it is not a known_hosts line and cannot be made into
+/// one. Anything stronger needs a different SSH library.
 ///
 /// It is written as blob == fingerprint deliberately: a real wire blob can
 /// never equal the fingerprint string, so a stored pin from this transport is

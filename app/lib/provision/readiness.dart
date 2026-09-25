@@ -12,8 +12,8 @@
 // come up, and its ceiling is short. So the app waits again, longer, and fails
 // instead of warning.
 
-import 'dart:convert';
-
+import '../control/models.dart';
+import '../control/vpnctl.dart';
 import 'commands.dart';
 import 'errors.dart';
 import 'step.dart';
@@ -25,37 +25,29 @@ import 'ssh.dart';
 /// the server's state, and the port list belongs to the protocol registry in
 /// `vpnctl/protocols/`. A copy in Dart is the second definition this repository
 /// keeps refusing to have.
+///
+/// Asked through the control layer rather than parsed here, for the same
+/// reason one level down. This function used to decode the payload itself and
+/// skip any row it could not read -- so a shape it did not recognise produced
+/// an empty spec list, "no protocol is enabled, so there is nothing to wait
+/// for", and a readiness step that passed without waiting for anything. That is
+/// the exact failure mode `control/json.dart` was written to refuse: a
+/// half-read answer looks like it worked. `Vpnctl.listProtocols()` names the
+/// field it cannot read and this step fails on it.
 Future<List<String>> enabledPortSpecs(ProvisionContext ctx) async {
-  final CommandResult result = await ctx.runChecked(
-    protocolListCommand(ctx.config),
+  final List<ProtocolEntry> protocols = await ctx.control(
+    (Vpnctl vpnctl) => vpnctl.listProtocols(),
     what: 'asking which protocols are enabled',
   );
-  final Object? decoded = jsonDecode(result.stdout) as Object?;
-  if (decoded is! Map<String, Object?>) {
-    throw ProvisionCommandError(
-      step: ctx.stepName,
-      what: '`protocol list --json` did not answer with a JSON object',
-      exitCode: result.exitCode,
-      output: result.combined,
-    );
-  }
-  final Object? rows = decoded['protocols'];
-  if (rows is! List<Object?>) {
-    throw ProvisionCommandError(
-      step: ctx.stepName,
-      what: '`protocol list --json` has no `protocols` list',
-      exitCode: result.exitCode,
-      output: result.combined,
-    );
-  }
   final List<String> specs = <String>[];
-  for (final Object? row in rows) {
-    if (row is! Map<String, Object?>) continue;
-    if (row['enabled'] != true) continue;
-    final Object? ports = row['ports'];
-    if (ports is! List<Object?>) continue;
-    for (final Object? port in ports) {
-      if (port is String && !specs.contains(port)) specs.add(port);
+  for (final ProtocolEntry protocol in protocols) {
+    if (!protocol.enabled) continue;
+    for (final String spec in protocol.ports) {
+      // `protocols.assert_ports_disjoint` on the server means this cannot
+      // fire today. It stays because the wait below compares counts: a spec
+      // listed twice would be bound once and the wait could never finish,
+      // which is a timeout on a healthy server rather than a duplicate line.
+      if (!specs.contains(spec)) specs.add(spec);
     }
   }
   return specs;

@@ -177,8 +177,10 @@ void main() {
       }
     });
 
-    test('a payload too big to show is truncated in the message, not lost',
-        () async {
+    test('a payload too big to show is described, not shown', () async {
+      // A base64 client bundle is hundreds of kilobytes. The length is the one
+      // fact about it worth reporting -- it is how a truncated bundle is
+      // recognised -- and the bytes are how a credential reaches a bug report.
       final String filler = 'A' * 5000;
       final String huge = '{"schema": 1, "ok": true, "users": "$filler"}';
       final FakeSsh ssh = FakeSsh.replying(huge);
@@ -187,8 +189,9 @@ void main() {
         fail('expected a protocol error');
       } on VpnctlProtocolError catch (e) {
         expect(e.raw.length, greaterThan(5000));
-        expect(e.message, contains('truncated'));
-        expect(e.message.length, lessThan(2000));
+        expect(e.message, contains('string(5000)'));
+        expect(e.message, isNot(contains(filler)));
+        expect(e.message.length, lessThan(500));
       }
     });
 
@@ -267,6 +270,164 @@ void main() {
             'reason',
             contains('users: expected a list, got a number'))),
       );
+    });
+  });
+
+  group('messages are safe to log', () {
+    // The message is what somebody selects, copies and pastes into a bug report
+    // -- and a schema error is precisely the failure whose remedy is "tell the
+    // author what the server said", so it is the one that gets pasted. Building
+    // it from the payload's bytes therefore published a credential every time,
+    // because `user export`'s payload BEGINS with a working VLESS URI. Same
+    // stance as share_uri.dart, which refuses a link without echoing it.
+
+    /// An export payload with one field of the wrong type: parseable enough to
+    /// reach the models, broken enough to be refused there.
+    String brokenExport() => exportJson.replaceFirst(
+        '"label": "VLESS + REALITY",', '"label": 5,');
+
+    const String uuid = '6f1d2c3b-4a59-4e87-9c10-2b7f5d0e8a41';
+
+    test('no refusal over an export payload echoes the uuid or the bundles',
+        () async {
+      try {
+        await Vpnctl(FakeSsh.replying(brokenExport())).exportUser('kate');
+        fail('expected a protocol error');
+      } on VpnctlProtocolError catch (e) {
+        expect(e.message, isNot(contains(uuid)));
+        expect(e.message, isNot(contains('vless://')));
+        // The .p12 has an empty password, so its bytes ARE the access.
+        expect(e.message, isNot(contains('PD94bWw=')));
+        // dnstt's settings are a form of plaintext fields, so the shape has to
+        // hide those values too and not only the ones that look like keys.
+        expect(e.message, isNot(contains('Qx7yPlum2zRt')));
+      }
+    });
+
+    test('a schema refusal over an export payload echoes nothing either',
+        () async {
+      // The named case: a server that grew a key refuses the export BY NAME,
+      // and it is the refusal whose remedy is "update the app" -- so it is the
+      // one somebody screenshots. Both schema paths build their message through
+      // the same describer as a plain protocol error, which is why neither can
+      // carry the URI.
+      final String grown = exportJson.replaceFirst(
+          '"label": "VLESS + REALITY",',
+          '"label": "VLESS + REALITY", "wireguard_uri": "wg://x",');
+      try {
+        await Vpnctl(FakeSsh.replying(grown)).exportUser('kate');
+        fail('expected a schema error');
+      } on VpnctlSchemaError catch (e) {
+        expect(e.unknownField, 'wireguard_uri');
+        expect(e.message, contains('update the app'));
+        expect(e.message, isNot(contains(uuid)));
+        expect(e.message, isNot(contains('vless://')));
+      }
+
+      try {
+        await Vpnctl(FakeSsh.replying(exportJson.replaceFirst(
+                '"schema": 1', '"schema": 2')))
+            .exportUser('kate');
+        fail('expected a schema error');
+      } on VpnctlSchemaError catch (e) {
+        expect(e.serverSchema, 2);
+        expect(e.message, isNot(contains(uuid)));
+        expect(e.message, isNot(contains('vless://')));
+      }
+    });
+
+    test('but the shape is still there, so the report says what changed',
+        () async {
+      try {
+        await Vpnctl(FakeSsh.replying(brokenExport())).exportUser('kate');
+        fail('expected a protocol error');
+      } on VpnctlProtocolError catch (e) {
+        expect(e.reason, contains('label'));
+        // Key names are the contract with the server and are not secrets.
+        expect(e.message, contains('protocols'));
+        expect(e.message, contains('vless-reality'));
+        expect(e.message, contains('png_b64'));
+      }
+    });
+
+    test('raw keeps the payload whole, for a caller that needs the bytes',
+        () async {
+      // Redacting the exception as well as the message would mean a screen that
+      // wanted to show the payload behind a deliberate tap could not.
+      try {
+        await Vpnctl(FakeSsh.replying(brokenExport())).exportUser('kate');
+        fail('expected a protocol error');
+      } on VpnctlProtocolError catch (e) {
+        expect(e.raw, contains(uuid));
+      }
+    });
+
+    test('a credential in user list --show-secrets is not echoed either',
+        () async {
+      final String payload = userListSecretsJson
+          .replaceFirst('"enabled": true,', '"enabled": "yes",');
+      try {
+        await Vpnctl(FakeSsh.replying(payload)).listUsers(showSecrets: true);
+        fail('expected a protocol error');
+      } on VpnctlProtocolError catch (e) {
+        expect(e.message, isNot(contains('4f9c1e2a7b3d8055c6a1e4f70b2d9a13')));
+        expect(e.message, isNot(contains(uuid)));
+        expect(e.message, contains('hysteria2_password: string(32)'));
+      }
+    });
+
+    test('a payload that arrived damaged is described, not quoted', () async {
+      // Under --json the payload is one JSON object, so everything before its
+      // opening brace is an MOTD or a wrapper and everything from there on is
+      // payload. A truncated export answer does not parse AND begins with a
+      // live URI, which is why the second half is never shown.
+      final String cut =
+          brokenExport().trim().substring(0, 220);
+      try {
+        await Vpnctl(FakeSsh.replying(cut)).exportUser('kate');
+        fail('expected a protocol error');
+      } on VpnctlProtocolError catch (e) {
+        expect(e.message, isNot(contains(uuid)));
+        expect(e.message, isNot(contains('vless://')));
+        expect(e.message, contains('not shown'));
+        expect(e.raw, contains(uuid));
+      }
+    });
+
+    test('an MOTD in front of the payload is still shown, because that is the '
+        'diagnosis', () async {
+      // The reason this layer refuses to scavenge for JSON inside other output:
+      // something speaking over vpnctl is a real failure and the text is the
+      // only thing that names it.
+      const String motd = 'Welcome to Ubuntu 24.04.1 LTS\n';
+      final FakeSsh ssh = FakeSsh.replying('$motd$exportJson');
+      try {
+        await Vpnctl(ssh).exportUser('kate');
+        fail('expected a protocol error');
+      } on VpnctlProtocolError catch (e) {
+        expect(e.message, contains('Welcome to Ubuntu'));
+        expect(e.message, isNot(contains(uuid)));
+      }
+    });
+
+    test('a non-zero exit with a damaged payload on stdout is not quoted either',
+        () async {
+      // The other message built from stdout. An argparse usage error or a
+      // missing shim never claimed to be answering in JSON, so its text is
+      // shown -- but a payload that failed to parse is still a payload.
+      final FakeSsh ssh = FakeSsh.replying(
+        brokenExport().trim().substring(0, 220),
+        exitCode: 1,
+        stderr: 'warning: ikev2 container is not running',
+      );
+      try {
+        await Vpnctl(ssh).exportUser('kate');
+        fail('expected a refusal');
+      } on VpnctlCommandError catch (e) {
+        expect(e.error, contains('ikev2 container is not running'));
+        expect(e.message, isNot(contains(uuid)));
+        expect(e.message, isNot(contains('vless://')));
+      }
     });
   });
 

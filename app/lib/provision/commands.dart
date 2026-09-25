@@ -28,6 +28,7 @@
 //      variable on its own line and the body uses `"$var"`.
 
 import '../control/shell.dart';
+import '../control/vpnctl.dart' show lockConflictExit;
 import 'config.dart';
 
 /// A value that is safe to splice into shell program text, because the only way
@@ -180,20 +181,36 @@ const RemoteProgram _installDockerProgram = RemoteProgram._(_installDocker);
 RemoteProgram installDockerCommand() => _installDockerProgram;
 
 // git is the clone's own prerequisite, so it is installed here rather than in a
-// step of its own. `checkout --force -B` rather than `reset --hard`: a shallow
-// fetch leaves the branch ref behind, and a stale ref is how a deploy lands an
-// older tree than the one asked for.
+// step of its own.
+//
+// `checkout --force --detach FETCH_HEAD` rather than `reset --hard`, and rather
+// than the `-B "$ref"` it used to be. A shallow fetch leaves the ref it fetched
+// behind and a stale ref is how a deploy lands an older tree than the one asked
+// for -- but the ref here is a TAG, and checking a tag out as a branch of the
+// same name leaves refs/heads/v0.2.0 beside refs/tags/v0.2.0, which makes every
+// later `git rev-parse v0.2.0` on that box ambiguous. Detaching leaves no branch
+// to go stale and no name to collide, and it is the state a fresh
+// `clone --depth 1 --branch <tag>` produces anyway, so both halves of this `if`
+// end the same way.
+//
+// The existence check at the end is not belt and braces. `main` had no
+// scripts/provision-host.sh -- the script is a pure addition -- so a provision
+// against a branch cloned perfectly and then died on the host stage at exit 127,
+// with apt and git already touched and nothing naming the ref or the file. A
+// tree that cannot serve this build of the app is a fact the clone knows, so the
+// clone is where it is said.
 const String _cloneRepo = r'''
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 repo=@PATH@
 url=@URL@
 ref=@REF@
+script=@SCRIPT@
 command -v git >/dev/null 2>&1 || { apt-get update -qq || true; apt-get install -y -qq git; }
 if [ -d "$repo/.git" ]; then
   git -C "$repo" remote set-url origin "$url"
   git -C "$repo" fetch --depth 1 origin "$ref"
-  git -C "$repo" checkout -q --force -B "$ref" FETCH_HEAD
+  git -C "$repo" checkout -q --force --detach FETCH_HEAD
 elif [ -d "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
   echo "$repo exists and is not a git checkout (an rsynced tree from the CLI path?); move it aside and re-run" >&2
   exit 1
@@ -201,6 +218,7 @@ else
   mkdir -p "$repo"
   git clone -q --depth 1 --branch "$ref" "$url" "$repo"
 fi
+[ -f "$repo/$script" ] || { echo "this build of the app needs a server tree containing $script; ref $ref has none" >&2; exit 1; }
 head=$(git -C "$repo" rev-parse --short HEAD)
 echo "head=$head"
 ''';
@@ -210,6 +228,7 @@ RemoteProgram cloneRepoCommand(ProvisionConfig config) =>
       '@PATH@': ShellArg(config.repoPath),
       '@URL@': ShellArg(config.repoUrl),
       '@REF@': ShellArg(config.repoRef),
+      '@SCRIPT@': ShellArg(config.hostScript),
     });
 
 // The server-local half, run from the checkout, one stage per call.
@@ -259,27 +278,75 @@ RemoteProgram hostCodeCommand(ProvisionConfig config) =>
       '@ARG@': ShellArg(config.repoPath),
     });
 
+// Every vpnctl invocation this layer sends goes through the lock, exactly as
+// `./vpn`'s remote(), install.sh, deploy.sh, provision-host.sh's own bootstrap
+// and the boot unit do. vpnctl takes no lock of its own, so this is the whole of
+// the multi-operator story, and app/README.md is flat about it: a call that
+// skips the lock is a bug even on the run where it works. The race is not
+// hypothetical -- two processes rendering candidate trees over each other is the
+// one thing the atomic promote downstream cannot save you from, because both
+// halves are valid and merely come from different inputs.
+//
+// `-w` and `-E 75` where the shell call sites use a bare `flock`: a phone
+// blocking for ever with nothing on screen is indistinguishable from a crash,
+// and EX_TEMPFAIL is a status vpnctl itself cannot produce -- 1 for a refusal, 2
+// for argparse or the not-the-server guard, 127 for a missing shim -- so
+// "somebody else is mid-apply" stays distinguishable from every real failure.
+// ProvisionContext.runVpnctl translates it.
+//
+// VPN_STACK_LOCK_HELD is the handshake install.sh and deploy.sh already set, for
+// the day vpnctl takes the lock itself: flock(1) inside flock(1) on the same
+// path from a child process opens a second file description and blocks for ever
+// (measured on this stack), and an outer `-w` does not bound a child's wait. Set
+// here so the app is not the one call site left to deadlock on that day.
+//
+// `env` rather than a bare `VAR=1 cmd` prefix: the same list is then valid as an
+// argv and as a shell word, so nothing here depends on which of the two a
+// caller happens to want.
+List<String> _lockedVpnctl(ProvisionConfig config, List<String> command) =>
+    <String>[
+      'env',
+      'VPN_STACK_LOCK_HELD=1',
+      'flock',
+      '-w',
+      '${config.lockWait.inSeconds}',
+      '-E',
+      '$lockConflictExit',
+      config.lockPath,
+      config.vpnctl,
+      ...command,
+    ];
+
+/// The shim from a bare environment, which is where one that forgot its own
+/// PATH fails -- and, incidentally, the first call that would notice a box with
+/// no `flock`, by name, instead of letting `apply` be the one that dies on it.
 RemoteProgram vpnctlReadyCommand(ProvisionConfig config) => _fill(
       r'@ARGV@ >/dev/null',
       <String, ShellArg>{
-        '@ARGV@': ShellArg.words(<String>[config.vpnctl, '--help']),
+        '@ARGV@': ShellArg.words(_lockedVpnctl(config, <String>['--help'])),
       },
     );
 
+/// Render, validate, promote, converge.
+///
+/// The payload is not read here. This layer verifies by observing what is bound
+/// afterwards, which is the stronger check: `apply` only *warns* when a port
+/// never came up and still returns ok, so believing its receipt is how a server
+/// that is not serving passes a readiness step.
 RemoteProgram applyCommand(ProvisionConfig config) => _fill(
       r'@ARGV@',
       <String, ShellArg>{
-        '@ARGV@': ShellArg.words(<String>[config.vpnctl, 'apply', '--json']),
+        '@ARGV@':
+            ShellArg.words(_lockedVpnctl(config, <String>['apply', '--json'])),
       },
     );
 
-RemoteProgram protocolListCommand(ProvisionConfig config) => _fill(
-      r'@ARGV@',
-      <String, ShellArg>{
-        '@ARGV@':
-            ShellArg.words(<String>[config.vpnctl, '--json', 'protocol', 'list']),
-      },
-    );
+// There is deliberately no `protocol list` program here. That answer is parsed,
+// and the strict parser already exists one layer over: readiness asks through
+// `Vpnctl.listProtocols()`, which refuses a row it cannot read BY NAME. The
+// loose copy that used to live here skipped any row it could not understand, so
+// "nothing parsed" became "nothing is enabled" and the readiness wait reported
+// success without waiting for anything.
 
 const String _smoke = r'''
 set -eu
@@ -292,6 +359,28 @@ RemoteProgram smokeCommand(ProvisionConfig config) =>
 
 // ufw is checked before the deadman is armed: a deadman whose body is
 // `ufw --force disable` is not a safety net on a box with no ufw.
+//
+// A live predecessor is refused, never written over, and this is the sharp edge
+// of the whole step. The failing proof leaves its deadman armed ON PURPOSE and
+// tells the operator to wait and try again; somebody who reconnects in thirty
+// seconds and taps retry arrives here with an earlier timer still sleeping and
+// its pid still in the file. Run A armed pid 100, run B's subshell writes 200
+// over the same path -- and whichever of the two the disarm reads, the other
+// wakes at its own T+180 and runs `ufw --force disable`, possibly minutes after
+// this reported success. An unattended firewall-off is meant to be the ONE
+// thing this net causes. Measured with a stubbed ufw under dash: without this
+// block the earlier timer is still sleeping after a successful disarm. Clearing
+// the file when nothing is alive closes a second race in the same place -- the
+// wait loop below only tests that the file is non-empty, so a stale pid
+// satisfies it and `armed=` reports the old timer instead of the new one.
+//
+// Refused rather than killed, which is where this and provision-host.sh's
+// deadman_arm deliberately differ. A pid in a file the previous run did not
+// clean up may have been recycled by the kernel, and signalling a process group
+// we did not create -- on a box whose firewall is about to change -- is a worse
+// accident than stopping. There is also nothing to recover: the timer switches
+// ufw off by itself, which is the entire contract, so waiting is the fix and the
+// message says so.
 //
 // The subshell records its OWN pid. `$!` is unreliable because setsid forks
 // when the caller is already a process-group leader, and setsid also makes the
@@ -307,6 +396,14 @@ set -eu
 pidfile=@PID@
 ttl=@TTL@
 command -v ufw >/dev/null 2>&1 || { echo "ufw is not installed; the host step was supposed to install it" >&2; exit 1; }
+if [ -s "$pidfile" ]; then
+  old=$(tr -dc '0-9' < "$pidfile")
+  if [ -n "$old" ] && { kill -0 -"$old" 2>/dev/null || kill -0 "$old" 2>/dev/null; }; then
+    echo "a deadman from an earlier run is still armed (process group $old). It disables ufw by itself when its timer expires, and arming a second one on top of it leaves whichever this run does not record to fire later on a healthy server. Wait for it to expire and try again, or stop that process group from a console." >&2
+    exit 1
+  fi
+  rm -f "$pidfile"
+fi
 setsid sh -c 'echo $$ > "$1"
               sleep "$2"
               ufw --force disable
