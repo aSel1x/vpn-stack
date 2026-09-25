@@ -9,22 +9,22 @@ Researched 2026-09-16 against Apple's own pages. The App Store Review Guidelines
 date at all, so "current" for those means "served on 2026-09-16" and nothing stronger. Apple
 moves these without notice — re-read §3 before acting on it, because that is the expensive one.
 
-The Apple half of this document held up under an adversarial check. **The half about this
-repository did not**, and §0, §1, §3, §4, §5 and §7 are rewritten here against the tree as it stood on
-2026-09-16: an iOS tunnel exists in Swift, and the earlier claim that none did was false in five
-places. Two dates, two confidences — do not read the repository claims below as carrying the Apple
-citations' weight.
-
-One thing about that tree is unusual enough to say once, here. The iOS Swift, the scripts under
-`app/tool/` and the workflow jobs described below are in the **working tree and not yet committed**
-on `app`; a clone of the branch today gets the older shape, in which none of them exist. Where the
-difference changes what somebody should do, it is said at that point.
+The Apple half of this document held up under an adversarial check. **The half about this repository
+has been wrong twice**, in the same direction both times: one draft said there was no iOS tunnel in
+Swift at all, and the draft after it said the Swift, the scripts under `app/tool/` and the workflow
+jobs were uncommitted work in somebody's working tree that a clone of the branch would not get.
+Neither is true now, and the second stopped being true through ordinary commits — `git ls-files
+app/ios app/tool` lists 44 files and 4. Two dates and two confidences: the Apple claims below are
+citations, the repository claims are checked against the tree as it stands, and the repository half
+is the one to re-check with a command rather than by reading. Two commands do most of it:
+`bash app/tool/check_extension.sh sources` and `ruby app/tool/ios_project.rb --check`.
 
 ## The decision, before the detail
 
 1. **Nothing in this repository can be uploaded to App Store Connect.** The `.ipa` CI produces is
-   unsigned by design (`.github/workflows/app.yml:13`), and App Store Connect takes distribution-
-   signed builds only. Every artifact from the App ID onward is created under somebody's paid
+   unsigned by design — `.github/workflows/app.yml`'s header says "NOTHING HERE IS SIGNED, and that
+   is the intended end state, not a TODO" — and App Store Connect takes distribution-signed builds
+   only. Every artifact from the App ID onward is created under somebody's paid
    membership, on their Mac, and cannot be produced here.
 2. **Internal TestFlight needs no Beta App Review.** Verified below from Apple's build-status
    table rather than repeated from folklore. Up to 100 testers, each of whom must be a user on
@@ -36,48 +36,57 @@ difference changes what somebody should do, it is said at that point.
    That is quoted verbatim in §3. Whether a *beta* reviewer enforces the organization clause is
    **not documented by Apple and I could not establish it.** It is the fact this plan turns on:
    if it is enforced, external TestFlight costs a legal entity with a D-U-N-S number.
-5. **A TestFlight build today would still not tunnel — and the reason is not the one this
-   document first gave.** The iOS tunnel is written: 1,538 lines of Swift under
-   `app/packages/singbox_tunnel/ios/`, including a real `NEPacketTunnelProvider` subclass
-   (`Extension/PacketTunnelProvider.swift:37`) and the `NETunnelProviderManager` the app drives it
-   through (`Classes/SingboxTunnelPlugin.swift:383`). What is missing is narrower and sharper: the
-   Xcode extension **target** that alone can compile `Extension/`, a committed `app/ios/` to hold
-   that target (`.gitignore:40` still excludes the directory), and the wiring at
-   `app/lib/main.dart:75`, which hands every non-Android platform `UnimplementedTunnel()`. So the
-   UI a tester would get still cannot connect — an App Review 2.1 problem the moment anybody
-   reviews it — and on top of that **none of that Swift has ever been through a compiler**. That is
-   §7.1, and it is the largest unknown in the whole document about the code.
+5. **Nothing this repository still owes is what blocks a TestFlight build. A paid membership
+   enrolled as an organization is.** The iOS tunnel is written, committed and compiled: 2,343 lines
+   of Swift under `app/packages/singbox_tunnel/ios/`, a real `NEPacketTunnelProvider` subclass, the
+   `NETunnelProviderManager` the app drives it through, an extension **target** committed in
+   `app/ios/Runner.xcodeproj/project.pbxproj`, and `app/lib/main.dart` handing iOS the real engine —
+   the stub arm is desktop only. What no machine here can produce is a signature: two App IDs
+   carrying the Network Extensions capability, an App Group registered against that team, and a
+   provisioning profile for each, all created under a membership. §5 is the order.
+6. **Nothing in this layer has ever run.** The Swift compiles and links against a real
+   `Libbox.xcframework` on a macOS runner, and that is the whole of what CI can prove: zero packets
+   have crossed it, no device and no simulator has launched the extension, and `.appex` entitlements
+   are validated against a provisioning profile at *install* time, which has never happened. That is
+   §7.1, and it is the largest unknown in this document about the code.
 
 Read §5 for the order of operations. Read §7 for everything I could not verify.
 
 ## 0. What this repository can hand over
 
-Line numbers into the *jobs* of `.github/workflows/app.yml` are deliberately absent below: that
-file is being edited as this is written and they would be stale within the hour. Job names are
-stable, and so is the header comment at `:13`.
+Line numbers into the *jobs* of `.github/workflows/app.yml` are deliberately absent below: that file
+moves, and a line number into it is stale the next time somebody adds a step. Job names are stable,
+and so is the header comment — which is where the "nothing is signed" sentence quoted below lives,
+not at any particular line of it.
 
 | thing | where | state |
 | --- | --- | --- |
-| Dart source, tests, analysis | `app/` | green — 216 tests, `flutter analyze --fatal-infos` clean |
+| Dart source, tests, analysis | `app/` | green — 288 tests in `app/`, 38 in `app/packages/singbox_tunnel`, `flutter analyze` clean with infos and warnings fatal |
 | Android tunnel (Kotlin + libbox) | `app/packages/singbox_tunnel/android/` | real, and compiled on every push |
 | unsigned `.ipa` | the `ios` job | `flutter build ios --release --no-codesign`, `Runner.app` zipped under `Payload/` |
-| iOS tunnel, app half | `…/singbox_tunnel/ios/Classes/SingboxTunnelPlugin.swift`, 498 lines | written; never compiled |
-| iOS tunnel, extension half | `…/singbox_tunnel/ios/Extension/` — `PacketTunnelProvider.swift` 247, `LibboxPlatform.swift` 580 | written; never compiled |
-| what both processes read | `…/singbox_tunnel/ios/Shared/`, 213 lines | written; never compiled |
-| the Xcode project spec | `…/singbox_tunnel/ios/README.md` | every identifier, entitlement and Info.plist key, as values |
+| iOS tunnel, app half | `…/singbox_tunnel/ios/Classes/SingboxTunnelPlugin.swift`, 801 lines | committed; compiled and linked on a macOS runner |
+| iOS tunnel, extension half | `…/singbox_tunnel/ios/Extension/` — `PacketTunnelProvider.swift` 376, `LibboxPlatform.swift` 859 | committed; compiled and linked into `SingboxTunnel.appex` |
+| what both processes read | `…/singbox_tunnel/ios/Shared/`, 307 lines | committed; compiled twice, once into each target |
+| the extension **target** | `app/ios/Runner.xcodeproj/project.pbxproj` | committed; written by `app/tool/ios_project.rb` and re-asserted by its `--check` |
+| the identifiers everything must agree on | `app/tool/ios_identifiers.sh` | one definition; `app/tool/check_extension.sh` asserts the tree against it |
+| the Xcode project spec, in prose | `…/singbox_tunnel/ios/README.md` | every identifier, entitlement and Info.plist key, as values |
 | `Libbox.xcframework` | built by the `libbox_apple` job; `…/ios/.gitignore` keeps it out of the tree | a build artifact, on purpose |
-| the extension **target** | `app/tool/ios_project.rb`, run by the `ios_project` job | in flight; never run |
-| committed `app/ios/` | nowhere — `.gitignore:40` still excludes it | the blocker everything else waits on |
+| a distribution certificate, two App IDs, an App Group, two profiles | nowhere — nothing here can create one | the blocker everything else waits on |
 
-The workflow says it out loud at `.github/workflows/app.yml:13`: "NOTHING HERE IS SIGNED, and that
-is the intended end state, not a TODO." That artifact exists to prove the iOS target compiles. It
-installs on no device, and it cannot be uploaded.
+The workflow says it out loud in its header: "NOTHING HERE IS SIGNED, and that is the intended end
+state, not a TODO." That artifact exists to prove the iOS target compiles. It installs on no device,
+and it cannot be uploaded.
 
-It is also not being produced right now. The `ios` job's first step refuses a tree with no
-`app/ios/Runner.xcodeproj/project.pbxproj` and prints how to make one, which is the correct
-behaviour and a red build: a stock one-target Flutter project compiles clean, links no libbox,
-contains no provider, and wraps into a perfectly valid `.ipa` that cannot tunnel — a failure that
-looks exactly like success until somebody signs and installs it.
+It *is* being produced on every push. The `ios` job builds the committed project and generates
+nothing — there is no `flutter create` in it — and it asserts the project before it spends an SDK:
+`project.pbxproj` must mention `com.apple.product-type.app-extension`, the extension bundle
+identifier and `Libbox.xcframework`; `ruby tool/ios_project.rb --check` must find the committed
+project still identical in every setting to what the generator writes; and after the build
+`tool/check_extension.sh` must find `Runner.app/PlugIns/SingboxTunnel.appex` with an executable in
+it and an **expanded** `NSExtensionPrincipalClass` of `SingboxTunnel.PacketTunnelProvider`. Every
+one of those exists because the failure here looks like success: a stock one-target Flutter project
+compiles clean, links no libbox, contains no provider, and wraps into a perfectly valid `.ipa` that
+cannot tunnel — indistinguishable from a real one until somebody signs and installs it.
 
 ## 1. Can an unsigned `.ipa` go to App Store Connect / TestFlight?
 
@@ -133,9 +142,9 @@ Mechanically an `.ipa` can be unzipped, given an `embedded.mobileprovision` and 
 Apple documents no such flow, and it buys nothing here — for a reason that outlives the extension
 target landing, which is why it is worth spelling out rather than repeating.
 
-Today the CI `.app` contains no packet tunnel extension, so a re-signed result is a UI with no VPN.
-Once `app/ios/` is committed it will contain one, and `app/tool/check_extension.sh` fails the build
-if it does not. Re-signing *then* means signing the `.appex` with its **own** provisioning profile
+The CI `.app` does contain a packet tunnel extension now — `app/tool/check_extension.sh` fails the
+build if it does not — which removes the shallowest objection and leaves the real one. Re-signing
+means signing the `.appex` with its **own** provisioning profile
 carrying the Network Extension entitlement and the App Group, signing the app with a second, and
 embedding both — every one of those artifacts created under the paid membership, and `codesign`
 itself runs on macOS only. The machine that could re-sign it is the machine that could have built
@@ -231,8 +240,10 @@ of them, in source:
 - **The `NEVPNManager` API requirement — met.** `NETunnelProviderManager`'s superclass is
   `NEVPNManager`
   ([NETunnelProviderManager](https://developer.apple.com/documentation/networkextension/netunnelprovidermanager)),
-  and `Classes/SingboxTunnelPlugin.swift` loads, configures and saves one
-  (`loadAllFromPreferences` at `:383`). Met in source and not in a running build — §7.1.
+  and `Classes/SingboxTunnelPlugin.swift` loads, configures, saves and — since the app stopped
+  leaving a profile behind that it told the person it had deleted — *removes* one, through
+  `loadAllFromPreferences` and `removeFromPreferences`. Met in compiled source and never in a
+  running build: no `NETunnelProviderManager` here has ever saved a configuration on a device — §7.1.
 - **A data-collection declaration screen shown *before* any use of the service — absent.** There is
   no such screen under `app/lib/ui/`, and it is a screen somebody has to design, not a checkbox.
 - **A privacy policy committing to no third-party disclosure — absent**, and not a code change at
@@ -295,10 +306,47 @@ covered by the same guideline's last sentence.
 | requirement | value | self-serve on a paid account? |
 | --- | --- | --- |
 | Network Extensions capability | enabled on both App IDs | **yes** — Account Holder or Admin ticks it in Certificates, Identifiers & Profiles, or Xcode's Signing & Capabilities does it |
-| `com.apple.developer.networking.networkextension` | array containing `packet-tunnel-provider` | yes, comes with the capability |
+| `com.apple.developer.networking.networkextension` | array containing `packet-tunnel-provider`, on both targets | yes, comes with the capability |
 | extension `NSExtensionPointIdentifier` | `com.apple.networkextension.packet-tunnel` | n/a — Info.plist |
-| App Group (`com.apple.security.application-groups`) | `group.<something>` registered on the developer site | **yes**, and available even to free accounts |
+| App Group (`com.apple.security.application-groups`) | `group.io.github.asel1x.vpnStackApp`, registered on the developer site | **yes**, and available even to free accounts |
 | Personal VPN (`NEVPNManager` built-in protocols) | not needed here | yes, but irrelevant — sing-box is a custom protocol, so packet tunnel |
+
+**Register these exact strings.** They are not placeholders and they are not spread around the
+tree: `app/tool/ios_identifiers.sh` is their single definition, `app/tool/ios_project.rb` writes
+them into `app/ios/`, and `app/tool/check_extension.sh` asserts what was written.
+
+| what | value |
+| --- | --- |
+| app bundle identifier (App ID #1) | `io.github.asel1x.vpnStackApp` |
+| extension bundle identifier (App ID #2) | `io.github.asel1x.vpnStackApp.SingboxTunnel` |
+| App Group | `group.io.github.asel1x.vpnStackApp` |
+| extension target and Swift module | `SingboxTunnel`, principal class `$(PRODUCT_MODULE_NAME).PacketTunnelProvider` |
+| deployment target, all six configurations | `15.0` |
+
+The extension identifier is the app's plus **exactly one** component: iOS refuses to install an
+extension whose identifier is not a prefix-extension of its container app's, at install time, with
+no useful text, and two components deeper is the same refusal. The App Group appears in four places
+that iOS compares at *runtime* and no compiler compares at all — both entitlements files, and the
+`SingboxTunnelAppGroup` key in each Info.plist, which `Shared/SharedContainer.swift` reads out of
+the running bundle rather than from baked-in Swift, because those values belong to whoever owns the
+Apple account. Changing the app bundle identifier means re-registering an App ID and an App Group,
+so it is not a rename anybody does casually.
+
+Before trusting any of that, and after any change on either side, two commands answer in seconds
+whether the tree still agrees with what was registered:
+
+```
+bash app/tool/check_extension.sh sources    # plain awk and grep; runs anywhere
+ruby app/tool/ios_project.rb --check        # opens the .xcodeproj; needs the xcodeproj gem,
+                                            # which arrives with CocoaPods, so: on the Mac
+```
+
+The first prints one line per assertion and reports every mismatch rather than stopping at the
+first, because these values are derived from one another and one wrong identifier usually breaks
+three of them. The second compares every setting in the committed project against the tables the
+generator writes from — `app/ios/` is a committed *generated* artefact, which is the shape that
+drifts from its generator silently, on settings whose only symptom is a build that succeeds and a
+tunnel that does not start.
 
 - **Network Extensions is not available on a free Apple ID.** Apple's capability matrix marks it for
   Apple Developer Program and Apple Developer Enterprise Program members only, blank for the free
@@ -328,13 +376,13 @@ covered by the same guideline's last sentence.
 - **Per-app VPN mode requires a managed device** (TN3134). Not wanted here; whole-device tunnel is
   the default.
 
-### What is missing in this tree before any of that matters
+### What this tree still owes, and what it stopped owing
 
-This is where the first draft of this document was wrong, and the corrections are stated as
-corrections because somebody may have read that draft: it said there was no `Libbox.xcframework`
-job, no extension target and **no Swift**. The last of those was flatly false. What is missing is
-narrower than "the iOS tunnel", and every item on the list is a build-system fact rather than an
-unwritten feature.
+Two drafts of this document were wrong here and the corrections are stated as corrections, because
+somebody may have read either. The first said there was no `Libbox.xcframework` job, no extension
+target and **no Swift**; the last of those was flatly false. The second said the target was "in
+flight" and the committed project the blocker everything waited on; both landed. What is left on
+this side of the fence is not a feature and not a file — it is that none of it has run.
 
 - **`Libbox.xcframework` is not in the tree, and is not meant to be — but CI builds it.** sing-box
   builds it: `make lib_apple` at v1.14.0 runs `build_libbox -target apple`, gomobile-binding
@@ -350,31 +398,37 @@ unwritten feature.
   trip. The earlier claim — "the existing `libbox` job builds the Android `.aar` on Ubuntu and
   cannot produce this" — described the only job that existed when it was written; the `.aar`
   sentence is still true and the conclusion is not.
-- **The packet tunnel extension target — in flight, never run.** `flutter create --platforms=ios`
-  generates a single `Runner` target, and a CocoaPods pod is linked only into the targets the
-  Podfile names, which is `Runner` and nothing else. That is why `singbox_tunnel.podspec` ships
-  `Classes/` and `Shared/` and deliberately **not** `Extension/`: compiling the provider into the
-  app would leave the only target that can run it without it. So nothing in a stock project can own
-  `Extension/`, and the decision this document said was unmade is now made — `app/tool/ios_project.rb`
-  writes the target over a freshly generated project (extension bundle identifier
-  `io.github.asel1x.vpnStackApp.SingboxTunnel`, both entitlements files, the App Group, the
-  framework search path, the Embed App Extensions phase), and the `ios_project` job runs it on
-  manual dispatch and uploads `app/ios/` for a human to commit. It has never been run: it fires
-  only on a deliberate `workflow_dispatch` with `regenerate_ios_project=true`, and the workflow
-  that carries it is not pushed yet.
-- **A committed `app/ios/` — the actual blocker.** `.gitignore:40` still excludes the directory, and
-  `app/README.md:188` still states the rule that platform code cannot live there because
-  `flutter create` regenerates it. Committing `app/ios/` contradicts that rule for iOS and for
-  nothing else, and it is a change to what ships, not a detail — which is why the regeneration job
-  is manual and uploads an artifact instead of writing the tree.
-- **The Dart wiring.** `app/lib/main.dart:75` gives every non-Android platform
-  `UnimplementedTunnel()`, which reports failure naming the platform and never reports connected.
-  Deliberate — a stub that showed "Connected" would be indistinguishable from a working app — but
-  it means a signed iOS build made today would show the UI and never call the plugin.
-- **What is NOT missing**: `Classes/`, `Extension/` and `Shared/` — 1,538 lines of Swift, written
-  against sing-box v1.14.0's libbox API read at that tag, with `…/ios/README.md` as the spec for
-  the Xcode project, naming every identifier, entitlement key and Info.plist key as a value rather
-  than a shape to invent.
+- **The packet tunnel extension target — written, run, and committed.** `flutter create
+  --platforms=ios` generates a single `Runner` target, and a CocoaPods pod is linked only into the
+  targets the Podfile names, which is `Runner` and nothing else. That is why
+  `singbox_tunnel.podspec` ships `Classes/` and `Shared/` and deliberately **not** `Extension/`:
+  compiling the provider into the app would leave the only target that can run it without it. So
+  nothing in a stock project can own `Extension/`, and `app/tool/ios_project.rb` is what does —
+  bundle identifiers, both entitlements files, the App Group, the framework search path, and the
+  Embed App Extensions phase, written over a freshly generated project. It has been run: a macOS
+  runner generated the project, built it, and uploaded it as the `ios-project` artifact, which is
+  what `app/ios/` in the tree now is. Regeneration is not a dispatch button — there is none, for a
+  workflow outside the default branch — it is deleting `app/ios/` and pushing.
+- **A committed `app/ios/` — done, and the rule it bends is written down where the exclusion used
+  to be.** `.gitignore` no longer excludes the directory; it carries a comment there saying the
+  directory is committed and why, and `app/README.md` states the exception rather than the old
+  blanket rule. The reason is narrow and does not generalise to the other four platform
+  directories: an app extension is a second target with its own bundle identifier, entitlements and
+  App Group, and `flutter create` preserves none of that.
+- **The Dart wiring — done.** `app/lib/main.dart` hands `SingboxTunnel` to Android *and* iOS and
+  `UnimplementedTunnel()` to the desktop platforms, where there is no engine yet. That file also
+  used to carry twenty lines arguing that iOS was deliberately not wired, directly above the line
+  that wired it; three reviewers tripped over it independently, which is what a stale comment at a
+  composition root costs.
+- **What is NOT missing**: `Classes/`, `Extension/` and `Shared/` — 2,343 lines of Swift, written
+  against sing-box v1.14.0's libbox API read at that tag, with `…/ios/README.md` as the spec for the
+  Xcode project, naming every identifier, entitlement key and Info.plist key as a value rather than
+  a shape to invent. `app/tool/ios_identifiers.sh` is now the single definition of those
+  identifiers, and `app/tool/check_extension.sh sources` compares the four places that must agree
+  about them — both Info.plist keys, both entitlements files, the extension's bundle identifier and
+  the generator's own tables — with awk and grep, on ubuntu-latest, in about two seconds. A mismatch
+  there is a sandbox denial at the first connect with no build-time symptom, so on a target no
+  device has ever run that comparison is the cheapest available substitute for a device.
 
 ## 5. Division of labour
 
@@ -387,10 +441,10 @@ this order — except step 6, which is this repository's and is kept in the tabl
 | --- | --- | --- | --- |
 | 1 | Get a Mac running **Xcode 26 or later**. Not optional and not rentable around: signing and upload both happen there. | colleague | n/a |
 | 2 | Enrol in the Apple Developer Program (99 USD/yr). The enroller becomes Account Holder. | colleague | **yes**, for steps 1-10 |
-| 3 | Register two App IDs — app and tunnel extension — and tick **Network Extensions** and **App Groups** on both. Register the app group. | Account Holder or Admin | yes |
+| 3 | Register two App IDs — `io.github.asel1x.vpnStackApp` and `io.github.asel1x.vpnStackApp.SingboxTunnel` — and tick **Network Extensions** and **App Groups** on both. Register the app group `group.io.github.asel1x.vpnStackApp`. The strings are §4's table, and `app/tool/ios_identifiers.sh` is where the tree keeps them — `bash app/tool/check_extension.sh sources` prints what the tree expects, in two seconds, so it can be read against what was registered. Both App IDs need a provisioning profile too (step 7's automatic signing will create them), because the workflow builds `--no-codesign` on purpose and that `.ipa` installs nowhere. | Account Holder or Admin | yes |
 | 4 | Create the `Apple Distribution` certificate (or let Xcode automatic signing do it). | **Account Holder or Admin only** | yes |
 | 5 | Create the app record in App Store Connect with the app's bundle ID. Bundle ID is permanent after the first upload. | Account Holder, Admin, App Manager | yes |
-| 6 | **Not the colleague's work, and the row stays to correct an earlier draft that said it was.** The `NEPacketTunnelProvider` subclass, the 27-method libbox `PlatformInterface` behind it and the app-side `NETunnelProviderManager` are written and in this repository. `Libbox.xcframework` is built by CI's `libbox_apple` job, not on that Mac. What is genuinely left — the extension target (`app/tool/ios_project.rb`, in flight), committing `app/ios/`, and wiring `main.dart` — is also this repository's, and none of it needs an Apple account. What it does need is the one thing nobody here has: a build. | this repository | n/a |
+| 6 | **Not the colleague's work, and the row stays to correct two earlier drafts that said parts of it were.** The `NEPacketTunnelProvider` subclass, the 27-method libbox `PlatformInterface` behind it, the app-side `NETunnelProviderManager`, the extension target in `app/ios/` and the Dart wiring are written, committed and compiled here; `Libbox.xcframework` is built by CI's `libbox_apple` job, not on that Mac. Nothing on this list waits on an Apple account. What it waits on is a device, which is step 10 — see §7.1. | this repository | n/a |
 | 7 | Archive in Xcode, `Distribute App` → `TestFlight & App Store`, automatic signing, upload. | Account Holder, Admin, App Manager, Developer | yes |
 | 8 | Answer the export compliance questions, or the build sits at `Missing Compliance` and nobody can install it. | Account Holder, Admin, App Manager | yes |
 | 9 | Create an internal group; invite the testers — each must first be added as an App Store Connect user (up to 50 extra on an individual account). | Account Holder, Admin, App Manager, Developer, Marketing | yes |
@@ -423,43 +477,56 @@ minimum for a tunnel that runs at all; that is what the capability matrix in §4
 
 ## 7. What I could not verify
 
-1. **None of the iOS Swift has ever been compiled. Still true as this is written.** The largest
-   unknown about the *code*, as §7.2 is the largest unknown about the *plan* — and unlike §7.2 it
-   is not unknowable, only unmeasured. 1,538 lines across `Classes/`, `Extension/` and `Shared/`
-   were written by somebody with no macOS and no Xcode, reading sing-box v1.14.0's Go source and
-   Apple's documentation. Nothing has type-checked them.
+1. **None of the iOS Swift has ever RUN. It has been compiled, and that is a different claim.**
+   The earlier version of this item said zero lines had been through a compiler; that stopped being
+   true the moment `app/ios/` existed, and what the compiler found is the reason to be exact about
+   it. Three commits are each a real build on a macOS runner, and each found a defect that four
+   rounds of reading had not:
 
-   Two mechanisms that would compile them are in the working tree, and **neither has run**.
-   Declaring `ios:` in `app/packages/singbox_tunnel/pubspec.yaml` is what puts `Classes/` and
-   `Shared/` in front of a compiler at all — until that line existed, CI's `ios` job built an app
-   with no plugin in it — and `app/tool/ios_project.rb` plus the `ios_project` job would compile
-   `Extension/` into a real target and link it against `Libbox.xcframework`. The push-triggered
-   `ios` job cannot do either today: it refuses a tree with no committed `app/ios/`, and there is
-   none. The count as of writing is zero lines compiled.
+   - *"Commit the Xcode project, and fix the four errors the first real compile found"* — four
+     errors, every one about a name **gomobile chooses** rather than a name in sing-box's Go source.
+     `usePlatformAutoDetectInterfaceControl` and `autoDetectInterfaceControl` do not exist in the
+     Apple binding; they are `usePlatformAutoDetectControl` and `autoDetectControl`, while the
+     Android binding of the same Go interface keeps `Interface` in both. And `NWPath` is ambiguous —
+     Network.framework has one and so does Libbox, and the extension imports both — qualified in
+     three places. Those are exactly the symbol-name risk this item used to name as the largest in
+     the Swift, and it was real.
+   - *"Link UIKit into the extension, because libbox reaches for UIApplication"* — the Swift
+     compiled, and the extension then failed to LINK on `_OBJC_CLASS_$_UIApplication` and
+     `_UIBackgroundTaskInvalid`. Neither appears anywhere in this repository's Swift: they come out
+     of libbox's own Apple binding, and an app extension links no UIKit by default. `-framework
+     UIKit` and `-lresolv` sit in `OTHER_LDFLAGS` in the committed project and in the generator, so
+     a regeneration does not reintroduce it.
+   - *"Embed the extension before Thin Binary, or the build graph has a cycle"* — "Cycle inside
+     Runner": the copy of `SingboxTunnel.appex` depended on Flutter's Thin Binary script, which
+     reached `ExtractAppIntentsMetadata`, which reached the `[CP] Embed Pods Frameworks` phase
+     CocoaPods appends *after* ours, which reached back to the copy.
 
-   When that changes, be exact about what it buys. It would prove: the Swift parses and
-   type-checks against the real SDK; the libbox Objective-C symbol names this was written against
-   are the ones `Libbox.xcframework` actually exports — the single largest risk in that Swift, since
-   they were derived from Go source and cross-checked only against the Android side, which is the
-   only compiled evidence a machine without Xcode has; that the extension target produces
-   `PlugIns/SingboxTunnel.appex` with an executable in it; and that its `Info.plist` carries
-   `com.apple.networkextension.packet-tunnel` and an **expanded**
-   `SingboxTunnel.PacketTunnelProvider` principal class, which `app/tool/check_extension.sh`
-   asserts against the built bundle rather than the source plist.
+   What that buys is worth stating exactly, because it is less than it sounds and more than
+   nothing. The Swift type-checks against the real SDK; the libbox Objective-C symbol names it was
+   written against are the ones `Libbox.xcframework` exports, which was the single largest risk in
+   that code since they were derived from Go source and cross-checked only against the Android
+   binding; and `check_extension.sh` asserts, against the BUILT bundle rather than the source plist,
+   that `PlugIns/SingboxTunnel.appex` exists with an executable in it, declares
+   `com.apple.networkextension.packet-tunnel`, and names an **expanded**
+   `SingboxTunnel.PacketTunnelProvider` as its principal class.
 
-   It would prove nothing whatever about the tunnel working. Nothing runs: no device, no simulator,
-   no signing. So the entitlements are never validated against a provisioning profile, the App
-   Group container is never opened, `NETunnelProviderManager` never saves a configuration, the
-   system approval sheet is never raised, and the two undocumented routes to the utun file
-   descriptor — KVC on `packetFlow`'s private `socket.fileDescriptor`, falling back to
-   `LibboxGetTunnelFileDescriptor()` — are precisely the kind of thing that compiles and then
+   It proves nothing whatever about the tunnel working, and that is what to budget for. Nothing has
+   run: no device, no simulator, no signing. So the entitlements are never validated against a
+   provisioning profile, the App Group container is never opened, `NETunnelProviderManager` never
+   saves a configuration, the system approval sheet is never raised, and the two undocumented routes
+   to the utun file descriptor — KVC on `packetFlow`'s private `socket.fileDescriptor`, falling back
+   to `LibboxGetTunnelFileDescriptor()` — are precisely the kind of thing that compiles and then
    returns nothing on a real phone. **The first genuine test of this code is a signed build on a
    device**, which is step 7 of §5 at the earliest and in practice step 10, when a tester installs
-   it. Budget for the iOS tunnel needing real debugging at that point, on the colleague's Mac —
-   and note what that debugging looks like: when a packet-tunnel provider refuses to start, iOS
-   hands the app an `NEVPNStatus` of "disconnected" with no error and no text, which is why the
-   extension writes its own reason into the App Group container
-   (`…/singbox_tunnel/ios/README.md` documents the status file and the rules that read it).
+   it. Budget for the iOS tunnel needing real debugging at that point, on the colleague's Mac — and
+   note what that debugging looks like: when a packet-tunnel provider refuses to start, iOS hands
+   the app an `NEVPNStatus` of "disconnected" with no error and no text, which is why the extension
+   writes its own reason into the App Group container, and why a start this process issued for which
+   no status record exists now reports *that* — the extension did not launch, or could not open the
+   App Group container, which on a target that has never been signed is the most likely failure of
+   all and has no build-time symptom (`…/singbox_tunnel/ios/README.md` documents the status file and
+   the rules that read it).
 2. **Whether Beta App Review enforces 5.4's organization clause.** The central unknown, and
    **the single fact this plan turns on**. Apple publishes no scope for beta review; guideline 2.2
    points the whole guidelines document at beta builds. Everything else about Apple here is
@@ -470,10 +537,12 @@ minimum for a tunnel that runs at all; that is what the capability matrix in §4
    confirm either way for the beta path.
 4. **The exact upload error for an unsigned `.ipa`.** Requirement documented, error codes
    (`ITMS-90035`/`ITMS-90034`) are forum-sourced, not Apple documentation.
-5. **Anything requiring a Mac.** No macOS, no Xcode, no Apple account was available: no step here
-   has been executed. `make lib_apple`, the extension target, automatic signing and the upload are
-   read off Apple's and sing-box's documentation and source, not performed. This is the general
-   form of item 1, and item 1 is its expensive special case.
+5. **Anything requiring an Apple *account*.** No macOS and no Apple account was available to
+   whoever wrote this: what has since been executed was executed by CI's macOS runners, which is
+   `make lib_apple`, generating the extension target, and building it. Everything gated on a
+   membership — automatic signing, provisioning profiles, the archive, the upload — is still read
+   off Apple's documentation and not performed, by anybody, anywhere in this project. Item 1 is the
+   expensive special case: a build is not a run.
 6. **Whether Apple's account tooling refuses a VPN app record on an individual account.** Nothing in
    the help pages says so, and the capability matrix is keyed on program membership rather than
    entity type — but "documentation does not mention a block" is not "there is no block".

@@ -109,11 +109,41 @@ dnstt.env               SSH_PORT, SOCKS_EXIT, PERMIT_OPEN
 ```
 
 `logins` holds one line per **enabled** user who has a `dnstt_password`. `dnstt-sshd/entrypoint.sh`
-reads it at container start, creates the accounts, and writes `/etc/ssh/sshd_config` itself. So
-`/etc/passwd` inside that container is a function of `users.json`, rebuilt from it every time, and a
-name that has dropped out of the list has no account to log into. The transport stays shared; the
-login does not. The repository records this as verified: after a `user disable`, that person's own
-password was refused while everyone else's still worked.
+reads it at container start, validates the whole list before it touches a single account, creates the
+accounts, asserts each one's membership of the `tunnel` group, and writes `/etc/ssh/sshd_config`
+itself. So `/etc/passwd` inside that container is a function of `users.json`, rebuilt from it every
+time, and a name that has dropped out of the list has no account to log into. The transport stays
+shared; the login does not. The repository records this as verified: after a `user disable`, that
+person's own password was refused while everyone else's still worked.
+
+Three things in that entrypoint are there because their absence cost something, and all three are
+about the same gap — `user add` validates what it writes, while the entrypoint is handed whatever a
+hand edit, a restore of an older backup or a rolled-back tree left in the file.
+
+**The list is validated whole, and a list this container cannot serve faithfully is refused rather
+than served partially.** A name that collides with an account the base image ships used to skip the
+`adduser`, and with it the `-G tunnel` grant that `AllowGroups` tests, while the `chpasswd` that
+followed ran anyway — setting *that system account's* password to the person's dnstt password.
+Measured against the old file: a user named `mail` came out with a real hash in `/etc/shadow`, a group
+list of `mail` alone, and no way in. The image snapshots its own accounts at build time into
+`/etc/dnstt-sshd.reserved`, because once the writable layer has been written to, `/etc/passwd` cannot
+tell a baked-in system account from an account a previous start of the same container created — and
+that difference decides whether a name is a collision to refuse or a login to reuse. A leading `-`
+(which `adduser` would read as an option, and which `users_store.validate_name`'s character class
+lets through), a character outside `[A-Za-z0-9._-]`, a name over 32 characters, a duplicate record
+and an empty password field are refused on the same footing, each naming the record to fix.
+`users_store.validate_name` rejects the same reserved names at `user add`, which is where the fix
+belongs; this is the depth behind it.
+
+**Group membership is asserted on every start, not assumed.** `adduser -G` grants it only on the run
+that creates the account, so a plain `docker restart` — a reboot, a `dockerd` restart — re-ran the
+loop against accounts that already existed and sshd then refused every login while logging nothing
+that named the cause.
+
+**The password never reaches an argv.** `printf` is a shell builtin, so no process is spawned to carry
+it, and `chpasswd` takes the pair from the pipe; 200 sampled iterations against `ps -o args` produced
+zero hits. The confirmation `chpasswd` prints names the user only, so the container log is a record of
+which logins were set this start and carries no secret.
 
 The same shape appears elsewhere in the stack — IKEv2 certificates are reconciled against the enabled
 user list on every apply rather than remembered — and the principle is the same. Derive the live state
@@ -123,15 +153,19 @@ from the database; do not trust a record of what you once did.
 
 This is the part worth copying, and the part that bit.
 
-The entrypoint only ever **adds**. Line 36 of `dnstt-sshd/entrypoint.sh`:
+The entrypoint only ever **adds**. The account loop is the second of its two passes over the login
+list (`dnstt-sshd/entrypoint.sh:131`), and the whole of its account creation is:
 
 ```sh
 id "$name" >/dev/null 2>&1 || adduser -D -H -G "$GROUP" -s /bin/sh "$name"
 ```
 
-There is no `deluser` anywhere in that script, and that is deliberate — the file says so in its own
-header. Its correctness rests entirely on the container being **new**: `/etc/passwd` resets with the
-container, so a login that dropped out of the rendered list is gone with nothing to clean up.
+`grep -n 'deluser\|userdel' dnstt-sshd/entrypoint.sh` returns nothing, and that is deliberate — the
+file says so in its own header. Everything the rewrite above added validates, asserts or refuses;
+none of it deletes.
+
+Its correctness rests entirely on the container being **new**: `/etc/passwd` resets with the container,
+so a login that dropped out of the rendered list is gone with nothing to clean up.
 
 `vpnctl/composectl.py` decides how each rendered path reaches the process that consumes it. The table
 is hand-written, because `docker compose config` can answer only half of it:
@@ -167,8 +201,12 @@ second test that asserts the argv rather than the parse, because the flag *is* t
 ### Reproducing the bypass, in about ten minutes
 
 That the revoked account still authenticates is not a deduction. It was reproduced during review of
-the change, and re-run against this tree on **2026-09-11** (Docker 29.6.2, the `alpine:3.20` base the
-`dnstt-sshd` image is built from) to produce the output quoted below. Nothing here needs a state
+the change, and re-run on **2026-09-11** (Docker 29.6.2, the `alpine:3.20` base the `dnstt-sshd` image
+is built from) to produce the output quoted below. `entrypoint.sh` has been rewritten since that run
+— it validates the whole list first, asserts group membership on every start and refuses a reserved
+name — and none of that touches the mechanism under test: the recipe's two names pass validation, and
+nothing added deletes an account. The quoted lines are from the earlier run; re-run it rather than
+trusting that sentence. Nothing here needs a state
 directory, a DNS zone, `vpnctl`, or a server: the whole mechanism lives in one container's writable
 layer, so a throwaway container built from this repository's own `dnstt-sshd/Dockerfile` and
 `entrypoint.sh` is the entire apparatus. `docker restart` stands in for `docker compose restart`, and
@@ -239,7 +277,8 @@ doubt, recreate.
 
 iOS clients for this path (HTTP Injector, AnyBridge, in mode `DNSTT → SSH`) run SSH on top of the
 tunnel, so dnstt has to hand the decoded stream to an sshd. It hands it to `127.0.0.1:2222`, which is
-an Alpine container with `openssh-server` and nothing mounted, not the host's sshd.
+an Alpine container with `openssh-server`, nothing mounted but its host-key volume and the read-only
+login list, and not the host's sshd.
 
 On the host, the same feature would be a real account in `/etc/passwd` plus an edit to
 `/etc/ssh/sshd_config`. Neither is captured by `vpn backup`, which tars the state directory and the
@@ -256,10 +295,13 @@ this container, that would be often.
 The generated config is narrow in every direction except one:
 
 ```
+Port 2222                          # SSH_PORT, from the rendered dnstt.env
 ListenAddress 127.0.0.1            # the tunnel is the only route in
+HostKey /host-keys/ssh_host_ed25519_key
 PermitRootLogin no
 AllowGroups tunnel
 PasswordAuthentication yes
+KbdInteractiveAuthentication no
 AllowTcpForwarding yes             # the entire point of the login
 AllowAgentForwarding no
 X11Forwarding no
@@ -271,12 +313,22 @@ Match Group tunnel
 
 It also refuses to start with an empty login list (`login list is empty -- add a user, or turn dnstt
 off`), rather than running an sshd nobody can log into, which would look healthy and answer nothing.
+That is the last line of defence and not the first: `dnstt.render` raises rather than emit an empty
+list, so the operator meets one sentence at `apply` time — before the candidate tree is promoted —
+instead of a crash-loop. Safe to raise on, unlike the missing zone, because every route out of it
+writes `users.json` before it applies (`user add`, `user enable`, setting `dnstt_password` by hand)
+and `protocol off dnstt` does not render dnstt at all, so the refusal cannot block its own fix.
+
+`sshd` runs as `sshd -D -e`, so everything it has to say — which logins were set this start, every
+`Accepted password`, every destination `PermitOpen` refused — goes to stderr and therefore to
+`docker logs dnstt-sshd`. None of it appears in the host's `/var/log/auth.log`; the host's sshd never
+sees these sessions.
 
 ## `PermitOpen any`, and why a list is not a workable alternative
 
 These clients use SSH **dynamic** forwarding. Every site is a fresh destination, which means no fixed
 list can match. That is not a deduction from the protocol; the server's own log proved it twice, in
-two steps. Both excerpts below are quoted from `dnstt/SETUP.md` §4, variant B, which is where this
+two steps. Both excerpts below are quoted from `dnstt/SETUP.md` §4, which is where this
 deployment recorded them when it happened; they are not reconstructed here.
 
 With only the SOCKS exit permitted, every session died at its first name lookup, having never touched
@@ -334,7 +386,14 @@ serves goes with it. The same is already true of IKEv2, where recreating the con
 Cisco IPsec and IKEv2 sessions alike. It is the price of deriving `/etc/passwd` from the database, and
 it is the right side of the trade: the alternative is the revocation bug above. An `apply` that changes
 nothing — every deploy, every boot — bounces nothing, because `changed_services` diffs the promoted
-tree against the candidate first.
+tree against the candidate first. The one thing that diff cannot see is a tree that was promoted and
+then *not* converged, since the next render is byte-identical to it and diffs to nothing; so `apply`
+writes `converge_pending` into `state.json` immediately after the symlink swap and lifts it only when
+the readiness wait passed, because a port that never bound means the convergence did not finish. (A
+teardown or firewall failure does not hold it down: neither is a claim that the containers are running
+the wrong tree.) Without that mark, a `composectl.up` that died part-way left the operator's retry
+rendering the same tree, bouncing nothing, passing the port wait because the *old* containers still
+held the ports, and printing "config unchanged; nothing restarted" then "OK." — with `smoke.sh` green.
 
 **A user predating the field gets no login, loudly.** `users.json` grew `dnstt_password` after dnstt
 was already shared, so a record created before that has none. `render` emits no line for that person
@@ -368,13 +427,33 @@ tun.example.net.      NS   ns-tun.example.net.
 ```
 
 `dig +short NS tun.example.net` confirms it, then
-`echo 'VPN_DNSTT_ZONE=tun.example.net' >> /etc/vpn-stack/.env`. Two details: `compose.yml` uses the
+`echo 'VPN_DNSTT_ZONE=tun.example.net' >> /etc/vpn-stack/.env`. `compose.yml` uses the
 bare `${VPN_DNSTT_ZONE}` form and **not** `${VPN_DNSTT_ZONE:?}`, because on Compose v5.3.1 the `:?`
 form fails *project load* even with dnstt's profile inactive — which would break every compose command
 on a server where dnstt is merely switched off. And dnstt binds `${VPN_SERVER_HOST}:53` explicitly,
 never wildcard `:53`, because `systemd-resolved` already holds `127.0.0.53:53`. For the same reason
 "bound" means bound on a non-loopback address in both `composectl` and `scripts/smoke.sh`: substring
 -matching the port number reports `53/udp` as served on any stock Ubuntu.
+
+Two consequences of that bare form, and both were paid for. **An unset variable does not arrive as an
+empty string; the argument drops out of the command entirely**, so a container recreated on a box whose
+`.env` never gained the variable runs `dnstt-server` with no zone at all — it binds 53/udp, `docker ps`
+says running, both loopback back-ends are up, and it answers for nothing a client can resolve.
+`render` only warns about that, deliberately: raising bricked a server once, taking `apply`, `user
+add`, `deploy` and the boot unit down together after `protocol on dnstt` had already written
+`state.json`, and the boot unit has no stderr anybody reads. So `scripts/smoke.sh` grew a check named
+`dnstt_zone` that reads the running container's argv — not `.env`, because the question is what this
+process is serving — and *parses* it rather than indexing it: `cmd[-2]` looks right and is the trap,
+since a dropped zone makes argv one shorter and `cmd[-2]` becomes the `-privkey-file` value,
+`/keys/server.key`, which has a dot in it and passes any domain-shaped test.
+
+And the two readers have to agree on the same bytes. `vpnctl/dotenv.py` now strips one matching pair
+of wrapping quotes, as compose does, plus a leading `export`. Before that,
+`VPN_DNSTT_ZONE="tun.example.net"` handed the container `tun.example.net` and every share link the
+literal `"tun.example.net"`, a zone no resolver answers for, with nothing reporting the mismatch. A
+trailing comment is deliberately *not* stripped, because compose does not strip one either — and
+`scripts/provision-host.sh`, which writes the commented `#VPN_DNSTT_ZONE=` hint into that file, says
+so where it writes it.
 
 **The Noise keypair is produced at enable time, not at install.** `prepare()` builds the Go image and
 runs `dnstt-server -gen-key`, because the key format is the binary's own. Doing that in `bootstrap`
@@ -408,14 +487,36 @@ applied by a `write_bytes()` then `chmod()` pair, which would leave a private ke
 for the width of a syscall; the `chmod` that follows is still there, because `O_CREAT`'s mode argument
 is itself masked by the umask and the explicit call is not.
 
-**The three dnstt services are built from unpinned upstreams.** `dnstt/Dockerfile` does
-`go install …/dnstt-server@latest`, `dnstt-socks/Dockerfile` does `git clone --depth 1` of microsocks
-and builds it, and both images plus `dnstt-sshd` sit on an `alpine:3.20` base whose `apk` packages
-float. None of that is pinned the way the two *pulled* images are — `sing-box` by tag,
-`hwdsl2/ipsec-vpn-server` by digest — while `composectl.up` passes `--build`, so an upstream change
-lands on the next `apply`, on a live server, with nothing recording what the previous build was.
-`CLAUDE.md` names this as a live instance of the hazard its own pinning paragraph is about, rather than
-as a resolved question. It is the weakest point in this protocol's supply chain and it is not fixed.
+**The three dnstt images are built here, and every input they fetch is pinned.** This was the weakest
+point in the protocol's supply chain: `dnstt/Dockerfile` did `go install …/dnstt-server@latest`,
+`dnstt-socks/Dockerfile` did `git clone --depth 1` of whatever microsocks' HEAD happened to be, and all
+three floated on `alpine:3.20` and `golang:1.23-alpine`. `composectl.up` passes `--build`, and `apply`
+runs from `user add`, `user rm`, `protocol on`, `protocol off`, `deploy` and the `vpn-stack.service`
+boot unit — so each of those was a re-resolution of upstream on a live server at a moment nobody chose,
+unattended, at boot, whenever the BuildKit cache missed, with nothing recording what the previous build
+was. That is the same class of accident the candidate tree in `apply` exists to prevent, and it was the
+one hole left in it.
+
+What they are pinned to lives in each Dockerfile as an `ARG` with a default, because these are built
+and not pulled and so have no `image:` tag to pin: `DNSTT_VERSION=v1.20260501.0`; microsocks by
+`MICROSOCKS_VERSION` **and** `MICROSOCKS_COMMIT`, where the clone asks for the tag and then asserts the
+sha, so a moved tag fails the build loudly rather than substituting something else; and both base
+images by multi-arch index digest, so the pin still resolves on a server of another architecture. Each
+image carries the same values as `org.opencontainers.image` labels, so
+`docker inspect dnstt-server:latest` answers "what is actually running" on a box whose checkout has
+since moved. `compose.yml` deliberately
+does not restate any of it — `scripts/check.sh` reads sing-box's tag out of `compose.yml` precisely so
+that one version is not written twice, and copying these up would recreate the drift that rule exists
+to prevent. What still moves is `openssh` inside the `alpine:3.20` branch: the digest fixes the base
+filesystem, not `apk`'s view of the network.
+
+The same change stripped these three down to what they each need. `dnstt-socks` runs as uid 10300 with
+an empty capability set and a read-only rootfs — it binds one high loopback port and opens outbound
+sockets, and needs nothing else. `dnstt-server` keeps `NET_BIND_SERVICE` and nothing else, because it
+binds udp/53 in the host's namespace, and its filesystem is read-only: a public-facing parser on udp/53
+should not be able to leave anything behind in its own filesystem. `dnstt-sshd` keeps root and a
+writable filesystem, and that is argued rather than assumed — rewriting `/etc/passwd`, `/etc/shadow`
+and `/etc/group` from the rendered list on every start is the entire revocation story above.
 
 Settings for a client are a form, not a link. DNSTT-over-SSH has no URI scheme and nothing to scan, so
 `share()` emits `fields` rather than a `uri` — they were crammed into a `uri` once, and every layer
@@ -498,9 +599,15 @@ Named here rather than buried, because this is the honest part of the report.
   run end to end through a real dnstt tunnel from a phone, and it does not need to be: the bug is in
   the container's writable layer, which the tunnel never touches. But that is the scope — the recipe
   demonstrates the revocation failure, not a full client path.
-- **The crash-loop case.** Reading the code rather than a measurement: with dnstt on and every user
-  disabled or lacking a password, `logins` renders empty, the entrypoint exits 1, and `restart: always`
-  retries it. `wait_ready` watches `53/udp` for dnstt, not the sshd's loopback `2222`, so `apply` would
-  report success while the sshd restarted. Not observed on a live box.
+- **The crash-loop case.** Reading the code rather than a measurement, and it is now three refusals
+  deep rather than one. With dnstt on and every user disabled or lacking a password, `dnstt.render`
+  raises before the candidate tree is promoted; were a hand-written or restored `logins` to be empty
+  anyway, the entrypoint exits 1 under `restart: always`. What that used to reach was a blind spot:
+  `wait_ready` watches `53/udp` for dnstt and not the sshd's loopback `2222`, so `apply` reported
+  success while the sshd restarted forever. `composectl.not_running` now answers which expected
+  services are not running — with `None` kept distinct from the empty list, because "docker could not
+  tell" is not a clean bill of health — `dnstt-sshd` and `dnstt-socks` carry healthchecks, and
+  `scripts/smoke.sh` asserts both loopback binds plus a restart count sampled twice. None of that has
+  been watched happening on a live box.
 - **Everything attributed to one ISP.** One subscriber line, 2026-09-08, one hosting location. Repeat it
   with `scripts/diagnose-ikev2.sh` before treating any of it as general.

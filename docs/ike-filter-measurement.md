@@ -186,15 +186,40 @@ the server answering. Reading it:
 
 `path` is the stronger test and needs no second host. It walks TTL 1 through 20, sending at each
 TTL one genuine SA_INIT and one same-size junk datagram, interleaved so both meet identical path
-conditions, and reads the resulting ICMP off the socket error queue; it stops early if the
-destination itself answers a walk packet. The destination port is **udp/500, hardcoded** — this
-command varies the TTL, nothing else. In its output a hop prints its address when it returned
-time-exceeded, `-` when nothing came back, and `<ip>!` when it returned destination-unreachable.
-That `!` matters: a reject is the filter announcing itself, and must **not** be read as "IKE
-travelled this far". After the walk it sends one SA_INIT at a normal TTL, because a reply is the
-only positive proof the destination was reached at all. Its verdicts:
+conditions, and reads the resulting ICMP off the socket error queue. The destination port is
+**udp/500, hardcoded** — this command varies the TTL, nothing else. It refuses to walk at all if the
+target resolves to IPv6, because `IP_RECVERR` on an IPv4 socket is how it reads that ICMP: a name with
+only an AAAA record used to print twenty empty hops, a walk that never happened presented as one that
+found nothing. Every comparison inside the walk is against the *resolved* address for the same class of
+reason — the "we have reached the destination" early exit could never fire for a hostname, so a named
+target walked all 20 TTLs and its trailing blanks read as a path that stopped answering.
 
+Each of the two columns prints one of four things, and telling them apart is the whole skill of
+reading a walk:
+
+| cell | means |
+| --- | --- |
+| `<ip>` | that hop returned ICMP time-exceeded, so it *did* forward the probe that far |
+| `-` | nothing came back. Either the probe died there silently, or that hop suppresses ICMP |
+| `<ip>!` | ICMP administrative reject — a filter announcing itself. It must **not** be read as "IKE travelled this far", which would exonerate the very box doing the dropping |
+| `<ip>?` | ICMP port-unreachable **from the destination**: the probe arrived complete and nothing was listening. That is positive proof of reachability and the opposite of a filtering result |
+
+The `!`/`?` split is not cosmetic, and it was one verdict before. Both arrive as ICMP type 3, so
+lumping them together made a server whose ikev2 container was simply *down* report "IKE was
+actively REJECTED at hop N … it sits upstream of the destination" — pointing at a middlebox on the
+evidence that the destination itself had answered. A `?` at the destination ends the walk; a `!`
+deliberately does not, because the remaining TTLs are what show whether junk keeps going past the
+device that refused us.
+
+After the walk it sends one SA_INIT at a normal TTL, because a reply is the only positive proof the
+destination was reached at all. Its verdicts, in the order it decides them:
+
+- the final SA_INIT never left this host — inconclusive, and said so rather than counted as "no
+  reply" (exit 2);
 - IKE reached the destination and was answered — nothing on this path filters IKE (exit 0);
+- IKE **reached** the destination, which answered port-unreachable, and nothing is listening on
+  udp/500 there. A server-side fault, not a path one: run `listen` and `local` on the destination
+  (exit 1);
 - IKE was actively rejected at hop *N* — that device refused the packet rather than forwarding it,
   and sits upstream of the destination (exit 1);
 - fewer than two hops answered ICMP for the **junk** control — inconclusive. The test is keyed on
@@ -210,8 +235,11 @@ Then the control that makes the finding destination-keyed rather than merely pat
 `path` a second time against a host you know answers IKE. `194.87.49.94` served as that host
 here. If the second target's SA_INIT survives the very hop the first one died at, the filter is
 keyed on destination and no change on the server can affect it. The script prints that follow-up
-itself after any walk that actually ran, and suppresses it on exit 2 — advising a comparison
-after a trace that never happened reads as though one had completed.
+itself, from the two verdicts a comparison can inform — the reject and the divergence — and from
+nowhere else. It used to be decided from the exit status instead, which suppressed it correctly after a
+walk that never ran and still printed it after the port-unreachable verdict, sending the operator
+hunting for a middlebox in the one case where the evidence says there is none and the fault is on the
+server.
 
 On the server, for the other half of the picture:
 
@@ -225,7 +253,14 @@ sudo bash scripts/diagnose-ikev2.sh local
 50, keeping the raw capture under `/tmp`. `-A` is load-bearing: without the ASCII payload the
 `DIAGIKE`/`DIAGJUNK` markers are invisible and the verdict cannot say which shape arrived, which
 is the entire discriminator. `tcpdump` taps before netfilter's INPUT chain, so anything reaching
-the NIC shows up even if a firewall would later drop it. Four outcomes:
+the NIC shows up even if a firewall would later drop it.
+
+Before any of the four verdicts, it checks that the capture actually ran: `timeout`'s 124 means the
+window elapsed and 0 means `tcpdump` hit `-c 200` first, and anything else means `tcpdump` never
+captured — so its stderr is kept in a file and printed, and **no verdict follows at all** (exit 2). An
+empty capture from a `tcpdump` that failed to start is indistinguishable from one taken on a path that
+dropped everything, and reading it as "NOTHING arrived" manufactures hypothesis (A)/(B) out of a
+measurement that never happened. Then:
 
 - `DIAGIKE` seen — IKE reaches the box. Look at the server (the FORWARD rules below) or at the
   client's profile;
@@ -237,13 +272,31 @@ the NIC shows up even if a firewall would later drop it. Four outcomes:
 - nothing at all — hypothesis (A) or (B): udp/500 and udp/4500 are dropped outright. Separate the
   two by probing from a second, unrelated network.
 
-`local` is the same state survey with no capture: container state, listeners (bound on a *global*
-address, not merely bound), ufw, the INPUT path across the whole ruleset including the `ufw-*`
-sub-chains, the FORWARD rules, the relevant sysctls, and strongSwan's own view. Only `listen`
-enforces root, but everything from the INPUT check onward reads `iptables`: without root, `local`
-prints `cannot read iptables (needs root)` and returns there, so the FORWARD check — the failure
-mode described below — is simply not performed. The script's own usage line shows `local` without
-`sudo`; run it with.
+`local` is the same state survey with no capture: container state, listeners, ufw, the INPUT path
+across the whole ruleset including the `ufw-*` sub-chains, the FORWARD rules, the relevant sysctls, and
+strongSwan's own view. A listener has to be on a *global* address, not merely bound — and a wildcard
+socket (`0.0.0.0:500`, or `*:500` on older `ss`) counts as one, because demanding a literal address out
+of `ip addr` reported a perfectly healthy box as "bound, but NOT on any global address (loopback
+only)". The port is asked of `ss` as `sport = :N` rather than grepped out of its output: `hwdsl2`'s own
+IPv6 pool is `fddd:500:500:500::/64`, so a grep for `:500` matches a socket bound to that address on
+some entirely different port and announces udp/500 as served when `charon` never bound it — the same
+substring trap that reports dnstt's 53/udp as served on any stock Ubuntu.
+
+Only `listen` enforces root, but everything from the INPUT check onward reads `iptables`: without root,
+`local` prints `cannot read iptables (needs root)`, names the four checks it is therefore skipping, and
+returns there — so the FORWARD check, the failure mode described below, is simply not performed. The
+script's own usage line shows `local` without `sudo`; run it with.
+
+**Neither survey exits 0 any more regardless of what it found**, and that mattered: `local` could stop
+at that line, having never looked at the FORWARD pair, and hand a wrapper or an operator reading `$?` a
+clean bill of health. Both modes now exit with the worst thing the survey holds — 1 if any check
+returned a ✗, else 2 if any check could not run at all, else 0 — with the ✗ outranking the
+could-not-run because a defect actually observed is the more actionable of the two. The whole script
+keeps one convention, stated in its own header and its usage text: 0 measured and healthy, 1 measured
+and broken, **2 nothing was measured**. Refusing to run for want of root is in the 2 class. (One
+departure survives: `listen` with no `tcpdump` installed exits 1, where nothing was measured either.)
+So `local` on a box whose ufw status could not be read, or whose `ss` or `docker` is absent, comes back
+2 unless some other check actually failed — read that 2 as "look again", never as "nothing wrong".
 
 One standing caveat on `listen`: a probe from some other network exonerates only that other
 network. It says nothing whatsoever about the failing client.
@@ -283,17 +336,42 @@ The order is the whole fix and it does not commute. `ikev2.sh` builds the pool f
 while `run.sh` uses `XAUTH_NET` for the firewall rules *it* writes, so the two can be set apart.
 `rightaddresspool` is literally the range `pluto` assigns — observed truth. `XAUTH_NET` is a
 statement of intent by a different script. Preferring the net would reproduce this very bug for
-anyone who set only one of the two. (The pool branch assumes a /24, which is what every stock
-deployment uses.) Same principle as IKEv2 certificates elsewhere in this repo: reconcile from
-observed truth, not from a remembered constant.
+anyone who set only one of the two. Same principle as IKEv2 certificates elsewhere in this repo:
+reconcile from observed truth, not from a remembered constant.
 
-Two details follow from the same "a broken check is worse than no check" reasoning. Every answer
-carries its provenance — `conn ikev2-cp rightaddresspool`, `VPN_XAUTH_NET`, or a third label that
-names the image default and says the container never answered (`image default -- container config
+The pool branch reads a `first-last` range and derives **the smallest network covering both ends**,
+rather than taking the /24 that contains the first one. The /24 is right for the image default and
+wrong for any pool that straddles a boundary: `192.168.43.10-192.168.44.250` would have `vpnctl`
+install its accepts for `192.168.40.0/21` while a health check went looking for a rule on
+`192.168.43.0/24`, found none, and reported a healthy box broken — the same three-copies-disagree
+failure in a new costume. Wider than the pool is the safe direction, because an address inside the
+covering network but outside the pool is one `pluto` never assigns to anybody. A bare CIDR is accepted
+too; `rightaddresspool` takes one. An IPv6 entry is refused rather than handed to `iptables`.
+
+Three details follow from the same "a broken check is worse than no check" reasoning.
+
+Every answer carries its provenance — `conn ikev2-cp rightaddresspool`, `VPN_XAUTH_NET`, or a label
+that names the image default and says *why* it was reached (`image default -- container config
 unreadable` in the Python, `image default, container unreadable` in the two shell copies) — so a
-fallback cannot be mistaken for a real answer. And both shell copies validate the address before
-handing it to `iptables`, because an unparseable value makes `iptables -C` fail in a way
-indistinguishable from "the rule is missing", which would report a healthy box as broken.
+fallback cannot be mistaken for a real answer, and "the container never answered" is distinguishable
+from "the container answered with something unusable".
+
+Both shell copies validate the address before handing it to `iptables`, because an unparseable value
+makes `iptables -C` fail in a way indistinguishable from "the rule is missing", which would report a
+healthy box as broken. That validation was a regex, and a regex is shape-only: `192.168.256.0/24`
+matches `^[0-9]+(\.[0-9]+){3}/[0-9]+$` perfectly, is not an address, and produced exactly the
+misreport the check existed to prevent. It goes through `python3`'s `ipaddress` now — which is already
+a hard dependency, since neither `probe` nor `path` can build a genuine `IKE_SA_INIT` without it — so
+the shell accepts, refuses and normalises precisely what `vpnctl/ikev2ctl.py` does, host bits included:
+`192.168.43.10/24` → `192.168.43.0/24`.
+
+And the agreement is held by a test rather than by care.
+`tests/test_diagnose_ikev2.py::test_the_shell_and_the_python_answer_identically` runs this script's
+`covering_net` against `ikev2ctl._covering_net` over six entry shapes — the stock
+range, a straddling range, a bare CIDR, a single address, a wide range and one padded with whitespace —
+and `test_an_ipv6_entry_is_refused_by_both` pins the refusal. `scripts/smoke.sh`'s copy of that function
+is byte-identical to this one (`diff` the two `covering_net` bodies), and
+`test_the_stock_pool_still_reads_as_the_image_default` names the one answer all three have to agree on.
 
 ## Limits
 
