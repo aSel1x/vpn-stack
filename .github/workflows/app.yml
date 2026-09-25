@@ -673,6 +673,46 @@ jobs:
       - name: flutter build apk --release
         run: flutter build apk --release
 
+      # Is the Go library actually INSIDE the apk?
+      #
+      # Two checks already stand between here and an apk with no tunnel in it,
+      # and neither answers this question. The plugin's build.gradle throws when
+      # android/libs/libbox.aar is absent, which proves the .aar was on the
+      # classpath; the download step above proves it landed at the path Gradle
+      # reads. Packaging is a third thing, and it is the one that has already
+      # gone wrong here: build.gradle's own comment records
+      # `:app:mergeReleaseNativeLibs` failing with "Could not find :libbox:,
+      # required by project ':app'" -- the classes resolved and the .so had
+      # nowhere to come from. A flatDir repository on every project fixed it,
+      # and nothing asserts it stayed fixed.
+      #
+      # gomobile puts libgojni.so under jni/<abi>/ in the .aar and AGP merges it
+      # to lib/<abi>/ in the apk. Asserted per ABI rather than once, because a
+      # merge that drops ONE architecture produces an apk that installs and runs
+      # everywhere except on the devices using that ABI -- which is the shape of
+      # failure nobody finds from a green build.
+      - name: The apk carries libgojni.so for every ABI it claims
+        run: |
+          apk=build/app/outputs/flutter-apk/app-release.apk
+          # `|| true`: unzip exits non-zero when a pattern matches nothing, and
+          # GitHub runs this under `bash -e`, so without it the step dies on
+          # unzip's own "caution: filename not matched" instead of on the
+          # sentence below that says what that means.
+          libs=$(unzip -Z1 "$apk" 'lib/*/*.so' 2>/dev/null | sort || true)
+          printf '%s\n' "$libs"
+          abis=$(printf '%s\n' "$libs" | awk -F/ 'NF==3 {print $2}' | sort -u)
+          [ -n "$abis" ] || { echo "no native libraries in $apk at all" >&2; exit 1; }
+          rc=0
+          for abi in $abis; do
+            printf '%s\n' "$libs" | grep -qx "lib/$abi/libgojni.so" || {
+              echo "$abi has native libraries but no libgojni.so -- the .aar" >&2
+              echo "resolved and its .so was not merged, which is an apk that" >&2
+              echo "dies at the first connect inside a Go callback" >&2
+              rc=1
+            }
+          done
+          exit $rc
+
       - name: Upload the APK
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
