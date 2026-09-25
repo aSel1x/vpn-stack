@@ -82,11 +82,14 @@ if (!libbox.exists()) {
         "singbox_tunnel: missing android/libs/libbox.aar.\n" +
         "\n" +
         "It is not published; it is built from sing-box's own source. The `libbox`\n" +
-        "job in .github/workflows/app.yml already builds it (it reads the version out\n" +
-        "of compose.yml, clones that tag, and runs `make lib_install && make\n" +
-        "lib_android`) and uploads it as the `libbox-<version>` artifact -- but no job\n" +
-        "downloads it into this directory yet. Wire that up, or build it locally with\n" +
-        "a Go 1.25.5 toolchain and an Android NDK and copy libbox.aar to:\n" +
+        "job in .github/workflows/app.yml builds it (it reads the version out of\n" +
+        "compose.yml, clones that tag, and runs `make lib_install && make lib_android`)\n" +
+        "and uploads it as the `libbox-<version>` artifact; the `android` job in the\n" +
+        "same workflow downloads that artifact straight into this directory before it\n" +
+        "installs a toolchain, so in CI a missing file here means that download failed\n" +
+        "or the artifact name moved. Locally there is no download: build it with the\n" +
+        "versions that workflow pins -- Go 1.25.5 and Android NDK 27.2.12479018 -- and\n" +
+        "copy libbox.aar to:\n" +
         "  " + libbox.absolutePath
     )
 }

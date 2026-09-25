@@ -92,11 +92,23 @@ class DefaultNetworkMonitor(context: Context) {
         // interface in Android P, which would point sing-box at the tun it just
         // created. requestNetwork with an explicit request does not, and 31
         // added registerBestMatchingNetworkCallback for exactly this.
+        //
+        // What makes that true is [request] rather than the choice of call:
+        // NetworkRequest.Builder() starts from NetworkCapabilities' defaults,
+        // which include NET_CAPABILITY_NOT_VPN, and a VPN network is the one
+        // network that does not carry it. So this request cannot match our own
+        // tun even while the tun is the app's default network. A future edit
+        // that builds the request from a NetworkCapabilities it cleared, or that
+        // adds TRANSPORT_VPN, hands sing-box the interface it is routing into.
         when {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
                 manager.registerBestMatchingNetworkCallback(request, networkCallback, threadHandler)
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ->
                 manager.requestNetwork(request, networkCallback, threadHandler)
+            // The call above says this one reports the VPN's own interface, and
+            // this branch still uses it: that behaviour arrived in Android P,
+            // which is two releases above this branch's ceiling of 25, so here it
+            // reports the underlying network and cannot point sing-box at the tun.
             else ->
                 manager.registerDefaultNetworkCallback(networkCallback)
         }
