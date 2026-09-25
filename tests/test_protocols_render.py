@@ -11,7 +11,7 @@ from conftest import make_user
 from cryptography import x509
 from cryptography.x509 import load_pem_x509_certificate
 
-from vpnctl import paths, protocols, secrets_store
+from vpnctl import paths, protocols, secrets_store, users_store
 from vpnctl.protocols import dnstt, hysteria2, ikev2, vless_reality
 
 
@@ -369,3 +369,37 @@ def test_ikev2_refuses_a_password_that_would_misalign_the_lists(secrets) -> None
     assert "alice" in str(excinfo.value)
     # Never the value: this message is printed and that is a live credential.
     assert "two words" not in str(excinfo.value)
+
+
+def test_a_reserved_name_does_not_break_every_apply_when_dnstt_is_off(secrets) -> None:
+    """ikev2 must enforce the file-format rule and not the dnstt-container one.
+
+    `validate_name` has two halves: characters that would corrupt a rendered file,
+    and names that collide with an account inside the dnstt sshd image. ikev2
+    render() called the whole thing, so a user legally created before that
+    reserved list existed -- `mail`, say, which the old regex accepted -- made
+    EVERY apply raise, including the one the systemd boot unit runs, on a box
+    with dnstt switched off and ikev2 enabled by default. The remedy would have
+    been unreachable from the server itself.
+
+    The file-format half still has to bite here, because it is what stops one
+    user being handed another's L2TP password.
+    """
+    legacy = make_user("mail")
+    assert users_store.reserved_name("mail") is not None
+    assert users_store.unrenderable_name("mail") is None
+
+    # ikev2 renders it: nothing about `mail` misaligns a space-separated list.
+    env = ikev2.render(secrets, [legacy])["ikev2.env"].decode()
+    assert "mail" in env
+
+    # dnstt is the protocol whose container cannot serve it, so dnstt refuses --
+    # and only when dnstt is enabled, which is what makes the refusal escapable.
+    with pytest.raises(protocols.RenderError) as refusal:
+        dnstt.render(secrets, [legacy])
+    assert "mail" in str(refusal.value)
+
+    # And the format rule still applies to ikev2, or the split would have traded
+    # one bug for a worse one.
+    with pytest.raises(protocols.RenderError):
+        ikev2.render(secrets, [make_user("bad name")])

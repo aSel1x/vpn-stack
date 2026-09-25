@@ -118,8 +118,23 @@ _RESERVED_NAMES = frozenset(
 )
 
 
-def validate_name(name: str) -> str | None:
-    """Return an error message if `name` is unsafe to render, else None."""
+def unrenderable_name(name: str) -> str | None:
+    """Return an error message if `name` would corrupt a rendered file, else None.
+
+    This half is about FILE FORMATS and nothing else, which is why every
+    protocol's render() may enforce it: `render_ikev2_env` pairs two
+    space-separated lists by position, and dnstt's login list is `name:password`
+    per line read with `IFS=:`. A name that breaks either one cannot be served by
+    anybody, so refusing before the candidate tree is promoted is strictly better
+    than serving it.
+
+    Kept apart from `reserved_name` deliberately. The two used to be one check,
+    and ikev2.render() called it -- so a user legally created before the reserved
+    list existed made EVERY apply fail, the systemd boot unit included, with
+    dnstt switched off and ikev2 enabled by default. That is the shape
+    dnstt.render's own comment warns about at length: a refusal in render that
+    the operator cannot get out from under.
+    """
     if not _NAME_RE.match(name):
         return (
             f"Invalid user name {name!r}. Use 1-32 characters: letters, digits, "
@@ -127,6 +142,16 @@ def validate_name(name: str) -> str | None:
             "L2TP/Cisco user list is space-separated and a space would misalign "
             "every user's password."
         )
+    return None
+
+
+def reserved_name(name: str) -> str | None:
+    """Return an error message if `name` collides with a dnstt-container account.
+
+    A fact about ONE protocol's container image, not about whether a name can be
+    rendered -- so only `user add` and dnstt's own render enforce it. ikev2 must
+    not: its render is reached on every apply whether or not dnstt is on.
+    """
     # Case-folded, because `find()` already treats names case-insensitively: a
     # person is known by one name regardless of case, so allowing `Root` would
     # only be allowing the same collision with a different spelling.
@@ -140,6 +165,11 @@ def validate_name(name: str) -> str | None:
             "credential that had already been handed out. Pick another name."
         )
     return None
+
+
+def validate_name(name: str) -> str | None:
+    """Both halves, which is what `user add` owes a name it is about to create."""
+    return unrenderable_name(name) or reserved_name(name)
 
 
 def _now() -> str:

@@ -19,7 +19,7 @@ import secrets as pysecrets
 from vpnctl.paths import USERS_JSON
 from vpnctl.protocols import Kind, Port, Protocol, RenderError, ShareItem
 from vpnctl.secrets_store import Secrets
-from vpnctl.users_store import User, validate_name
+from vpnctl.users_store import User, unrenderable_name
 
 NAME = "ikev2"
 
@@ -41,12 +41,17 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
     # credential; the same check at `user add` cannot see a record it did not
     # create.
     #
-    # Deliberately the whole shared validator and not just "the characters that
-    # break this file": one definition of a renderable name, in users_store,
-    # beside the regex's own explanation. A name that reaches here having failed
-    # any part of it is a database `user add` would not have written.
+    # `unrenderable_name` and NOT the whole shared validator, which is what this
+    # called at first. The other half of that validator refuses names colliding
+    # with an account inside the dnstt sshd container -- a fact about one
+    # protocol's image, not about whether this file can be written. ikev2 is
+    # enabled by default and dnstt is not, so enforcing it here meant a user
+    # legally created before that list existed made EVERY apply fail, the
+    # systemd boot unit included, on a box where dnstt was switched off. That is
+    # precisely the trap dnstt.render's own comment describes: a refusal in
+    # render that the operator cannot get out from under.
     for user in enabled:
-        error = validate_name(user.name)
+        error = unrenderable_name(user.name)
         if error:
             raise RenderError(
                 f"{USERS_JSON} names a user this cannot render. {error} "
@@ -71,7 +76,7 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
 
     # Both of these end up in the container's environment, which means every
     # user's L2TP/Cisco password and the shared PSK are readable with a single
-    # `docker inspect ikev2` by anything that can reach the docker socket. There
+    # `docker inspect ipsec-vpn-server` by anything that can reach the docker socket. There
     # is no way around it -- the hwdsl2 image is configured by environment and
     # nothing else -- so "nothing else on this host gets the docker socket" is a
     # written invariant of this deployment rather than an accident of it: no

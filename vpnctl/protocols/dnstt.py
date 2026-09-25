@@ -17,7 +17,7 @@ import sys
 from vpnctl.paths import ENV_FILE, USERS_JSON
 from vpnctl.protocols import Kind, Port, Protocol, RenderError, ShareItem
 from vpnctl.secrets_store import Secrets
-from vpnctl.users_store import User, validate_name
+from vpnctl.users_store import User, reserved_name, unrenderable_name
 
 NAME = "dnstt"
 
@@ -125,7 +125,11 @@ def render(secrets: Secrets, users: list[User]) -> dict[str, bytes]:
     # render() is handed whatever a hand edit, an old backup or a rolled-back
     # tree left in the file.
     for user in issued:
-        error = validate_name(user.name)
+        # Both halves here, unlike ikev2: this protocol's own container is the
+        # one that cannot serve a reserved name -- it refuses to start on one
+        # rather than crash-loop -- so refusing at render is what turns a
+        # crash-loop into a sentence. Only reached when dnstt is enabled.
+        error = unrenderable_name(user.name) or reserved_name(user.name)
         if error:
             raise RenderError(
                 f"{USERS_JSON} names a user this cannot render into the dnstt "
