@@ -1,0 +1,69 @@
+# What keeps the SHA pins in .github/workflows/ from rotting.
+#
+# Both workflows pin every `uses:` to a commit SHA with the tag in a trailing
+# comment, because a major tag is a mutable pointer and whoever can move it
+# decides what runs on a runner holding a checkout of this tree. The cost of
+# that is the thing this file pays: a SHA cannot tell you it is stale. Nothing
+# warns when the action it names stops receiving security fixes, and the Node 20
+# deprecation -- five actions printing "being forced to run on Node.js 24" on
+# every run -- is exactly what that looks like when nobody is watching. So the
+# bumps arrive as pull requests a human reads, which is the same shape as
+# everything else here: `./vpn deploy` is one deliberate command, and so is
+# merging one of these.
+#
+# Dependabot rewrites the SHA *and* the trailing `# vN.N.N` comment, which is
+# the other reason those comments are spelled that way rather than left out: it
+# is how a reviewer sees which version a SHA became.
+#
+# ONE THING TO KNOW BEFORE WONDERING WHY NO PULL REQUESTS ARRIVE: Dependabot
+# reads this file from the repository's DEFAULT BRANCH only. That is the same
+# rule that made app.yml's `workflow_dispatch` input unreachable -- the default
+# branch is `main` and app.yml lives on `app` -- and it is named here so it is a
+# known property rather than a mystery. Until this branch merges, Dependabot
+# sees whatever workflows `main` carries (today: ci.yml alone). Unlike the
+# dispatch button, this is not a dead end: merging to main is where this branch
+# is going anyway.
+#
+# NO OTHER ECOSYSTEM IS LISTED, and that is deliberate rather than an oversight.
+# The three other pins in this tree are not bot-shaped. ci.yml's `RUFF` cannot
+# move without `ruff format .` running in the same commit, or CI goes red on a
+# tree nobody touched. app.yml's `FLUTTER_VERSION` has to move together with
+# app/pubspec.yaml's SDK constraint, app/pubspec.lock and
+# app/packages/singbox_tunnel/pubspec.lock. compose.yml's sing-box tag is read
+# by the libbox jobs and by scripts/check.sh, so bumping it rebuilds the client
+# library and revalidates every rendered config. Each of those is a change with
+# a companion step, and a bot that opens it without the companion produces a red
+# branch and a stale diff to clean up.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    # "/" is not this file's directory -- for github-actions it means "the
+    # workflows in this repository", and Dependabot reads all of
+    # .github/workflows/ from it. There is no per-file entry to add.
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Enough for a week's worth of actions and small enough that a neglected
+    # queue is visible rather than endless.
+    open-pull-requests-limit: 5
+    # No `labels:` -- a custom label that does not already exist in the
+    # repository is a configuration error Dependabot reports in its own tab and
+    # nowhere a person looks, which is the wrong failure mode for a file whose
+    # whole job is to stop something going unnoticed. It applies `dependencies`
+    # by itself.
+    groups:
+      # A MAPPING keyed by group name, which is the shape Dependabot's schema
+      # wants; the list-of-objects form parses as YAML, fails validation, and
+      # then opens no pull requests at all while looking like a working file.
+      #
+      # GitHub's own actions move together -- the Node 24 migration bumped five
+      # of them in one go -- so one diff is the honest unit of review.
+      github-owned-actions:
+        patterns:
+          - "actions/*"
+    # Everything not matched by that group -- today `astral-sh/setup-uv` and
+    # `subosito/flutter-action` -- arrives as its own pull request, which is the
+    # point: a third-party action is the one whose diff deserves reading on its
+    # own, and flutter-action is a `composite` action, so its "diff" is shell
+    # that runs in this workflow's own context.

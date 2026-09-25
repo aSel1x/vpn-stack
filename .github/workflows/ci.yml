@@ -1,14 +1,16 @@
 # CI that checks the code and CANNOT touch a server.
 #
 # There is no deploy step here, and adding one would be a regression, not a
-# feature. The previous pipeline (.github/workflows/deploy.yml, deleted in
-# 61457b7 "Drop CI: deploy-on-push cost more than it bought") ran
-# scripts/deploy.sh on every push to main. That is how /opt/vpn-stack
-# reappeared on a box that had just been deliberately wiped -- CI acting on
-# production because someone committed, not because anyone asked it to. It cost
-# a standing key with root on the VPN server, held by GitHub, and its
-# `ssh-keyscan` accepted whatever host key the server presented. Deploying is
-# `./vpn deploy` from a checkout, one deliberate command, and stays that way.
+# feature. The previous pipeline (.github/workflows/deploy.yml, removed by the
+# commit "Drop CI: deploy-on-push cost more than it bought" -- named by subject,
+# because the hash this paragraph used to cite stopped resolving after a history
+# rewrite and was still here to be copied somewhere) ran scripts/deploy.sh on
+# every push to main. That is how /opt/vpn-stack reappeared on a box that had
+# just been deliberately wiped -- CI acting on production because someone
+# committed, not because anyone asked it to. It cost a standing key with root on
+# the VPN server, held by GitHub, and its `ssh-keyscan` accepted whatever host
+# key the server presented. Deploying is `./vpn deploy` from a checkout, one
+# deliberate command, and stays that way.
 #
 # So, deliberately: no `secrets:`, no `environment:`, no ssh, no rsync, no
 # `deploy`, no network target of any kind. `permissions: contents: read` is
@@ -17,9 +19,30 @@
 # itself. If you find yourself adding a secret to this file, the thing you want
 # is a laptop, not a runner.
 #
+# Every `uses:` below is pinned to a commit SHA with its tag in a trailing
+# comment, for the reason .github/workflows/app.yml states at length: a major
+# tag is a mutable pointer, and whoever can move it decides what runs here.
+# .github/dependabot.yml is what keeps those SHAs from rotting into
+# unmaintained code. The majors here cleared the Node 20 deprecation in the same
+# change that pinned them -- app.yml explains why those two had to travel
+# together, and each tag below was confirmed to declare `runs.using: node24`
+# (subosito/flutter-action is `composite` and has no runtime to deprecate).
+#
+# Three jobs. `python` is ruff plus pytest. `shell` is `bash -n` over every
+# shell file the finder in it matches. `dart` is the surprising one and is the
+# whole reason the Flutter client's cheap checks are duplicated here: it runs
+# the analyzer and BOTH Dart test suites -- app/ and the
+# app/packages/singbox_tunnel plugin -- on every push and every pull request,
+# with no path filter, so a commit that renames a key in vpnctl/cli.py runs
+# them in the same run as the Python tests. app.yml keeps the five artifact
+# builds and their `app/**` filter, because a server-side one-liner should not
+# spend two macOS runners.
+#
 # One loose end this file cannot close: DEPLOY_HOST and DEPLOY_SSH_KEY outlived
-# the workflow that used them by months, sitting in the repo's Actions secrets
-# with nothing referencing them. Delete them there; a workflow cannot.
+# the workflow that used them, sitting in the repo's Actions secrets with
+# nothing in this tree referencing them. Nothing here reads them and nothing
+# here can remove them -- a workflow cannot delete a repository secret. Delete
+# them in the settings page.
 
 name: ci
 
@@ -28,8 +51,22 @@ on: [push, pull_request]
 permissions:
   contents: read
 
+# Keyed so the `push` and the `pull_request` run for ONE commit share a group
+# and the second cancels the first. `github.ref` could not do that: for the same
+# commit it is `refs/heads/foo` on the push event and `refs/pull/N/merge` on the
+# pull_request event, so the pair never collapsed and every same-repo pull
+# request paid for two identical runs. `github.head_ref` is the head BRANCH name
+# and is set on pull_request only; `github.ref_name` is that same string on a
+# push, so the two events agree.
+#
+# The head REPOSITORY is in the key as well, and not for tidiness: a fork's pull
+# request opened from a branch called `main` would otherwise share a group with
+# pushes to this repository's own main and cancel them. `github.event.pull_request`
+# is null on a push, so the fallback is this repository. The `pull_request`
+# trigger is what covers forks at all -- `push` does not fire for a fork -- which
+# is why it stays rather than being dropped to stop the double run.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -48,10 +85,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           enable-cache: true
 
@@ -80,25 +117,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Half this repo is bash and none of it is exercised until a server runs
       # it, at which point install.sh is a third of the way through a firewall
       # change. `bash -n` is the cheapest check that would have caught an
-      # unterminated quote before that. Files are found by shebang rather than
-      # by a list, because a list goes stale silently -- this way a new script
-      # is covered the day it lands. (`bash -n` on a #!/bin/sh script parses a
-      # superset: it catches syntax, not bashisms.)
+      # unterminated quote before that.
+      #
+      # Files are found rather than listed, because a list goes stale silently
+      # and a new script has to be covered the day it lands. TWO rules, because
+      # this tree holds two kinds of shell file and either rule alone misses
+      # one. By shebang only -- what this job did for a while -- skips
+      # app/tool/ios_identifiers.sh, which is SOURCED by tool/check_extension.sh
+      # and read by tool/ios_project.rb and therefore deliberately has no
+      # shebang: the job whose name promises every shell script never parsed
+      # the single definition of the App Group identifier. By extension only
+      # skips `vpn` and `deploy`, the two scripts a person actually types. So:
+      # anything named *.sh, plus anything whose first line is an sh or bash
+      # shebang. (`bash -n` on a #!/bin/sh script parses a superset: it catches
+      # syntax, not bashisms.)
       - name: bash -n every shell script
         run: |
           rc=0
           n=0
           while IFS= read -r f; do
-            head -n1 -- "$f" | grep -qE '^#!.*\b(ba)?sh$' || continue
+            case "$f" in
+              *.sh) ;;
+              *) head -n1 -- "$f" | grep -qE '^#!.*\b(ba)?sh$' || continue ;;
+            esac
             n=$((n + 1))
             bash -n -- "$f" || rc=1
           done < <(git ls-files)
           echo "checked $n script(s)"
+          # A green check that ran no checks is the exact shape of the
+          # wrong-subnet health checks this repo has already been bitten by, so
+          # a finder that matches nothing fails rather than passes.
           [ "$n" -gt 0 ] || { echo "no shell scripts matched -- the finder is broken, not the tree" >&2; exit 1; }
           exit $rc
 
@@ -114,12 +167,16 @@ jobs:
   # macOS runners, for a server-side one-liner. So the cheap half runs here,
   # where there is no path filter, and app.yml keeps the expensive half.
   #
-  # Be precise about what this buys, because app/README.md is now precise about
-  # it too: the Dart fixtures are hand-copied from cli.py's output and nothing
-  # compares the two, so renaming `enabled_protocols` leaves this job GREEN.
-  # It catches a payload the parser cannot read, a command line assembled
-  # wrongly, and any Dart-side regression -- and it is the job the missing
-  # key-set diff would run in, once it exists.
+  # This job used to be the weaker half of that promise and it no longer is.
+  # The Dart fixtures were hand-copied from what cli.py printed, nothing
+  # compared the two, and renaming `enabled_protocols` left this job GREEN
+  # while every phone refused the payload. The shared artifact that closes it is
+  # app/test/fixtures/: tests/test_json_contract.py generates those files by
+  # calling cli.py and asserts the bytes, and the Dart suite parses the same
+  # files instead of inline strings. So a rename now fails in the `python` job
+  # above -- the golden no longer matches -- and if somebody regenerates the
+  # golden without touching the app, it fails HERE, on the parse. Neither side
+  # can move alone, which is the whole reason both run in one workflow.
   dart:
     name: app analyze and test
     runs-on: ubuntu-latest
@@ -129,43 +186,95 @@ jobs:
         working-directory: app
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Read out of app.yml rather than restated here, for the reason
       # scripts/check.sh reads the sing-box tag out of compose.yml: two
       # literals drift, silently, and then the contract is checked on one
       # toolchain and shipped on another. app.yml stays the single definition
       # of which Flutter this tree builds with.
+      #
+      # Single-valuedness is ASSERTED rather than papered over with `head -1`:
+      # two FLUTTER_VERSION lines means two pins, and quietly taking the first
+      # would install one toolchain here while the artifact builds used the
+      # other -- the very drift this read exists to prevent, wearing the shape
+      # of a fix.
       - name: Read the pinned Flutter version out of app.yml
         id: flutter
         working-directory: .
         run: |
-          v=$(sed -n 's/^[[:space:]]*FLUTTER_VERSION:[[:space:]]*"\([^"]*\)".*/\1/p' .github/workflows/app.yml)
-          [ -n "$v" ] || { echo "no FLUTTER_VERSION in .github/workflows/app.yml -- the pin moved and this job cannot guess what to install" >&2; exit 1; }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          pins=$(sed -n 's/^[[:space:]]*FLUTTER_VERSION:[[:space:]]*"\([^"]*\)".*/\1/p' .github/workflows/app.yml)
+          found=$(printf '%s\n' "$pins" | grep -c . || true)
+          [ "$found" -eq 1 ] || {
+            echo "expected exactly one FLUTTER_VERSION in .github/workflows/app.yml, found $found: $(printf '%s' "$pins" | tr '\n' ' ')" >&2
+            echo "this job cannot guess which toolchain the artifact builds will use" >&2
+            exit 1
+          }
+          echo "version=$pins" >> "$GITHUB_OUTPUT"
+          echo "app.yml pins Flutter $pins"
 
       - name: Install Flutter ${{ steps.flutter.outputs.version }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ steps.flutter.outputs.version }}
           channel: stable
           cache: true
 
+      # --enforce-lockfile, or the committed app/pubspec.lock is a freeze by
+      # convention only: a plain `flutter pub get` resolves whatever satisfies
+      # pubspec.yaml today, rewrites pubspec.lock with the new answer, and says
+      # nothing. With the flag pub exits 65 ("Unable to satisfy `pubspec.yaml`
+      # using `pubspec.lock`") when the resolution would differ, and exits 1
+      # when the lockfile is missing entirely -- so a silent re-resolution
+      # becomes the red build the lock was committed for. That commit is
+      # "Commit pubspec.lock, because an untouched tree went red on somebody
+      # else's release"; this flag is what makes it actually hold.
       - name: flutter pub get
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
 
-      # Plain `flutter analyze`, matching app.yml: errors and warnings fail,
-          # `flutter analyze` defaults --fatal-infos AND --fatal-warnings to
-          # true, so every lint info fails this job. That is deliberate here:
-          # the code was written on a machine with no Dart toolchain, so this
-          # job is the first thing that can see a diagnostic at all.
-      # worth a red build on its own.
+      # `flutter analyze`, not `dart analyze`, and nothing is passed to it,
+      # because flutter's wrapper already defaults BOTH --fatal-infos and
+      # --fatal-warnings to on -- `flutter analyze --help` says so, and a
+      # tree whose only diagnostic is a lint info exits 1. `dart analyze` does
+      # not. So every diagnostic the analyzer emits fails this job, down to an
+      # info, and that is deliberate: the Dart here was written on a machine
+      # with no toolchain, so this job is the first thing that can see a
+      # diagnostic at all. app/analysis_options.yaml escalates unawaited_futures
+      # to an error on top of that, because an unawaited future in provisioning
+      # is a step reporting success before it finished.
+      #
+      # The obvious objection is a real one: with infos fatal, a flutter_lints
+      # release that merely adds a lint would turn every branch red on a tree
+      # nobody touched. What stops it is app/pubspec.lock -- committed, and
+      # enforced by the step above, so flutter_lints cannot move here without a
+      # commit that moves it. The pinned FLUTTER_VERSION does the same for the
+      # analyzer itself.
       - name: flutter analyze
         run: flutter analyze
 
-      # No pubspec.lock is committed yet, so this resolves fresh every run and
-      # a new release of a dependency can turn this red with no commit in
-      # between. app.yml's check job uploads the lock it resolved; commit it
-      # and both jobs freeze. That is a real loose end, not a style note.
       - name: flutter test
         run: flutter test
+
+      # app/packages/singbox_tunnel holds the state machine that decides when
+      # the app is allowed to say "Connected", and `flutter test` above never
+      # sees a line of it: that command collects app/test/ and does not descend
+      # into packages/. `flutter analyze` from app/ DOES read the package's
+      # Dart -- the analyzer walks the whole directory and app/analysis_options.yaml
+      # governs it, measured by planting a diagnostic under
+      # packages/singbox_tunnel/lib/ and watching analyze from app/ report it --
+      # so this step is about EXECUTION, not analysis.
+      #
+      # The package has its own committed pubspec.lock, so this resolve cannot
+      # move app/pubspec.lock, and --enforce-lockfile holds it for the same
+      # reason it holds the one above.
+      #
+      # It runs here rather than only in app.yml's `check` job because this is
+      # the job with no path filter. The package is where a tunnel that reports
+      # the wrong state comes from, and that is worth eight seconds on every
+      # push.
+      - name: flutter test (singbox_tunnel plugin)
+        working-directory: app/packages/singbox_tunnel
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter test

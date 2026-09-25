@@ -6,9 +6,46 @@
 # is public. One workflow, five artifacts, no local toolchain required.
 #
 # It keeps the four properties ci.yml has, for the same reasons ci.yml states:
-# no `secrets:`, no deploy step of any kind, every action pinned, and
+# no `secrets:`, no deploy step of any kind, every `uses:` pinned, and
 # `permissions: contents: read` written out rather than inherited from a
 # settings page this file cannot document.
+#
+# PINNED MEANS PINNED TO A COMMIT SHA, with the tag in a trailing comment. It
+# used to say "every action pinned" while every one of them named a major tag,
+# which is a mutable pointer: `@v4` is whatever its owner last moved it to, and
+# for the third-party `subosito/flutter-action` that owner is not GitHub. A
+# workflow that builds the VPN clients this project hands to humans, on a
+# runner with a checkout of this tree, is not a place to accept "whatever is
+# there today". The cost is that a SHA cannot tell you it is stale, so
+# .github/dependabot.yml watches github-actions and opens the bumps as
+# reviewable pull requests.
+#
+# THE MAJORS MOVED AT THE SAME TIME, and not for tidiness: every run used to
+# print "Node.js 20 is deprecated... being forced to run on Node.js 24" for
+# checkout, upload-artifact, download-artifact and cache, plus "setup-java v4 is
+# deprecated". A SHA pin makes that permanent rather than merely noisy -- a major
+# tag would at least have drifted onto a supported runtime eventually, and a SHA
+# never does -- so the migration had to land in the same change as the pinning.
+# The majors are NOT all the same number and were each read off that action's own
+# releases: checkout v5, cache v5, setup-java v5, setup-go v6, upload-artifact
+# v6, download-artifact v7, setup-uv v7. `runs.using` was confirmed to be
+# `node24` at each tag pinned below. subosito/flutter-action is exempt because it
+# is a `composite` action -- it has no JavaScript runtime to deprecate.
+#
+# Each is the FIRST major on node24, deliberately, and not the newest one
+# published: the newest are further along (checkout v7, download-artifact v8),
+# and a major bump is an interface change, not a runtime change. Taking the
+# smallest step that clears the deprecation keeps this change reviewable as one
+# thing, and Dependabot proposes the rest as pull requests a human reads -- which
+# is the arrangement, not a gap in it.
+#
+# The jobs, because the list here drifted from the file once already:
+# `check` (analyzer, both Dart test suites, and the cheap iOS identifier
+# assertions), `libbox` and `libbox_apple` (sing-box built from source for
+# Android and for Apple), the five platform builds `android`, `ios`, `macos`,
+# `windows`, `linux`, plus `ios_state` and `ios_project`, which between them
+# regenerate app/ios/ when it is absent, and `ios_result`, which fails when
+# neither of those two did anything.
 #
 # NOTHING HERE IS SIGNED, and that is the intended end state, not a TODO.
 # The .ipa is built with --no-codesign and installs on no device until somebody
@@ -56,15 +93,21 @@ on:
       # rebuilds -- the drift is invisible until a config parses on one side and
       # not the other.
       - 'compose.yml'
-  workflow_dispatch:
-    inputs:
-      regenerate_ios_project:
-        description: >-
-          Rewrite app/ios/ from the Flutter template plus tool/ios_project.rb and
-          upload it. Off by default, and deliberately manual: app/ios/ is a
-          COMMITTED directory, so regenerating it is a change to what ships.
-        type: boolean
-        default: false
+
+# NO `workflow_dispatch:`, and its absence is the fix rather than an omission.
+# There was one here, carrying a `regenerate_ios_project` boolean, and the route
+# it described could not be walked: GitHub offers "Run workflow" only for a
+# workflow present on the repository's DEFAULT branch, and this file exists on
+# `app` while the default branch is `main` and carries ci.yml alone. So the
+# input was unreachable, the `if:` half that read it could never be true, and
+# the error message that told a human to use it sent them looking for a button
+# that is not rendered. An input that does nothing is worse than no input: it
+# reads as a supported route.
+#
+# THE ROUTE THAT WORKS: delete app/ios/ and push. The `ios_state` job below
+# reports it absent, `ios_project` regenerates it and uploads the ios-project
+# artifact, and `ios` stands down for that run. Commit the artifact and the next
+# push builds it again. That is one gesture, in git, on any branch.
 
 permissions:
   contents: read
@@ -94,14 +137,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
+      # BOTH CHECKS BELOW RUN BEFORE THE TOOLCHAIN, deliberately. Neither needs
+      # Flutter, Ruby gems or Xcode -- one is `ruby -c`, the other is awk and
+      # grep -- and installing Flutter first means a mismatch that is legible in
+      # two seconds is reported four minutes in. The Android and iOS jobs order
+      # their own assertions the same way and say so: a wrong artifact name is
+      # cheaper to discover ahead of an SDK download than behind one.
 
       # The only cheap judge of tool/ios_project.rb. That script runs on a macOS
       # runner against a project that exists for the length of one job, so a
@@ -112,37 +155,104 @@ jobs:
       - name: ruby -c tool/ios_project.rb
         run: ruby -c tool/ios_project.rb
 
-      - name: flutter pub get
-        run: flutter pub get
+      # The cheapest available substitute for a device, which is why it runs
+      # here and not only behind a 45-minute macOS build. Every identifier the
+      # packet-tunnel extension depends on -- the App Group, both bundle
+      # identifiers, the two entitlement keys, the extension point -- is
+      # compared at RUNTIME by iOS and by nothing at build time, so a mismatch
+      # among tool/ios_identifiers.sh, app/ios/*/Info.plist, the two
+      # entitlements files and Runner.xcodeproj compiles, links, wraps into a
+      # valid .ipa, and then denies the sandbox on the first connect. On a
+      # target no device has ever run, that symptom is unreachable. The script
+      # reads the strings with awk and grep, so ubuntu-latest is enough.
+      #
+      # Guarded on the project being present rather than asserting it, and the
+      # reason is the regeneration route above: deleting app/ios/ and pushing is
+      # how a human asks for a new project, `ios_project` needs this job, and a
+      # hard failure here would therefore refuse to regenerate the very
+      # directory whose absence caused the failure. The skip is announced on
+      # stdout and `ios_result` is what makes sure the run did not silently do
+      # neither.
+      - name: Check the iOS identifiers agree (tool/ios_identifiers.sh)
+        run: |
+          set -euo pipefail
+          if [ -f ios/Runner.xcodeproj/project.pbxproj ]; then
+            bash tool/check_extension.sh sources
+          else
+            echo "app/ios/ is absent, so there is nothing to assert against"
+            echo "tool/ios_identifiers.sh yet -- the ios_project job will generate it"
+            echo "and run the same check over what it wrote."
+          fi
 
-      # app/pubspec.yaml deliberately carries no version constraints and no
-      # lockfile is committed, because they would have been written by somebody
-      # who could not run a resolver. This is the resolver's answer: download
-      # it from the first green run, commit it, and the resolution is frozen
-      # from then on. Uploaded before analyze so a red analysis still hands you
-      # the lockfile.
-      # Kept after pubspec.lock was committed: this is the resolution CI
-      # actually used, so a lock that drifts from it is visible here.
-      - name: Upload the resolved pubspec.lock
-        uses: actions/upload-artifact@v4
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
-          name: pubspec.lock
-          path: app/pubspec.lock
-          if-no-files-found: error
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
 
-          # `flutter analyze` defaults --fatal-infos AND --fatal-warnings to
-          # true, so every lint info fails this job. That is deliberate here:
-          # the code was written on a machine with no Dart toolchain, so this
-          # job is the first thing that can see a diagnostic at all.
-      # --fatal-infos would hand flutter_lints' next release the same veto the
-      # pinned SDK above exists to prevent, on a tree nobody touched.
-      # app/analysis_options.yaml already escalates the one lint that is worth a
-      # red build (unawaited_futures) to an error by itself.
+      # --enforce-lockfile, or the committed app/pubspec.lock is a freeze by
+      # convention only: a plain `flutter pub get` resolves whatever satisfies
+      # pubspec.yaml today, rewrites pubspec.lock with the new answer, and says
+      # nothing at all. With the flag, pub exits 65 ("Unable to satisfy
+      # `pubspec.yaml` using `pubspec.lock`") when the resolution would differ,
+      # and exits 1 when the lockfile is missing entirely -- so a silent
+      # re-resolution becomes the red build the lock was committed for by
+      # "Commit pubspec.lock, because an untouched tree went red on somebody
+      # else's release".
+      #
+      # This is also why there is no longer a step uploading the resolved
+      # pubspec.lock as an artifact. That step existed to hand a human the
+      # resolver's answer back when none was committed, and was then kept to
+      # show "the resolution CI actually used" -- which under this flag cannot
+      # differ from the committed file by construction, so the artifact was a
+      # copy of a tracked file. The flag asserts what the upload only displayed.
+      - name: flutter pub get
+        run: flutter pub get --enforce-lockfile
+
+      # `flutter analyze`, not `dart analyze`, and nothing is passed to it,
+      # because flutter's wrapper already defaults BOTH --fatal-infos and
+      # --fatal-warnings to on -- `flutter analyze --help` says so, and a tree
+      # whose only diagnostic is a lint info exits 1. `dart analyze` does not.
+      # So every diagnostic the analyzer emits fails this job, down to an info,
+      # and that is deliberate: the Dart in this tree was written on a machine
+      # with no toolchain, so this job and ci.yml's `dart` job are the first
+      # things that can see a diagnostic at all. app/analysis_options.yaml
+      # escalates unawaited_futures to an error on top of that, because an
+      # unawaited future in provisioning is a step reporting success before it
+      # finished.
+      #
+      # The obvious objection is a real one: with infos fatal, a flutter_lints
+      # release that merely adds a lint would turn every branch red on a tree
+      # nobody touched. What stops it is app/pubspec.lock -- committed, and
+      # enforced by the step above, so flutter_lints cannot move here without a
+      # commit that moves it. FLUTTER_VERSION does the same for the analyzer.
       - name: flutter analyze
         run: flutter analyze
 
       - name: flutter test
         run: flutter test
+
+      # app/packages/singbox_tunnel holds the state machine that decides when
+      # the app is allowed to say "Connected", and `flutter test` above never
+      # sees a line of it: that command collects app/test/ and does not descend
+      # into packages/, so a package with its own test suite is invisible to the
+      # job whose name is "analyze and test".
+      #
+      # ANALYSIS is already covered, and that was measured rather than assumed:
+      # `flutter analyze` from app/ walks the whole directory under
+      # app/analysis_options.yaml, so a diagnostic planted in
+      # packages/singbox_tunnel/lib/ is reported by the step above. This step is
+      # about EXECUTION.
+      #
+      # The package has its own committed pubspec.lock, so this resolve cannot
+      # move app/pubspec.lock, and --enforce-lockfile holds it for the same
+      # reason it holds the one above.
+      - name: flutter test (singbox_tunnel plugin)
+        working-directory: app/packages/singbox_tunnel
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter test
 
   # sing-box's Android library is not published anywhere: the v1.14.0 release
   # carries 167 assets and not one .aar, so it has to be built from source with
@@ -163,7 +273,7 @@ jobs:
       version: ${{ steps.pin.outputs.version }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # working-directory defaults to app/ for the whole workflow; compose.yml is
       # at the repository root, which is why this one step overrides it.
@@ -172,21 +282,41 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          version=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
-          [ -n "$version" ] || { echo "no sing-box image pin in compose.yml" >&2; exit 1; }
+          # Exactly one match is asserted, not assumed. `[ -n "$version" ]`
+          # passes on two matches as happily as on one, and two matches arrive
+          # as a single newline-joined string that is then handed to `git clone
+          # --branch` and to a cache key -- so a second sing-box image line in
+          # compose.yml would fail somewhere far from its cause.
+          # scripts/check.sh guards the same read with `head -1`, which picks a
+          # winner silently; naming the ambiguity is strictly better, because
+          # the whole point of reading the tag out of one file is that one
+          # number governs both ends of a configuration.
+          #
+          # Counted with grep and not `mapfile`, and ci.yml's reader of
+          # FLUTTER_VERSION uses the same idiom for the same reason: this step
+          # is byte-identical in the libbox and libbox_apple jobs, and
+          # macos-latest still supplies bash 3.2, which has no `mapfile` at all.
+          # One idiom that runs on both runners beats two that drift.
+          pins=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
+          found=$(printf '%s\n' "$pins" | grep -c . || true)
+          [ "$found" -eq 1 ] || {
+            echo "expected exactly one ghcr.io/sagernet/sing-box image pin in compose.yml, found $found: $(printf '%s' "$pins" | tr '\n' ' ')" >&2
+            exit 1
+          }
+          version=$pins
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "server runs sing-box $version"
 
       - name: Restore a previously built libbox
         id: cached
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: libbox-out
           key: libbox-${{ steps.pin.outputs.version }}-api24-gomobile0.1.13
 
       - name: Install Go
         if: steps.cached.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain refuses
           # the module outright.
@@ -245,7 +375,7 @@ jobs:
           test -s libbox-out/libbox.aar
 
       - name: Upload libbox.aar
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: libbox-${{ steps.pin.outputs.version }}
           path: libbox-out/*.aar
@@ -303,7 +433,7 @@ jobs:
       version: ${{ steps.pin.outputs.version }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Byte-identical to the libbox job's step, deliberately: one number
       # governs the engine at both ends of a configuration, and it lives in
@@ -314,8 +444,28 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          version=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
-          [ -n "$version" ] || { echo "no sing-box image pin in compose.yml" >&2; exit 1; }
+          # Exactly one match is asserted, not assumed. `[ -n "$version" ]`
+          # passes on two matches as happily as on one, and two matches arrive
+          # as a single newline-joined string that is then handed to `git clone
+          # --branch` and to a cache key -- so a second sing-box image line in
+          # compose.yml would fail somewhere far from its cause.
+          # scripts/check.sh guards the same read with `head -1`, which picks a
+          # winner silently; naming the ambiguity is strictly better, because
+          # the whole point of reading the tag out of one file is that one
+          # number governs both ends of a configuration.
+          #
+          # Counted with grep and not `mapfile`, and ci.yml's reader of
+          # FLUTTER_VERSION uses the same idiom for the same reason: this step
+          # is byte-identical in the libbox and libbox_apple jobs, and
+          # macos-latest still supplies bash 3.2, which has no `mapfile` at all.
+          # One idiom that runs on both runners beats two that drift.
+          pins=$(sed -n 's|^[[:space:]]*image:[[:space:]]*ghcr\.io/sagernet/sing-box:\(.*\)$|\1|p' compose.yml)
+          found=$(printf '%s\n' "$pins" | grep -c . || true)
+          [ "$found" -eq 1 ] || {
+            echo "expected exactly one ghcr.io/sagernet/sing-box image pin in compose.yml, found $found: $(printf '%s' "$pins" | tr '\n' ' ')" >&2
+            exit 1
+          }
+          version=$pins
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "server runs sing-box $version"
 
@@ -326,14 +476,14 @@ jobs:
       # cold run months later. Pack once, cache and upload the same bytes.
       - name: Restore a previously built Libbox.xcframework
         id: cached
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: libbox-apple-out
           key: libbox-apple-${{ steps.pin.outputs.version }}-gomobile0.1.13
 
       - name: Install Go
         if: steps.cached.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain
           # refuses the module outright.
@@ -396,7 +546,7 @@ jobs:
           echo "$(wc -l < /tmp/xcframework-members) members packed"
 
       - name: Upload Libbox.xcframework
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: libbox-apple-${{ steps.pin.outputs.version }}
           path: libbox-apple-out/Libbox.xcframework.tar.gz
@@ -429,7 +579,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Straight into the directory the plugin reads -- `file("libs/libbox.aar")`
       # in app/packages/singbox_tunnel/android/build.gradle, resolved against
@@ -444,17 +594,25 @@ jobs:
       # Before the toolchain installs: a wrong artifact name is cheaper to
       # discover ahead of two SDK downloads than behind them.
       - name: Download libbox ${{ needs.libbox.outputs.version }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: libbox-${{ needs.libbox.outputs.version }}
           path: app/packages/singbox_tunnel/android/libs
 
-      # The plugin's own missing-file message ends with "no job downloads it
-      # into this directory yet. Wire that up", which was true when it was
-      # written and is not this file's to edit. A download that lands half a
-      # directory off would therefore fail with an instruction to do the thing
-      # that has just been done -- so assert the exact path here, where the
-      # artifact name is still in scope.
+      # The assertion is not redundant with the plugin's own check, and the
+      # difference is the failure this step is shaped around: a download that
+      # lands half a directory off. `path:` above names a directory, so if the
+      # artifact ever gains a level the bytes arrive at
+      # libs/libbox-<version>/libbox.aar -- present, complete, and invisible to
+      # `file("libs/libbox.aar")`. Asserted HERE because this is where the
+      # artifact name is still in scope and the listing below can say where the
+      # file really went, and because it runs BEFORE two SDK downloads and a
+      # Gradle configure rather than five minutes into them.
+      #
+      # (packages/singbox_tunnel/android/build.gradle throws on the same missing
+      # file and its message now names the `libbox` and `android` jobs by name,
+      # so it is a good message in its own right -- it is just raised at the
+      # wrong end of a toolchain install, and it cannot see the artifact name.)
       #
       # libbox-legacy.aar (the -androidapi 21 variant) rides along in the same
       # artifact and is left where it lands: build.gradle names libbox.aar
@@ -474,13 +632,13 @@ jobs:
       # moves with the image. Pin it: AGP in the current template needs 17+, and
       # "works until the image rolls" is not a build.
       - name: Install JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -516,51 +674,19 @@ jobs:
         run: flutter build apk --release
 
       - name: Upload the APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: android-apk
           path: app/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
 
-  # THIS JOB REGENERATES app/ios/. IT DOES NOT BUILD ON EVERY RUN, AND MUST NOT.
-  #
-  # app/ios/ is a COMMITTED directory -- the one platform directory that is, and
-  # not out of taste. iOS runs an NEPacketTunnelProvider in its own app-extension
-  # PROCESS, so the provider needs its own TARGET; a CocoaPods pod is linked into
-  # the targets the Podfile names, which is Runner and nothing else, which is why
-  # packages/singbox_tunnel/ios/singbox_tunnel.podspec:32 ships Classes/ and
-  # Shared/ and deliberately not Extension/. `flutter create` writes one target,
-  # no entitlements, no App Group and no extension, and preserves none of those
-  # if you add them. A colleague cannot sign a project that does not exist.
-  #
-  # So: a human dispatches this workflow with regenerate_ios_project=true,
-  # downloads the ios-project artifact, and commits app/ios/. The `ios` job below
-  # then builds THAT project on every push and never generates one. Regenerating
-  # on every run would mean the thing that ships is rewritten behind the
-  # operator's back, which is the failure committing it exists to prevent.
-  #
-  # It deletes app/ios/ before generating. `flutter create` over an existing
-  # project writes only absent files, so a second pass would merge a fresh
-  # template into an edited project -- the unreviewable state this whole
-  # arrangement avoids -- and tool/ios_project.rb refuses to run twice over one
-  # project for the same reason.
-  #
-  # It also BUILDS what it generated, which is what `needs: libbox_apple` is for.
-  # A project a human is about to commit should be known to compile the 827 lines
-  # under packages/singbox_tunnel/ios/Extension/ before it is committed, not
-  # after. The build steps are spelled out again rather than shared with the
-  # `ios` job on purpose: that job builds the COMMITTED project and this one
-  # builds the GENERATED one, and if they shared steps the difference -- which is
-  # the entire point of both -- would be invisible.
-  # Is the Xcode project in the tree?
-  #
-  # Added because the dispatch route the ios job used to print does not exist:
-  # GitHub only shows "Run workflow" for a workflow present on the DEFAULT
-  # branch, and app.yml lives only on `app`. So the recovery instruction was
-  # unfollowable, and every push was red on a job whose fix could not be run.
-  # Deciding here instead makes the workflow self-healing: with no project it
+  # Is the Xcode project in the tree? Everything iOS below branches on this one
+  # answer, and that is what makes the workflow self-healing: with no project it
   # generates one, with a project it builds it, and neither needs a human to
-  # remember which.
+  # remember which. The alternative it replaced was a recovery instruction
+  # nobody could follow -- see the `on:` block above for why the dispatch route
+  # it named does not exist -- while every push stayed red on a job whose fix
+  # could not be run.
   ios_state:
     name: Is the Xcode project committed?
     runs-on: ubuntu-latest
@@ -569,7 +695,7 @@ jobs:
       committed: ${{ steps.look.outputs.committed }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Look for it
         id: look
         working-directory: .
@@ -583,22 +709,49 @@ jobs:
             echo "app/ios/ is absent; the ios_project job will generate one to commit"
           fi
 
+  # THIS JOB REGENERATES app/ios/. IT DOES NOT BUILD ON EVERY RUN, AND MUST NOT.
+  #
+  # app/ios/ is a COMMITTED directory -- the one platform directory that is, and
+  # not out of taste. iOS runs an NEPacketTunnelProvider in its own app-extension
+  # PROCESS, so the provider needs its own TARGET; a CocoaPods pod is linked into
+  # the targets the Podfile names, which is Runner and nothing else, which is why
+  # packages/singbox_tunnel/ios/singbox_tunnel.podspec:32 ships Classes/ and
+  # Shared/ and deliberately not Extension/. `flutter create` writes one target,
+  # no entitlements, no App Group and no extension, and preserves none of those
+  # if you add them. A colleague cannot sign a project that does not exist.
+  #
+  # So: delete app/ios/ and push. This job generates a project, builds it,
+  # uploads it as the ios-project artifact, and a human commits that. The `ios`
+  # job below then builds THAT project on every push and never generates one.
+  # Regenerating on every run would mean the thing that ships is rewritten
+  # behind the operator's back, which is the failure committing it exists to
+  # prevent -- so the trigger is the directory's absence and nothing else. There
+  # is no manual override, because the button that would offer one is not
+  # rendered for a workflow outside the default branch; the `on:` block says so
+  # at length.
+  #
+  # It deletes app/ios/ before generating anyway, belt and braces. `flutter
+  # create` over an existing project writes only absent files, so a second pass
+  # would merge a fresh template into an edited project -- the unreviewable
+  # state this whole arrangement avoids -- and tool/ios_project.rb refuses to
+  # run twice over one project for the same reason.
+  #
+  # It also BUILDS what it generated, which is what `needs: libbox_apple` is for.
+  # A project a human is about to commit should be known to compile the 827 lines
+  # under packages/singbox_tunnel/ios/Extension/ before it is committed, not
+  # after. The build steps are spelled out again rather than shared with the
+  # `ios` job on purpose: that job builds the COMMITTED project and this one
+  # builds the GENERATED one, and if they shared steps the difference -- which is
+  # the entire point of both -- would be invisible.
   ios_project:
-    name: regenerate app/ios/ (manual)
-    # `inputs.` and NOT `github.event.inputs.`: the latter is a string, and the
-    # string "false" is truthy, so this would run on every dispatch of the
-    # workflow including the ones that just want a rebuild.
-    # Runs when there is no committed project, and on an explicit dispatch when
-    # somebody wants to regenerate one that exists.
-    if: >-
-      needs.ios_state.outputs.committed == 'false' ||
-      (github.event_name == 'workflow_dispatch' && inputs.regenerate_ios_project)
+    name: regenerate app/ios/
+    if: needs.ios_state.outputs.committed == 'false'
     needs: [check, libbox_apple, ios_state]
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # xcodeproj is not listed on the runner image by name; it arrives as a
       # runtime dependency of CocoaPods, which is listed ("CocoaPods 1.17.0" in
@@ -614,7 +767,7 @@ jobs:
             || { echo "error: no xcodeproj gem. It ships as a dependency of CocoaPods; the runner image dropped one of them, and this job needs a gem install step." >&2; exit 1; }
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -657,7 +810,7 @@ jobs:
       # Runner.xcodeproj, the two entitlements files and the two Info.plists are
       # the deliverable.
       - name: Upload app/ios/ for a human to commit
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ios-project
           path: |
@@ -669,7 +822,7 @@ jobs:
           if-no-files-found: error
 
       - name: Download Libbox.xcframework ${{ needs.libbox_apple.outputs.version }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: libbox-apple-${{ needs.libbox_apple.outputs.version }}
           path: app/packages/singbox_tunnel/ios/Frameworks
@@ -685,6 +838,12 @@ jobs:
 
   ios:
     name: iOS .ipa (unsigned)
+    # Only with a project to build. Without this the job failed on every push and
+    # the failure was not actionable, because the route it told people to take --
+    # a manual dispatch -- is not offered for a workflow outside the default
+    # branch. `ios_state` decides instead, and `ios_result` below is what makes
+    # sure this job and `ios_project` did not BOTH stand down.
+    if: needs.ios_state.outputs.committed == 'true'
     # libbox_apple as well as check, and macos/windows/linux deliberately still
     # do not. The xcframework carries a macos slice -- build_libbox binds one
     # (main.go:198) whether anything wants it or not -- so the temptation is to
@@ -693,19 +852,14 @@ jobs:
     # *binary* behind a privileged helper, and there is no macOS Network
     # Extension target in this tree to link a framework into. Adding the
     # dependency would park a second macOS runner behind a Go build whose
-    # output it never opens. The day a macOS helper wants libbox
-    # instead of the binary, the slice is already in the artifact and this is
-    # one line.
-    # Only with a project to build. Without this the job failed on every push
-    # and the failure was not actionable, because the job that produces the
-    # project could not be dispatched.
-    if: needs.ios_state.outputs.committed == 'true'
+    # output it never opens. The day a macOS helper wants libbox instead of the
+    # binary, the slice is already in the artifact and this is one line.
     needs: [check, libbox_apple, ios_state]
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # THIS JOB BUILDS THE COMMITTED PROJECT AND GENERATES NOTHING. There is no
       # `flutter create` below, and its absence is the point: every way of
@@ -723,9 +877,12 @@ jobs:
           if [ ! -f "$pbxproj" ]; then
             echo "error: no $pbxproj." >&2
             echo "app/ios/ is a committed directory and nothing in this job generates one." >&2
-            echo "Produce it: run this workflow from the Actions tab with regenerate_ios_project=true," >&2
-            echo "download the ios-project artifact, drop the app/ios/ line from .gitignore, and commit it." >&2
-            echo "The why is in packages/singbox_tunnel/ios/README.md and in the ios_project job above." >&2
+            echo "This should be unreachable: the ios_state job reported the project committed," >&2
+            echo "so either it read a different path or the checkout is not the tree it read." >&2
+            echo "Produce a project: delete app/ios/ and push. ios_state then reports it absent," >&2
+            echo "the ios_project job regenerates it and uploads the ios-project artifact, and you" >&2
+            echo "commit that. The why is in packages/singbox_tunnel/ios/README.md and in the" >&2
+            echo "ios_project job above." >&2
             exit 1
           fi
           # A project that exists but predates the extension target is the same
@@ -746,6 +903,28 @@ jobs:
           test -f app/ios/SingboxTunnel/Info.plist
           test -f app/ios/Runner/Runner.entitlements
 
+      # The other half of that assertion, and the half only this runner can do.
+      # The grep above finds three strings; --check OPENS Runner.xcodeproj with
+      # the xcodeproj gem and compares every setting against the tables
+      # tool/ios_project.rb generates from, so a committed project that has
+      # drifted from its generator -- by a hand edit, or by a change to the
+      # script that nobody re-ran -- is named here rather than discovered as a
+      # tunnel that will not start. app/ios/ is a committed GENERATED artefact,
+      # which is exactly the shape that drifts silently.
+      #
+      # It lives in this job and not in the cheap `check` one because the gem
+      # does: xcodeproj arrives as a dependency of CocoaPods, which only the
+      # macOS images carry. `check` runs `ruby -c` on the script (a parse) and
+      # `tool/check_extension.sh sources` over the same identifiers with awk and
+      # grep, which is the portable subset of this assertion; --check is the
+      # version that reads the project as a project.
+      #
+      # Before the framework download and the Flutter install, for the reason
+      # the step above gives: a project that cannot pass this is not worth an
+      # SDK.
+      - name: Check the committed project still matches tool/ios_project.rb
+        run: ruby tool/ios_project.rb --check
+
       # Straight into the directory the extension target links from --
       # FRAMEWORK_SEARCH_PATHS is $(SRCROOT)/../packages/singbox_tunnel/ios/Frameworks
       # and the file reference in Runner.xcodeproj is the same path -- rather
@@ -759,7 +938,7 @@ jobs:
       # wrong artifact name is cheaper to discover ahead of an SDK download than
       # behind one.
       - name: Download Libbox.xcframework ${{ needs.libbox_apple.outputs.version }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: libbox-apple-${{ needs.libbox_apple.outputs.version }}
           path: app/packages/singbox_tunnel/ios/Frameworks
@@ -768,7 +947,7 @@ jobs:
         run: bash tool/unpack_libbox.sh
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -798,7 +977,7 @@ jobs:
           cd build/ipa && zip -qry vpn-stack-app-unsigned.ipa Payload
 
       - name: Upload the .ipa
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ios-ipa-unsigned
           path: app/build/ipa/vpn-stack-app-unsigned.ipa
@@ -811,10 +990,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -844,7 +1023,7 @@ jobs:
           ditto -c -k --keepParent "$app" build/vpn-stack-app-macos.zip
 
       - name: Upload the macOS app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: macos-app
           path: app/build/vpn-stack-app-macos.zip
@@ -857,10 +1036,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -881,7 +1060,7 @@ jobs:
       # build/windows/runner/Release into the x64/ level -- if this step ever
       # reports no files, look there first.)
       - name: Upload the Windows build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-x64
           path: app/build/windows/x64/runner/Release
@@ -894,7 +1073,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Flutter's Linux embedder links against GTK 3 and builds with clang and
       # ninja; the runner image ships neither the GTK headers nor liblzma's.
@@ -931,7 +1110,7 @@ jobs:
             libsecret-1-dev
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
@@ -1067,8 +1246,60 @@ jobs:
           dpkg-deb --contents "$deb"
 
       - name: Upload the .deb
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: linux-deb
           path: app/build/*.deb
           if-no-files-found: error
+
+  # A SKIPPED JOB IS NOT A FAILURE, and that is the hole this closes.
+  #
+  # `ios` and `ios_project` are mutually exclusive by construction -- ios_state
+  # decides which of them runs -- so exactly one should have succeeded on every
+  # run. GitHub renders "skipped" as neither red nor green, so a state where
+  # NEITHER ran is indistinguishable from success on the Actions page: a renamed
+  # output, a typo in an `if:`, or a `committed=` value that is neither 'true'
+  # nor 'false' would ship a green run in which nothing built the iOS target and
+  # nothing regenerated it, on the one platform whose project is committed and
+  # whose extension no device has ever run.
+  #
+  # The trade-off, stated the way the rest of this file states them: one extra
+  # ubuntu job on every run, a few seconds long, in exchange for turning a
+  # silence into a signal. It also reddens twice when `check` fails -- both iOS
+  # jobs are skipped, so this one reports zero successes -- which is noise, and
+  # cheaper than the alternative of trusting a skip.
+  #
+  # `if: always()` is load-bearing: without it this job inherits the skip from
+  # its own dependencies and proves nothing, which is the failure it exists to
+  # catch wearing one more layer. It reads `needs.*.result` and not the
+  # artifacts, deliberately -- what it asserts is that the workflow DECIDED, and
+  # Xcode's opinion is the two jobs' own business.
+  ios_result:
+    name: Exactly one iOS job ran
+    needs: [ios, ios_project]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require exactly one success
+        working-directory: .
+        run: |
+          set -euo pipefail
+          built='${{ needs.ios.result }}'
+          regenerated='${{ needs.ios_project.result }}'
+          echo "ios=$built  ios_project=$regenerated"
+          # `case` and not `[ ... ] && n=$((n + 1))`: under `set -e` a failing
+          # test as the left half of an && list ends the step, which would
+          # report "no successes" as a shell error instead of as this message.
+          ok=0
+          case "$built" in success) ok=$((ok + 1)) ;; esac
+          case "$regenerated" in success) ok=$((ok + 1)) ;; esac
+          [ "$ok" -eq 1 ] || {
+            echo "error: expected exactly one of ios/ios_project to succeed, counted $ok." >&2
+            echo "Two successes means they are no longer mutually exclusive -- check both \`if:\`" >&2
+            echo "conditions against the ios_state job's committed= output." >&2
+            echo "Zero means neither ran (or the one that ran failed): if both are 'skipped', the" >&2
+            echo "branch decided nothing and no iOS target was built or regenerated at all." >&2
+            exit 1
+          }
+          echo "exactly one iOS job succeeded"
