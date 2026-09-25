@@ -14,6 +14,69 @@ Matcher refusalSaying(Object matcher) =>
         (ShareUriException e) => e.reason, 'reason', matcher));
 
 void main() {
+  // The link the server really issued, as opposed to the one this file builds.
+  //
+  // Everything else here works from `vlessUri()`, which composes
+  // `vlessShareParams` -- a hand transcription of the f-string in
+  // vless_reality.py's share(). That transcription is what lets the refusal
+  // tests drop or corrupt one parameter at a time, and it is also what nothing
+  // used to check: add a parameter to share() and every test below stays green
+  // while the parser refuses every real link, because it refuses parameters it
+  // does not know.
+  //
+  // So this group parses the URI out of test/fixtures/user-export.json, which
+  // tests/test_json_contract.py generates by calling share() and then holds
+  // cli.py to. A parameter added, renamed or reordered there fails here; a
+  // structural VALUE changed -- `security`, `flow`, `type` -- fails here too,
+  // and those are refusals rather than warnings in vless_reality.dart.
+  group('the generated link, against the transcription', () {
+    final String generated = fixtureShareUri('vless-reality');
+
+    test('carries exactly the parameters this file transcribes, in order', () {
+      expect(
+        shareUriQuery(generated).map((List<String> p) => p[0]).toList(),
+        vlessShareParams.map((List<String> p) => p[0]).toList(),
+      );
+    });
+
+    test('carries the structural values this app refuses to import without',
+        () {
+      // Values, not just names. `security=reality` and `flow=xtls-rprx-vision`
+      // are `requireOneOf` constraints: the server changing either one is not a
+      // degraded import, it is a link the app rejects outright. `type=tcp` and
+      // `headerType=none` say there is no transport object to build, and
+      // `encryption=none` is the only value the scheme defines.
+      final Map<String, String> params = <String, String>{
+        for (final List<String> pair in shareUriQuery(generated))
+          pair[0]: pair[1],
+      };
+      expect(params['security'], 'reality');
+      expect(params['flow'], 'xtls-rprx-vision');
+      expect(params['encryption'], 'none');
+      expect(params['type'], 'tcp');
+      expect(params['headerType'], 'none');
+      expect(params['fp'], 'chrome');
+      // The masquerade host is a structural constant in the protocol module,
+      // and it is both the TLS SNI and the host the handshake is proxied to.
+      expect(params['sni'], vlessSni);
+    });
+
+    test('parses, and its pbk survives the query decoding', () {
+      // The fixture's REALITY public key carries both `-` and `_`, which is the
+      // point of it: base64url's two characters, and the pair a form-decoding
+      // query parser mangles. `_checkPublicKey` refuses a key that is not 43
+      // unpadded base64url characters, so a mangled one is a refusal here
+      // rather than a handshake that fails on a phone with no operator.
+      final VlessRealityOutbound out = parseVlessRealityUri(generated);
+      expect(out.publicKey.length, 43);
+      expect(out.publicKey, contains('-'));
+      expect(out.publicKey, contains('_'));
+      expect(out.serverName, vlessSni);
+      expect(out.profileName, 'kate');
+      expect(out.serverPort, vlessPort);
+    });
+  });
+
   group('a link the server really issued', () {
     test('round-trips every parameter share() emits', () {
       final VlessRealityOutbound out = parseVlessRealityUri(vlessUri());

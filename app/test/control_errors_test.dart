@@ -55,8 +55,11 @@ void main() {
         expect(e.error, contains('vpnctl bootstrap'));
         final Object? missing = e.payload!['missing'];
         expect(missing, isA<Map<String, Object?>>());
+        // Structured, not a sentence to grep: one protocol to the secrets it
+        // lacks. deploy.sh deliberately does not bootstrap, so this refusal is
+        // the whole message an operator gets about a damaged state directory.
         expect((missing! as Map<String, Object?>)['hysteria2'],
-            <String>['hysteria2.crt', 'hysteria2.key']);
+            <String>['hysteria2.crt', 'hysteria2.key', 'hysteria2.obfs']);
       }
     });
 
@@ -119,9 +122,9 @@ void main() {
       // emit(ok=not failures) exits 0 and still carries every bundle that did
       // work. Throwing here would discard the profiles that succeeded.
       final ShareBundle bundle =
-          await Vpnctl(FakeSsh.replying(exportJson)).exportUser('kate');
-      expect(bundle.failed, <String>['hysteria2']);
-      expect(bundle.byProtocol.keys, contains('ikev2'));
+          await Vpnctl(FakeSsh.replying(exportPartialJson)).exportUser('kate');
+      expect(bundle.failed, <String>['ikev2']);
+      expect(bundle.byProtocol.keys, contains('vless-reality'));
     });
 
     test('an export that really was refused still throws', () async {
@@ -245,7 +248,11 @@ void main() {
       final UserMutation added =
           await Vpnctl(FakeSsh.replying(payload)).addUser('kate');
       expect(added.user, 'kate');
-      expect(added.apply.unknownKeys, <String>['wg']);
+      // `contains`, not equality: the fixture already carries the converge
+      // verdicts cli.py added after these models were written, and they are
+      // tolerated by the same carve-out. What this pins is that an invented key
+      // reaches `unknownKeys` rather than the exception path.
+      expect(added.apply.unknownKeys, contains('wg'));
     });
 
     test('a missing field says which one, and where', () async {
@@ -286,7 +293,9 @@ void main() {
     String brokenExport() => exportJson.replaceFirst(
         '"label": "VLESS + REALITY",', '"label": 5,');
 
-    const String uuid = '6f1d2c3b-4a59-4e87-9c10-2b7f5d0e8a41';
+    // kate's, from the export fixture: the credential the VLESS URI carries,
+    // and the string every message in this group must not reproduce.
+    const String uuid = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
 
     test('no refusal over an export payload echoes the uuid or the bundles',
         () async {
@@ -301,6 +310,8 @@ void main() {
         // dnstt's settings are a form of plaintext fields, so the shape has to
         // hide those values too and not only the ones that look like keys.
         expect(e.message, isNot(contains('Qx7yPlum2zRt')));
+        // And the Hysteria2 password, which is the userinfo of its own URI.
+        expect(e.message, isNot(contains('8d2e1f0a7c6b5948372615049382a1b0')));
       }
     });
 
@@ -381,8 +392,13 @@ void main() {
       // opening brace is an MOTD or a wrapper and everything from there on is
       // payload. A truncated export answer does not parse AND begins with a
       // live URI, which is why the second half is never shown.
-      final String cut =
-          brokenExport().trim().substring(0, 220);
+      //
+      // The cut has to land PAST the uuid for this to prove anything -- the
+      // assertions below are that `raw` still has it and the message does not --
+      // so it is asserted rather than assumed. 220 reaches into the first
+      // protocol's `uri`, which is the payload's first value of any size.
+      final String cut = brokenExport().trim().substring(0, 220);
+      expect(cut, contains(uuid));
       try {
         await Vpnctl(FakeSsh.replying(cut)).exportUser('kate');
         fail('expected a protocol error');
@@ -442,7 +458,7 @@ void main() {
         stderr: 'warning: some ports never came up:\n  53/udp\n',
       );
       final ApplyResult result = await Vpnctl(ssh).apply();
-      expect(result.rendered, 'rendered-1757354108');
+      expect(result.rendered, startsWith('rendered-'));
     });
   });
 }

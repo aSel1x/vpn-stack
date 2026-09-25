@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "ok": true,
+  "changed": true,
+  "rendered": "rendered-20260101T000000Z-fixture",
+  "enabled_protocols": [
+    "vless-reality",
+    "hysteria2"
+  ],
+  "restarted": true,
+  "config_changed": [
+    "ikev2"
+  ],
+  "converge_pending": false,
+  "teardown": "nothing to tear down",
+  "teardown_ok": true,
+  "ready": [
+    "all 5 port(s) bound"
+  ],
+  "ports_ready": true,
+  "not_running": [],
+  "firewall": [
+    "firewall already matches"
+  ],
+  "firewall_ok": true,
+  "ikev2_forwarding": "removed 2 IKEv2 IPv4 FORWARD rule(s)",
+  "forwarding_ok": true
+}

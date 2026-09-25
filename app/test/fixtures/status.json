@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "ok": true,
+  "state_dir": "/etc/vpn-stack",
+  "is_server": true,
+  "rendered": "rendered-20260101T000000Z-fixture",
+  "enabled": [
+    "vless-reality",
+    "hysteria2",
+    "ikev2"
+  ],
+  "revoke_pending": [
+    "oldphone"
+  ],
+  "users": 2,
+  "users_enabled": 1,
+  "ikev2_running": true
+}

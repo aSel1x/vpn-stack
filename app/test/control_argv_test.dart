@@ -3,6 +3,12 @@
 // about something other than what the screen asked for. So every command line
 // this layer can emit is written out here in full, by hand, from cli.py's
 // parser -- not generated from the same builder it is checking.
+//
+// The argv is hand-written; the ANSWER each call is given is not. Every fake
+// reply below is that command's own generated fixture, so a command answered
+// with another command's payload would fail to parse rather than pass. It used
+// to be whichever literal was nearest -- `user rm` was answered with `user
+// add`'s -- which is harmless until the two payloads differ.
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vpn_stack_app/control/vpnctl.dart';
@@ -36,7 +42,7 @@ void main() {
     });
 
     test('user rm', () async {
-      final FakeSsh ssh = FakeSsh.replying(userAddJson);
+      final FakeSsh ssh = FakeSsh.replying(userRmJson);
       await Vpnctl(ssh).removeUser('kate');
       expect(ssh.lastArgv, expectedArgv(<String>['user', 'rm', 'kate']));
     });
@@ -46,7 +52,7 @@ void main() {
       await Vpnctl(on).setUserEnabled('kate', enabled: true);
       expect(on.lastArgv, expectedArgv(<String>['user', 'enable', 'kate']));
 
-      final FakeSsh off = FakeSsh.replying(userEnableJson);
+      final FakeSsh off = FakeSsh.replying(userDisableJson);
       await Vpnctl(off).setUserEnabled('kate', enabled: false);
       expect(off.lastArgv, expectedArgv(<String>['user', 'disable', 'kate']));
     });
@@ -96,7 +102,7 @@ void main() {
       await Vpnctl(on).setProtocol('dnstt', enabled: true);
       expect(on.lastArgv, expectedArgv(<String>['protocol', 'on', 'dnstt']));
 
-      final FakeSsh off = FakeSsh.replying(protocolOnJson);
+      final FakeSsh off = FakeSsh.replying(protocolOffJson);
       await Vpnctl(off).setProtocol('dnstt', enabled: false);
       expect(off.lastArgv, expectedArgv(<String>['protocol', 'off', 'dnstt']));
     });

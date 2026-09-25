@@ -7,6 +7,8 @@
 // different encoding. So the pin is parsed, kept, and NOT emitted, and the
 // caller has to say what to trust instead.
 
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vpn_stack_app/config/config.dart';
 
@@ -18,6 +20,67 @@ Matcher refusalSaying(Object matcher) =>
 
 void main() {
   _regressions();
+
+  // The link the server really issued, against the transcription every other
+  // test in this file works from.
+  //
+  // `hysteria2ShareParams` is a hand copy of the f-string in hysteria2.py's
+  // share(), and `spki` is in it because it once was not: it was added to
+  // share() and nothing here noticed, so every test passed while the parser
+  // refused every real link for carrying a parameter it did not know. The URI
+  // below comes out of test/fixtures/user-export.json, which
+  // tests/test_json_contract.py generates by calling share() and then holds
+  // cli.py to -- so the next parameter cannot arrive unannounced.
+  group('the generated link, against the transcription', () {
+    final String generated = fixtureShareUri('hysteria2');
+
+    test('carries exactly the parameters this file transcribes, in order', () {
+      expect(
+        shareUriQuery(generated).map((List<String> p) => p[0]).toList(),
+        hysteria2ShareParams.map((List<String> p) => p[0]).toList(),
+      );
+    });
+
+    test('emits both pins, which are not convertible into one another', () {
+      // pinSHA256 hashes the whole DER certificate; spki hashes the
+      // SubjectPublicKeyInfo and base64s it. Different preimage, different
+      // encoding, and sing-box can only check the second -- which is why
+      // share() emits both and dropping either one costs a whole class of
+      // client its ability to connect. Asserted on the generated link because
+      // that is the only place the two can be seen to be different values.
+      final Map<String, String> params = <String, String>{
+        for (final List<String> pair in shareUriQuery(generated))
+          pair[0]: pair[1],
+      };
+      expect(params['pinSHA256'], isNotNull);
+      expect(params['spki'], isNotNull);
+      expect(params['spki'], isNot(params['pinSHA256']));
+      expect(params['obfs'], 'salamander');
+      expect(params['sni'], hysteria2Sni);
+    });
+
+    test('the spki pin survives the query decoding, `+` and all', () {
+      // The reason share_uri.dart refuses to use `Uri.queryParameters`: form
+      // decoding turns `+` into a space. The fixture's certificate is chosen so
+      // its SPKI hash base64s with both a `+` and a `/` in it -- the `+`
+      // arrives percent-encoded, the `/` literal -- so a parser that decoded
+      // with the form rules would hand sing-box a pin that is not the one the
+      // server published, and the handshake would fail with a TLS error that
+      // says nothing about a pin.
+      expect(generated, contains('%2B'));
+      final Hysteria2Outbound out = parseHysteria2Uri(generated,
+          trust: Hysteria2Trust.systemRoots);
+      expect(out.spkiSha256, contains('+'));
+      expect(out.spkiSha256, contains('/'));
+      expect(out.spkiSha256, endsWith('='));
+      // 32 bytes, base64: SHA-256 of the SubjectPublicKeyInfo and nothing else.
+      expect(base64Decode(out.spkiSha256!).length, 32);
+      expect(out.serverName, hysteria2Sni);
+      expect(out.profileName, 'kate');
+      expect(out.serverPort, hysteria2Port);
+    });
+  });
+
   group('a link the server really issued', () {
     test('round-trips every parameter share() emits', () {
       final Hysteria2Outbound out = parseHysteria2Uri(hysteria2Uri(),

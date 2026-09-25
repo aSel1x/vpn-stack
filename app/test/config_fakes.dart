@@ -1,15 +1,32 @@
 // Share URIs built the way vpnctl/protocols/*.py builds them.
 //
-// The parameter lists below are transcriptions of the f-strings in
-// vless_reality.py's and hysteria2.py's share(): same parameters, same order,
-// same separators. That is the point -- a test that invents its own URI proves
-// the parser can read what the test author imagined, which is not the format
-// anybody's phone is handed. Not a _test.dart file: it holds no tests and
-// `flutter test` should not collect it.
+// Two kinds of URI live here and they are not interchangeable.
 //
-// The credentials are the shapes users_store.py really produces: a uuid4, two
-// `secrets.token_hex(16)` strings, and `secrets.token_hex(8)` for the short id.
-// None of them belongs to a real server.
+// SYNTHETIC, built by [buildShareUri]: the parameter lists below are
+// transcriptions of the f-strings in vless_reality.py's and hysteria2.py's
+// share(), and the builder edits them -- drop `pbk`, replace `security`, append
+// a parameter the server does not write -- so "missing each required parameter"
+// is nine variations rather than nine hand-written URIs that drift apart. Only a
+// builder can do that, which is why these stay.
+//
+// GENERATED, reached through [fixtureShareUri]: the real URI, taken out of
+// test/fixtures/user-export.json, which tests/test_json_contract.py generates by
+// calling share() and then holds cli.py to. That is what closes the hole this
+// file used to document and could not fix: the transcription was checked by
+// nothing, so adding a parameter to share() left these tests green while every
+// real link was refused -- the parser rejects parameters it does not know. The
+// cross-check now lives in config_vless_test.dart and config_hysteria2_test.dart,
+// which assert the generated URI's parameters against the lists below, in order.
+//
+// Not a _test.dart file: it holds no tests and `flutter test` should not collect
+// it.
+//
+// The synthetic credentials are the shapes users_store.py really produces: a
+// uuid4, two `secrets.token_hex(16)` strings, and `secrets.token_hex(8)` for the
+// short id. None of them belongs to a real server.
+
+import 'dart:convert';
+import 'dart:io';
 
 /// vless_reality.py's PORT.
 const int vlessPort = 10443;
@@ -65,12 +82,12 @@ const String certificateSpki = 'BzXhPQ2yVCkGDXK5dRJiTlIz3bMUwEZAfTZP1xhbQ0E=';
 
 /// Exactly the parameters hysteria2.py writes, in its order.
 ///
-/// This list is transcribed by hand and nothing cross-checks it against the
-/// Python, which is the known weak point of these fixtures: add a parameter to
-/// share() and these tests stay green while every real link is refused, because
-/// the parser rejects parameters it does not know. `spki` is here because that
-/// happened -- the guard is now a test on the Python side asserting this exact
-/// name set, which fails and names this file.
+/// `spki` is in here because it once was not: it was added to share() and this
+/// list stayed as it was, so every test passed while every real link was refused
+/// for carrying a parameter the parser did not know. Two things check it now --
+/// test_protocols_share.py asserts the name set on the Python side, and
+/// config_hysteria2_test.dart asserts this list against the generated URI in
+/// test/fixtures/user-export.json, in order.
 const List<List<String>> hysteria2ShareParams = <List<String>>[
   <String>['obfs', 'salamander'],
   <String>['obfs-password', obfsPassword],
@@ -154,3 +171,60 @@ String hysteria2Uri({
       change: change,
       fragment: fragment,
     );
+
+// --------------------------------------------- the generated URIs, from cli.py
+
+/// The share URI `vpnctl user export --json` really emitted for a protocol.
+///
+/// Read out of test/fixtures/user-export.json, which tests/test_json_contract.py
+/// generates by calling the protocol's own share() and then asserts cli.py still
+/// prints. So this is not a transcription of the format: it IS the format, and a
+/// value change in share() -- `security`, `flow`, the obfs type, a new
+/// parameter -- reaches these tests as a failure.
+///
+/// Throws rather than returning null when the protocol has no URI item: dnstt
+/// deliberately emits `fields` and no URI at all, and a silent null there would
+/// turn every assertion about it into a skip.
+String fixtureShareUri(String protocol) {
+  final File file = File('test/fixtures/user-export.json');
+  if (!file.existsSync()) {
+    throw StateError(
+      'test/fixtures/user-export.json is missing. It is generated from '
+      'vpnctl/cli.py: run `UPDATE_CONTRACT=1 uv run --frozen --with pytest '
+      'pytest tests/test_json_contract.py` from the repository root.',
+    );
+  }
+  final Map<String, Object?> payload =
+      jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
+  final Map<String, Object?> protocols =
+      payload['protocols']! as Map<String, Object?>;
+  final List<Object?> items = protocols[protocol]! as List<Object?>;
+  for (final Object? item in items) {
+    final Object? uri = (item! as Map<String, Object?>)['uri'];
+    if (uri is String) return uri;
+  }
+  throw StateError('no uri item for $protocol in test/fixtures/user-export.json');
+}
+
+/// The query of [uri], as `key=value` pairs IN ORDER and without decoding.
+///
+/// Order matters to the comparison this feeds: a set comparison would pass on a
+/// share() that emitted the same names in a different order, and the point of
+/// the transcribed lists above is that they describe the f-string. Undecoded
+/// because `spki` is base64 whose `+` arrives percent-encoded, and decoding here
+/// would hide whether it was encoded at all.
+List<List<String>> shareUriQuery(String uri) {
+  final int mark = uri.indexOf('?');
+  if (mark < 0) return const <List<String>>[];
+  final int hash = uri.indexOf('#', mark);
+  final String query =
+      hash < 0 ? uri.substring(mark + 1) : uri.substring(mark + 1, hash);
+  return <List<String>>[
+    for (final String pair in query.split('&'))
+      if (pair.isNotEmpty)
+        <String>[
+          pair.substring(0, pair.indexOf('=')),
+          pair.substring(pair.indexOf('=') + 1),
+        ],
+  ];
+}

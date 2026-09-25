@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "ok": false,
+  "user": "kate",
+  "host": "203.0.113.10",
+  "protocols": {
+    "vless-reality": [
+      {
+        "label": "VLESS + REALITY",
+        "uri": "vless://3f2504e0-4f89-41d3-9a0c-0305e82c3301@203.0.113.10:10443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.apple.com&fp=chrome&pbk=NwwC4J_pN87_-FCJDTAMQsg-tH3tvxyqCWXmULqX40M&sid=0123456789abcdef&type=tcp&headerType=none#kate",
+        "png_b64": "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"
+      }
+    ],
+    "hysteria2": [
+      {
+        "label": "Hysteria2",
+        "uri": "hysteria2://8d2e1f0a7c6b5948372615049382a1b0@203.0.113.10:20443?obfs=salamander&obfs-password=d41d8cd98f00b204e9800998ecf8427e&sni=bing.com&pinSHA256=51:6D:ED:5D:61:CD:B0:A0:4D:17:4F:3B:CE:30:07:8C:BE:50:68:FA:73:35:A2:D7:3D:45:78:93:C7:87:C9:96&spki=K5hbrfG6yCk/a5LowKzBE5vFpey7%2BXpicdzw1PbGivY%3D#kate",
+        "png_b64": "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"
+      }
+    ],
+    "dnstt": [
+      {
+        "label": "dnstt \u2014 phone (HTTP Injector / AnyBridge, mode DNSTT \u2192 SSH)",
+        "fields": [
+          [
+            "Nameserver / domain",
+            "tests.invalid"
+          ],
+          [
+            "Public key",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "DNS resolver",
+            "the blocked network's OWN resolver, :53, plain UDP"
+          ],
+          [
+            "SSH username",
+            "kate"
+          ],
+          [
+            "SSH password",
+            "Qx7yPlum2zRt"
+          ]
+        ]
+      },
+      {
+        "label": "dnstt \u2014 laptop (two commands)",
+        "fields": [
+          [
+            "1. open the tunnel",
+            "dnstt-client -udp <resolver>:53 -pubkey bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb tests.invalid 127.0.0.1:7000"
+          ],
+          [
+            "2. SOCKS through it",
+            "ssh -N -D 1080 -p 7000 kate@127.0.0.1"
+          ],
+          [
+            "then",
+            "point the browser at socks5://127.0.0.1:1080"
+          ]
+        ]
+      }
+    ]
+  },
+  "failed": [
+    "ikev2"
+  ]
+}

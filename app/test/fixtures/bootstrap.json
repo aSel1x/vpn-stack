@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "ok": true,
+  "message": "generated 9 secret(s): hysteria2.crt, hysteria2.key, hysteria2.obfs, ipsec.primary_password, ipsec.primary_user, ipsec.psk, reality.key, reality.pub, reality.short_id"
+}

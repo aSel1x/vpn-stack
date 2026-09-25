@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "ok": true,
+  "protocols": [
+    {
+      "name": "vless-reality",
+      "enabled": true,
+      "ports": [
+        "10443/tcp"
+      ],
+      "kind": "singbox",
+      "summary": "VLESS+REALITY (TCP, XTLS-Vision)",
+      "notes": ""
+    },
+    {
+      "name": "hysteria2",
+      "enabled": true,
+      "ports": [
+        "20443/udp"
+      ],
+      "kind": "singbox",
+      "summary": "Hysteria2 (QUIC, Salamander obfs)",
+      "notes": ""
+    },
+    {
+      "name": "ikev2",
+      "enabled": true,
+      "ports": [
+        "500/udp",
+        "4500/udp",
+        "1701/udp"
+      ],
+      "kind": "compose",
+      "summary": "IKEv2 / L2TP / Cisco IPsec",
+      "notes": "Diagnosed 2026-09-05: the server side is correct end to end and no client IKE has ever reached it. The drop is on the client's network. See scripts/diagnose-ikev2.sh."
+    },
+    {
+      "name": "dnstt",
+      "enabled": false,
+      "ports": [
+        "53/udp"
+      ],
+      "kind": "compose",
+      "summary": "DNS tunnel (dnstt -> containerised sshd -> SOCKS5)",
+      "notes": "Needs a delegated zone (VPN_DNSTT_ZONE in /etc/vpn-stack/.env) pointing NS at this host, and ufw allow 53/udp. See dnstt/SETUP.md."
+    }
+  ]
+}
