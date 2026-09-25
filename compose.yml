@@ -10,6 +10,11 @@ name: vpn-stack
 #
 # 10m x 3 matches every other service on this host, so "how much log does a container get
 # to keep" is one answer rather than per-stack folklore.
+#
+# A disk budget, and nothing more. How much a service says -- sing-box's log level, which
+# is a privacy decision about what gets written down at all -- is settled in that service's
+# own rendered config, not here. Turning a service quieter does not make this cap wrong; it
+# only makes it rotate less often.
 x-logging: &logging
   driver: json-file
   options:
@@ -89,6 +94,17 @@ services:
   # got, and udp/53 on a box without one is pure attack surface.
   # Bound to an explicit address, never wildcard :53 -- a wildcard collides
   # with the host's systemd-resolved stub listener.
+  #
+  # These three are built here rather than pulled, so unlike sing-box and ikev2
+  # there is no version in an `image:` line to pin -- the local tag is rewritten
+  # by every `--build`. What they are pinned TO lives in each Dockerfile as an
+  # ARG with a default (dnstt-server's version, microsocks' tag and commit, the
+  # base-image digests), and each image carries the same values as
+  # org.opencontainers.image labels, so `docker inspect dnstt-server:latest`
+  # answers "what is running" on a box whose checkout has since moved.
+  # Deliberately not restated here: scripts/check.sh reads sing-box's tag out of
+  # this file precisely so that one version is not written in two places, and
+  # copying these up would recreate the drift that rule exists to prevent.
   dnstt:
     build: ./dnstt
     image: dnstt-server:latest
@@ -97,6 +113,22 @@ services:
     restart: always
     network_mode: host
     profiles: ["dnstt"]
+    # One capability, because it does exactly one privileged thing: bind udp/53
+    # in the host's network namespace. Verified on the built image -- CapEff is
+    # 0x400 and nothing else, and the listener comes up. It stays uid 0 rather
+    # than taking a non-root user, because a non-root uid would need
+    # NET_BIND_SERVICE as a file capability on the binary, which is more moving
+    # parts than an empty capability set around a process that opens one socket
+    # and reads one key.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    # It reads a key and writes nothing -- verified read-only end to end, with
+    # the key already mounted :ro below. If it ever does need a scratch path,
+    # the answer is a tmpfs for that path, not dropping this line: the whole
+    # point is that a public-facing parser on udp/53 cannot leave anything
+    # behind in its own filesystem.
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - ${VPN_STATE:-/etc/vpn-stack}/rendered/dnstt:/keys:ro
     # The zone is the operator's own -- deployment config in .env, not a
@@ -135,6 +167,31 @@ services:
       # docker silently creates a *directory* in place of a missing bind-mount
       # source, which would fail far from the cause.
       - ${VPN_STATE:-/etc/vpn-stack}/rendered/dnstt-sshd:/conf:ro
+    # The one failure in this stack that nothing else can observe. This sshd
+    # binds 127.0.0.1:2222, so it contributes no port to composectl's readiness
+    # wait and none to scripts/smoke.sh -- both look only at non-loopback
+    # addresses, deliberately, because substring-matching 53 reports
+    # systemd-resolved's stub as dnstt. Meanwhile dnstt-server goes on answering
+    # udp/53, so a client completes the whole tunnel and meets a closed door
+    # while `apply` reports success on every port it knows about.
+    #
+    # It reports; it does not act. An unhealthy container is not restarted by
+    # compose -- `restart: always` reacts to the process exiting, not to health
+    # -- which is what makes this safe to add to a service people are using: a
+    # false negative prints "unhealthy" in `docker compose ps`, which is exactly
+    # where composectl.not_running is already looking, and does nothing else.
+    #
+    # `nc` is busybox's own applet, with -z and -w: no package to install and
+    # nothing extra to pin. The port comes from the same SSH_PORT the entrypoint
+    # reads out of the rendered dnstt.env, not from a second literal here --
+    # two literals drift, and this stack has been bitten by that shape before.
+    # `$$` so compose leaves the expansion to the container's shell.
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 2 127.0.0.1 \"$${SSH_PORT:-2222}\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
   # SOCKS5 exit for SSH-over-dnstt clients. Loopback only: reachable solely
   # through an authenticated SSH forward, never from outside.
@@ -146,4 +203,27 @@ services:
     restart: always
     network_mode: host
     profiles: ["dnstt"]
+    # Needs nothing at all: one high loopback port in, outbound sockets out.
+    # The uid is the one dnstt-socks/Dockerfile creates -- numeric here on
+    # purpose, because a numeric `user:` cannot fail an /etc/passwd lookup at
+    # container-create time. Keep the two in step.
+    #
+    # Verified on the built image: uid 10300, CapEff 0x0, read-only rootfs, and
+    # 127.0.0.1:7300 bound. Every byte a dnstt client sends leaves the box
+    # through this process, and it needs no privilege whatsoever to do that --
+    # the cheapest place in the stack to strip one, so it is stripped to nothing.
+    user: "10300:10300"
+    cap_drop: [ALL]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
     command: -i 127.0.0.1 -p 7300
+    # Same reasoning as dnstt-sshd's: loopback-only, so no port check anywhere
+    # else can see it, and reporting only -- an unhealthy container is not
+    # restarted by compose. A bare connect-and-close, measured to produce no log
+    # line from microsocks, so this does not spend the 10m log budget above.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "7300"]
+      interval: 60s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
