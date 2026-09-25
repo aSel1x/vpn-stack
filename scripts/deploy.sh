@@ -55,15 +55,21 @@ cd "$REPO_PATH"
 # so this also removes one a previous deploy left behind.
 uv sync --frozen --no-dev
 # Under the lock every other call site takes (./vpn's remote(), the boot unit,
-# install.sh). vpnctl holds no lock of its own, so a deploy that overlapped an
-# operator's `./vpn user add` had two processes rendering candidate trees over
-# each other -- the one race the atomic promote downstream cannot save you from,
-# because both halves are valid, they are just from different inputs.
+# install.sh). A deploy that overlapped an operator's `./vpn user add` had two
+# processes rendering candidate trees over each other -- the one race the atomic
+# promote downstream cannot save you from, because both halves are valid, they
+# are just from different inputs.
 #
-# VPN_STACK_LOCK_HELD is the handshake for the day vpnctl takes the lock itself:
-# flock(1) inside flock(1) on the same path from a child process opens a second
-# file description and blocks forever -- measured, not assumed -- so an inner
-# lock has to be able to see that the outer one is already held.
+# vpnctl now takes this same lock itself for every mutating command, and this
+# one still earns its place: it is held across the whole remote script above --
+# the uv sync as well as the apply -- while vpnctl's own window is just its
+# process, and vpnctl's is non-blocking, so overlapping runs would be refused
+# rather than serialised.
+#
+# VPN_STACK_LOCK_HELD is what stands that inner lock down, and it is not
+# optional: flock(1) inside flock(1) on the same path from a child process opens
+# a second file description and blocks forever -- measured, not assumed -- so
+# the inner lock has to be able to see that the outer one is already held.
 export VPN_STACK_LOCK_HELD=1
 flock /run/vpn-stack.lock vpnctl apply
 REMOTE

@@ -50,12 +50,16 @@ set -euo pipefail
 }
 
 # The same lock ./vpn takes around every forwarded command, and that scripts/deploy.sh,
-# scripts/install.sh and the boot unit take too. vpnctl holds no lock of its own, so
-# without this a hand-run apply can interleave with an operator's `./vpn user add` - two
-# candidate trees rendering over each other, which is precisely what the atomic promote
-# downstream cannot save you from.
+# scripts/install.sh and the boot unit take too. Without it a hand-run apply can interleave
+# with an operator's `./vpn user add` - two candidate trees rendering over each other,
+# which is precisely what the atomic promote downstream cannot save you from.
 #
-# VPN_STACK_LOCK_HELD is the handshake for the day vpnctl takes the lock itself: flock(1)
+# vpnctl now takes this same lock itself for every mutating command, which does not make
+# this one redundant: vpnctl's window opens after argument parsing and closes when the
+# process exits, and it is deliberately non-blocking, so two overlapping operators would
+# get one refusal rather than two runs that queue.
+#
+# VPN_STACK_LOCK_HELD is what stands that inner lock down, and it has to exist: flock(1)
 # inside flock(1) on the same path from a child process opens a second file description,
 # the kernel treats that as a different holder, and a blocking inner lock then waits on a
 # lock its own parent will never release. Measured, not assumed.

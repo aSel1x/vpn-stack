@@ -36,6 +36,13 @@ MSG
 
 # One SSH call, one lock. That is the whole multi-operator story: two people
 # running ./vpn at once serialise instead of interleaving writes to users.json.
+#
+# vpnctl now takes this same lock itself for every mutating command, and this
+# one is still load-bearing rather than belt-and-braces: it covers the whole
+# remote command -- the cd and everything forwarded after it -- while vpnctl's
+# own window opens after argument parsing and closes when the process exits.
+# vpnctl's is also non-blocking by design, so without an outer lock two
+# overlapping operators get one refusal instead of two runs that queue.
 remote() {
   need_host
   # -t only when we actually have a terminal, or ssh warns on every scripted call
@@ -51,9 +58,10 @@ remote() {
   # the environment, and a path with a space in it is re-split by the remote
   # shell into two arguments to cd.
   #
-  # VPN_STACK_LOCK_HELD is the handshake for the day vpnctl takes this lock
-  # itself. It has to be able to see that an outer flock(1) already holds it:
-  # flock(1) inside flock(1) on the same path from a child process opens a
+  # vpnctl takes this same lock itself now, for every mutating command, so
+  # VPN_STACK_LOCK_HELD is what tells its inner lock to stand down. It has to be
+  # able to see that an outer flock(1) already holds the file, because flock(1)
+  # inside flock(1) on the same path from a child process opens a
   # second file description, which the kernel treats as a different holder, and
   # a blocking lock then waits for a lock its own parent will never release --
   # measured, not assumed.

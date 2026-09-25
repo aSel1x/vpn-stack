@@ -218,10 +218,33 @@ def test_a_wrong_shaped_file_says_it_is_not_a_users_json(body) -> None:
     assert "not a users.json" in str(excinfo.value)
 
 
-def test_a_record_that_is_not_an_object_is_refused() -> None:
-    write_db(["alice"])
-    with pytest.raises(UsersError):
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param("alice", id="string"),
+        pytest.param(7, id="int"),
+        pytest.param(["alice"], id="list"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_a_record_that_is_not_an_object_is_refused(record) -> None:
+    """And says THAT, rather than arriving as some other refusal.
+
+    A bare `pytest.raises(UsersError)` here asserted nothing about the guard it
+    was written for: a string record falls through to `set(u) - known`, which
+    over "alice" yields the letters and raises the unknown-field refusal -- so
+    the check passed against the code with no isinstance guard at all, telling
+    the operator the database is newer than vpnctl when it is simply damaged.
+    An int does not even get that far: set(7) is a TypeError, which is the
+    traceback this module exists to replace.
+    """
+    write_db([record])
+    with pytest.raises(UsersError) as excinfo:
         users_store.load()
+    message = str(excinfo.value)
+    assert "not an object" in message
+    assert type(record).__name__ in message
+    assert "newer than the code" not in message
 
 
 @pytest.mark.parametrize(

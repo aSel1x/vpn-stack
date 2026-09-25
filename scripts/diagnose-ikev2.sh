@@ -610,6 +610,12 @@ print(covering)
 # XAUTH_POOL, so preferring the net would reproduce the very bug this replaced
 # for anyone who set only one of the two. Both are validated before use.
 #
+# Byte-identical to smoke.sh's copy, and pinned there by a test that extracts
+# both and runs them over the same probe set against the Python one. The two
+# drifted on the fix for this very function -- this file grew the python3 guard
+# and the whitespace-tolerant entry match, smoke.sh did not -- and nothing was
+# watching, which is how three copies that silently disagree happen twice.
+#
 # Emits "net|provenance": a value that came from the hardcoded default must not
 # read as a real answer, and the provenance names WHY the fallback was reached,
 # so "image default, container unreadable" is distinguishable from a container

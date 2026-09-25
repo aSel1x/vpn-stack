@@ -178,19 +178,47 @@ check_container() {
   ok "container_$c" "$c running" "$(container_fields running "${restarts:-0}")"
 }
 
-# The /24 IKEv2 clients are actually assigned from, asked of the container
-# rather than hardcoded. Mirrors vpnctl.ikev2ctl._ikev2_ipv4_net exactly:
-# `conn ikev2-cp`'s rightaddresspool is authoritative (it is what pluto hands
-# out); VPN_XAUTH_NET is only a fallback, and is validated before use because
-# an unparseable value handed to `iptables -C` fails in a way that is
-# indistinguishable from "the rule is missing". Emits "net|provenance", since
-# a value that came from the hardcoded default must not read as a real answer.
+# The pool IKEv2 clients are actually assigned from, asked of the container
+# rather than hardcoded. `conn ikev2-cp`'s rightaddresspool is authoritative (it
+# is what pluto hands out); VPN_XAUTH_NET is only a fallback, because run.sh
+# uses the net for the firewall rules *it* writes while ikev2.sh builds the pool
+# from XAUTH_POOL, so preferring the net would reproduce the very bug this
+# replaced for anyone who set only one of the two. Both are validated before
+# use: an unparseable value handed to `iptables -C` fails in a way
+# indistinguishable from "the rule is missing".
+#
+# Byte-identical to scripts/diagnose-ikev2.sh's copy, and answering the same
+# question as vpnctl.ikev2ctl.pool_network -- not by convention but pinned by a
+# test that extracts all three and runs them over the same probe set. The two
+# shell copies drifted once already, on the fix for this very function: one grew
+# the python3 guard and the whitespace-tolerant entry match and the other did
+# not, so on a box without python3 this file blamed the container for a missing
+# tool. Three copies of a derivation that silently disagree is the failure this
+# repo has already paid for, when the subnet was hardcoded as the L2TP pool and
+# BOTH health checks asserted the same wrong value and reported green.
+#
+# Emits "net|provenance": a value that came from the hardcoded default must not
+# read as a real answer, and the provenance names WHY the fallback was reached,
+# so "image default, container unreadable" is distinguishable from a container
+# that answered with something unusable.
 ikev2_pool() {
   local line entry v net why="container unreadable"
+  # Without python3 nothing below can be validated, and an unvalidated value is
+  # what makes `iptables -C` fail as though the rule were missing. Say so in the
+  # provenance rather than blaming the container for a tool that is absent.
+  if ! command -v python3 >/dev/null; then
+    printf '192.168.43.0/24|image default, python3 absent so nothing could be validated'
+    return
+  fi
   line=$(docker exec ipsec-vpn-server \
            sed -n 's/^[[:space:]]*rightaddresspool=//p' /etc/ipsec.d/ikev2.conf 2>/dev/null | head -1)
   if [[ -n "$line" ]]; then
-    entry=$(printf '%s' "$line" | tr ',' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}' || true)
+    # First IPv4 entry of a comma-separated list that also carries the image's
+    # IPv6 range, with any padding around it dropped -- ipsec.conf tolerates
+    # whitespace after the '=' and around each entry, and python3 below will
+    # refuse anything that survives this and is still not an address.
+    entry=$(printf '%s' "$line" | tr ',' '\n' | grep -m1 -E '^[[:space:]]*[0-9]+(\.[0-9]+){3}' || true)
+    entry=${entry//[[:space:]]/}
     net=$(covering_net "$entry") && {
       printf '%s|conn ikev2-cp rightaddresspool' "$net"; return; }
     why="conn ikev2-cp gave an unusable pool"

@@ -13,6 +13,11 @@ network, and nothing runs a mode of the script that would capture or send.
 What cannot be exercised this way (that tcpdump really does fail this way, that
 pluto really binds where the check looks) is read out of the text instead, and
 belongs on a live box in scripts/smoke.sh.
+
+shell_function() and run_helpers() take the file to lift from, because the pool
+derivation exists here AND in scripts/smoke.sh and the two drifted once:
+tests/test_shell_scripts.py imports them to pin the copies together rather than
+growing a third one of its own.
 """
 
 from __future__ import annotations
@@ -50,29 +55,34 @@ def code() -> str:
     )
 
 
-def shell_function(name: str) -> str:
-    """One top-level `name() { ... }` block, verbatim."""
-    body = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", text(), re.S | re.M)
-    assert body, f"{name} is not a top-level function in {SCRIPT.name}"
+def shell_function(name: str, source: Path = SCRIPT) -> str:
+    """One top-level `name() { ... }` block of a shell file, verbatim.
+
+    `source` because the pool derivation exists in two of these scripts and has
+    to keep answering identically; pinning that means lifting the same function
+    out of both.
+    """
+    body = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source.read_text(), re.S | re.M)
+    assert body, f"{name} is not a top-level function in {source.name}"
     return body.group(0)
 
 
 def run_helpers(
-    tmp_path: Path, script: str, *, env: dict[str, str] | None = None
+    tmp_path: Path,
+    script: str,
+    *,
+    env: dict[str, str] | None = None,
+    source: Path = SCRIPT,
+    names: tuple[str, ...] = ("udp_bind", "valid_net", "covering_net", "ikev2_pool"),
 ) -> str:
-    """Run `script` with the file's pool/listener helpers sourced.
+    """Run `script` with `source`'s pool/listener helpers sourced.
 
     The helpers are pure -- they shell out to docker, ss and python3 and touch
     nothing -- so a fake docker and a fake ss in tmp_path are enough to drive
     every branch.
     """
     fns = tmp_path / "fns.sh"
-    fns.write_text(
-        "\n".join(
-            shell_function(n)
-            for n in ("udp_bind", "valid_net", "covering_net", "ikev2_pool")
-        )
-    )
+    fns.write_text("\n".join(shell_function(n, source) for n in names))
     proc = subprocess.run(
         ["bash", "-c", f'set -uo pipefail\nsource "{fns}"\n{script}'],
         capture_output=True,

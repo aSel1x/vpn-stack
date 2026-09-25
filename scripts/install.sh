@@ -116,13 +116,16 @@ fi
 
 # ------------------------------------------------------------- 5. bring it up
 step "rendering and converging"
-# Under the lock, like every other call site: vpnctl takes none of its own, and
-# an apply that interleaves with somebody's `./vpn user add` has two candidate
-# trees rendering over each other -- the one thing the atomic promote downstream
-# cannot save you from. VPN_STACK_LOCK_HELD is the handshake for the day vpnctl
-# locks internally: an flock(1) inside an flock(1) on the same path from a child
-# process opens a second file description and blocks forever (measured), so the
-# inner lock has to be able to see that the outer one is already held.
+# Under the lock, like every other call site: an apply that interleaves with
+# somebody's `./vpn user add` has two candidate trees rendering over each other
+# -- the one thing the atomic promote downstream cannot save you from.
+#
+# vpnctl takes this same lock internally now, for every mutating command, which
+# is why VPN_STACK_LOCK_HELD is here: an flock(1) inside an flock(1) on the same
+# path from a child process opens a second file description and blocks forever
+# (measured), so the inner lock has to be able to see that the outer one is
+# already held. The outer one stays because vpnctl's is non-blocking and covers
+# only its own process; this one covers the whole remote command.
 on "VPN_STACK_LOCK_HELD=1 flock /run/vpn-stack.lock vpnctl apply"
 
 step "smoke test"

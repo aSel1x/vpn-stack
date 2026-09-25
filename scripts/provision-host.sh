@@ -421,11 +421,13 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker info >/dev/null 2>&1 &&
 # Absolute path because ExecStart demands one; /usr/bin/flock is util-linux's
 # on both 22.04 and 24.04 (/bin is a symlink to /usr/bin there).
 ExecStart=/usr/bin/flock /run/vpn-stack.lock /usr/local/bin/vpnctl apply
-# Set at every wrapped call site, unread for now: the day vpnctl takes this lock
-# itself it has to be able to tell that an outer flock(1) already holds it, or a
-# blocking inner lock on the same path -- a second file description, so a
-# different holder as far as the kernel is concerned -- waits on its own parent
-# forever. Measured.
+# Set at every wrapped call site, and read by vpnctl, which takes this same lock
+# itself for every mutating command: it has to be able to tell that an outer
+# flock(1) already holds the file, or a blocking inner lock on the same path --
+# a second file description, so a different holder as far as the kernel is
+# concerned -- waits on its own parent forever. Measured. vpnctl's own lock is
+# non-blocking, so at boot, with this unit racing whatever the operator is
+# running, the outer flock is what makes the apply wait rather than be refused.
 Environment=VPN_STACK_LOCK_HELD=1
 Restart=on-failure
 RestartSec=15
@@ -474,11 +476,12 @@ SHIM
   # bootstrap never overwrites an existing secret without --force, so re-running
   # this stage cannot invalidate a profile already handed out.
   #
-  # Under the lock, like every other vpnctl call site. vpnctl takes no lock of
-  # its own, so a bootstrap that overlapped an operator's `./vpn user add` would
-  # have two processes writing the keyring and users.json with nothing
-  # serialising them -- and the app can run this stage while somebody else is
-  # already using the box.
+  # Under the lock, like every other vpnctl call site. A bootstrap that
+  # overlapped an operator's `./vpn user add` would have two processes writing
+  # the keyring and users.json with nothing serialising them -- and the app can
+  # run this stage while somebody else is already using the box. vpnctl takes
+  # this lock itself too, but non-blockingly: the outer flock is what makes a
+  # re-provision queue behind a live command instead of failing on it.
   VPN_STACK_LOCK_HELD=1 flock /run/vpn-stack.lock vpnctl bootstrap
 }
 
