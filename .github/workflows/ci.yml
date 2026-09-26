@@ -92,6 +92,25 @@ jobs:
         with:
           enable-cache: true
 
+      # Does uv.lock still agree with pyproject.toml?
+      #
+      # `--frozen` below does NOT answer that, which is the whole reason this
+      # step exists: measured, `uv sync --frozen` against a lock naming the
+      # project at 0.1.0 while pyproject says 0.2.0 exits 0 and installs 0.2.0.
+      # It freezes the DEPENDENCY resolution and says nothing about the root
+      # project's own metadata -- so a version bump that forgets the lock ships
+      # green, here and through `scripts/deploy.sh`, and the two files drift
+      # silently until somebody reads them side by side. That is exactly what
+      # happened to the 0.2.0 bump.
+      #
+      # `uv lock --check` is the tool for it and exits 1 on a mismatch. The
+      # Flutter side of this repository already learned the same lesson one
+      # commit earlier, where `flutter pub get` resolves happily past a stale
+      # lock unless `--enforce-lockfile` is passed; this is the Python half of
+      # it, and it was missed the first time round.
+      - name: uv lock --check
+        run: uv lock --check
+
       - name: uv sync --frozen
         run: uv sync --frozen
 
