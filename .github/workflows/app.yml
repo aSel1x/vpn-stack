@@ -137,7 +137,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # BOTH CHECKS BELOW RUN BEFORE THE TOOLCHAIN, deliberately. Neither needs
       # Flutter, Ruby gems or Xcode -- one is `ruby -c`, the other is awk and
@@ -273,7 +273,7 @@ jobs:
       version: ${{ steps.pin.outputs.version }}
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # working-directory defaults to app/ for the whole workflow; compose.yml is
       # at the repository root, which is why this one step overrides it.
@@ -309,14 +309,14 @@ jobs:
 
       - name: Restore a previously built libbox
         id: cached
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: libbox-out
           key: libbox-${{ steps.pin.outputs.version }}-api24-gomobile0.1.13
 
       - name: Install Go
         if: steps.cached.outputs.cache-hit != 'true'
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain refuses
           # the module outright.
@@ -375,7 +375,7 @@ jobs:
           test -s libbox-out/libbox.aar
 
       - name: Upload libbox.aar
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: libbox-${{ steps.pin.outputs.version }}
           path: libbox-out/*.aar
@@ -433,7 +433,7 @@ jobs:
       version: ${{ steps.pin.outputs.version }}
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Byte-identical to the libbox job's step, deliberately: one number
       # governs the engine at both ends of a configuration, and it lives in
@@ -476,14 +476,14 @@ jobs:
       # cold run months later. Pack once, cache and upload the same bytes.
       - name: Restore a previously built Libbox.xcframework
         id: cached
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: libbox-apple-out
           key: libbox-apple-${{ steps.pin.outputs.version }}-gomobile0.1.13
 
       - name: Install Go
         if: steps.cached.outputs.cache-hit != 'true'
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # sing-box v1.14.0's go.mod says `go 1.25.5`; an older toolchain
           # refuses the module outright.
@@ -546,7 +546,7 @@ jobs:
           echo "$(wc -l < /tmp/xcframework-members) members packed"
 
       - name: Upload Libbox.xcframework
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: libbox-apple-${{ steps.pin.outputs.version }}
           path: libbox-apple-out/Libbox.xcframework.tar.gz
@@ -579,7 +579,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Straight into the directory the plugin reads -- `file("libs/libbox.aar")`
       # in app/packages/singbox_tunnel/android/build.gradle, resolved against
@@ -594,7 +594,7 @@ jobs:
       # Before the toolchain installs: a wrong artifact name is cheaper to
       # discover ahead of two SDK downloads than behind them.
       - name: Download libbox ${{ needs.libbox.outputs.version }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: libbox-${{ needs.libbox.outputs.version }}
           path: app/packages/singbox_tunnel/android/libs
@@ -632,7 +632,7 @@ jobs:
       # moves with the image. Pin it: AGP in the current template needs 17+, and
       # "works until the image rolls" is not a build.
       - name: Install JDK 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: '17'
@@ -743,7 +743,7 @@ jobs:
           exit $rc
 
       - name: Upload the APK
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: android-apk
           path: app/build/app/outputs/flutter-apk/app-release.apk
@@ -764,7 +764,7 @@ jobs:
       committed: ${{ steps.look.outputs.committed }}
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Look for it
         id: look
         working-directory: .
@@ -820,7 +820,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # xcodeproj is not listed on the runner image by name; it arrives as a
       # runtime dependency of CocoaPods, which is listed ("CocoaPods 1.17.0" in
@@ -879,7 +879,7 @@ jobs:
       # Runner.xcodeproj, the two entitlements files and the two Info.plists are
       # the deliverable.
       - name: Upload app/ios/ for a human to commit
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ios-project
           path: |
@@ -891,7 +891,7 @@ jobs:
           if-no-files-found: error
 
       - name: Download Libbox.xcframework ${{ needs.libbox_apple.outputs.version }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: libbox-apple-${{ needs.libbox_apple.outputs.version }}
           path: app/packages/singbox_tunnel/ios/Frameworks
@@ -928,7 +928,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # THIS JOB BUILDS THE COMMITTED PROJECT AND GENERATES NOTHING. There is no
       # `flutter create` below, and its absence is the point: every way of
@@ -1007,7 +1007,7 @@ jobs:
       # wrong artifact name is cheaper to discover ahead of an SDK download than
       # behind one.
       - name: Download Libbox.xcframework ${{ needs.libbox_apple.outputs.version }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: libbox-apple-${{ needs.libbox_apple.outputs.version }}
           path: app/packages/singbox_tunnel/ios/Frameworks
@@ -1046,7 +1046,7 @@ jobs:
           cd build/ipa && zip -qry vpn-stack-app-unsigned.ipa Payload
 
       - name: Upload the .ipa
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ios-ipa-unsigned
           path: app/build/ipa/vpn-stack-app-unsigned.ipa
@@ -1059,7 +1059,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
@@ -1092,7 +1092,7 @@ jobs:
           ditto -c -k --keepParent "$app" build/vpn-stack-app-macos.zip
 
       - name: Upload the macOS app
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-app
           path: app/build/vpn-stack-app-macos.zip
@@ -1105,7 +1105,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
@@ -1129,7 +1129,7 @@ jobs:
       # build/windows/runner/Release into the x64/ level -- if this step ever
       # reports no files, look there first.)
       - name: Upload the Windows build
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-x64
           path: app/build/windows/x64/runner/Release
@@ -1142,7 +1142,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Flutter's Linux embedder links against GTK 3 and builds with clang and
       # ninja; the runner image ships neither the GTK headers nor liblzma's.
@@ -1315,7 +1315,7 @@ jobs:
           dpkg-deb --contents "$deb"
 
       - name: Upload the .deb
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-deb
           path: app/build/*.deb
